@@ -251,7 +251,7 @@ muestra con un spinner animado.
 | `●` | trabajando | Está pensando o ejecutando herramientas |
 | `▲` | esperando | Necesita que apruebes algo o respondas una pregunta |
 | `○` | inactivo | Terminó y espera tu siguiente mensaje |
-| `✕` | terminado | El proceso salió; su última pantalla sigue visible |
+| `✕` | terminado | El agente salió (por ejemplo con `/exit`); en su panel queda una terminal donde puedes volver a abrirlo |
 
 **Cómo se detecta:**
 
@@ -283,8 +283,13 @@ con `x`. Restaurarlos automáticamente está en el plan.
 No. pastor usa su propio servidor (`tmux -L pastor`). Puedes verlo con `tmux -L pastor ls`.
 
 **Estoy dentro de un agente y no sé salir.**
-Pulsa `Ctrl-b` y luego `d`. Eso te saca sin cerrar al agente. No uses `/exit` a menos que quieras
-terminarlo.
+Pulsa `Ctrl-b` y luego `d`. Eso te saca sin cerrar al agente. Si usas `/exit`, el agente se cierra
+y su panel se queda con una terminal en el mismo directorio.
+
+**Cerré el agente con `/exit`. ¿Cómo lo vuelvo a abrir?**
+Entra con `⏎` y escribe `claude`, `codex` u `opencode` en la terminal que quedó. Claude Code se
+abre otra vez con los hooks de pastor, así que su estado se sigue viendo bien. Mientras el agente
+esté cerrado, pastor no le envía mensajes ni tareas, para que no se ejecuten como comandos.
 
 **¿Cómo paso del agente a su terminal?**
 Dentro de la sesión, pulsa `Ctrl-b` y luego la flecha `→` o `←`. También puedes hacer clic en el
