@@ -42,6 +42,7 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
 | [Rust](https://rustup.rs) 1.82 o superior | Para compilar pastor |
 | Al menos un agente: `claude`, `codex` u `opencode` | Los agentes que vas a manejar; deben estar en tu `PATH` |
 | `notify-send` (opcional) | Notificaciones de escritorio en Linux |
+| Una [Nerd Font](https://www.nerdfonts.com) (recomendada) | Iconos en la interfaz; sin ella usa `PASTOR_ICONS=simple` (ver [Iconos y fuente](#iconos-y-fuente)) |
 
 ### Instalar los requisitos
 
@@ -122,6 +123,8 @@ Cambia de pestaña con `1`, `2`, `3` o `Tab`. Sal con `q` (los agentes siguen co
 | `t` | Abrir una terminal al lado del agente (ver abajo) |
 | `T` | Cerrar esa terminal |
 | `x` | Terminar el agente (pide confirmación) |
+| `<` `>` | Estrechar / ensanchar la lista de agentes |
+| `[` `]` | Ensanchar / estrechar la terminal de al lado |
 
 #### Terminal al lado del agente
 
@@ -134,7 +137,7 @@ proyecto. pastor te propone un comando para ejecutar en ella:
 
 Puedes cambiarlo o dejarlo vacío para abrir una terminal sin comando. Al confirmar:
 
-- En la lista, el agente muestra `⊞`.
+- En la lista, el agente muestra el icono de terminal (`⊞` en modo simple).
 - La vista previa se divide en dos: el agente a la izquierda y la terminal a la derecha.
 - Al entrar con `⏎` ves los dos paneles lado a lado. El foco empieza en el agente; cambia de
   panel con **`Ctrl-b` y una flecha** (o con el ratón).
@@ -153,6 +156,7 @@ abrir otra con `t`.
 | `d` | Marcar como hecha |
 | `g` | Ir al agente que tiene la tarea |
 | `x` | Borrar la tarea (pide confirmación) |
+| `<` `>` | Agrandar / achicar el panel de descripción |
 
 Al asignar una tarea, pastor le envía al agente el título y la descripción como mensaje, y la
 marca *en curso*. Cuando el agente termina, pasa a *por revisar*.
@@ -171,6 +175,9 @@ lista de lo que necesita tu atención: agentes esperando respuesta y tareas por 
 | `⏎` | Confirmar |
 | `Esc` | Cancelar |
 | `Ctrl-u` | Borrar el campo |
+
+Puedes pegar texto con varias líneas: en los campos de mensaje y descripción se conservan los
+saltos de línea, y en los demás se convierten en espacios. Pegar nunca confirma el formulario.
 
 ## Línea de comandos
 
@@ -209,7 +216,34 @@ pastor task done t1
 pastor task rm t1
 ```
 
+## Iconos y fuente
+
+pastor usa iconos de [Nerd Font](https://www.nerdfonts.com): una oveja como logo, un icono por
+tipo de agente, carpeta, terminal, estados de las tareas, etc. Los agentes que están trabajando
+muestran un spinner animado.
+
+La fuente no la elige pastor sino tu emulador de terminal. Para ver los iconos:
+
+1. Descarga una Nerd Font (por ejemplo *JetBrainsMono Nerd Font*) de
+   [nerdfonts.com/font-downloads](https://www.nerdfonts.com/font-downloads) e instálala
+   (en Linux, copia los `.ttf` a `~/.local/share/fonts` y ejecuta `fc-cache -f`).
+2. Selecciónala como fuente de tu terminal. En kitty, por ejemplo, en `~/.config/kitty/kitty.conf`:
+
+   ```
+   font_family JetBrainsMono Nerd Font
+   ```
+
+Si no quieres instalar una Nerd Font y ves cuadritos (`□`) en lugar de iconos, usa el modo simple,
+con símbolos que muestra cualquier fuente:
+
+```sh
+export PASTOR_ICONS=simple   # agrégalo a tu ~/.bashrc o ~/.zshrc
+```
+
 ## Estados de un agente
+
+Iconos del modo simple; con Nerd Font cada estado tiene su propio icono, y *trabajando* se
+muestra con un spinner animado.
 
 | Icono | Estado | Significa |
 |---|---|---|

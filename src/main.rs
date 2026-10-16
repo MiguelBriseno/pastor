@@ -1,5 +1,6 @@
 mod agent;
 mod hooks;
+mod icons;
 mod ops;
 mod store;
 mod tmux;
