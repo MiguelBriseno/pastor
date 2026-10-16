@@ -145,8 +145,8 @@ Puedes cambiarlo o dejarlo vacío para abrir una terminal sin comando. Al confir
   panel con **`Ctrl-b` y una flecha** (o con el ratón).
 
 La terminal es un shell normal: `Ctrl-c` detiene el servidor y puedes escribir otros comandos.
-Pulsa `T` para cerrarla. Si la cierras escribiendo `exit`, aparecerá como *cerrada* y puedes
-abrir otra con `t`.
+Pulsa `T` para cerrarla, o escribe `exit` en ella: el panel se cierra solo y puedes abrir otra
+con `t`.
 
 ### 2 · Tareas
 

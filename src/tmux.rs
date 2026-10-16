@@ -172,6 +172,9 @@ pub fn split_right(pane: &str, cwd: &Path) -> Result<String> {
     ];
     let id = run(&args)?.trim().to_string();
     set_role(&id, "term")?;
+    // La ventana tiene remain-on-exit para el agente; la terminal, en cambio,
+    // se cierra sola al hacer `exit`.
+    run(&["set-option", "-p", "-t", &id, "remain-on-exit", "off"])?;
     Ok(id)
 }
 

@@ -72,7 +72,8 @@ PATH se ajusta después de leer la configuración del usuario (`--rcfile` en bas
 `-C` en fish), porque el `.bashrc` suele anteponer sus propios directorios.
 
 Además, cada sesión se crea con `remain-on-exit on`: si hasta el shell termina, el panel sigue
-visible para leer lo último que escribió, y tmux lo marca como `pane_dead`.
+visible para leer lo último que escribió, y tmux lo marca como `pane_dead`. La terminal
+secundaria lo desactiva en su propio panel (`set-option -p`), así que al hacer `exit` se cierra sola.
 
 ### El estado se lee del disco en cada operación
 
