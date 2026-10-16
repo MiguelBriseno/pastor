@@ -30,6 +30,9 @@ pub struct Agent {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub task: Option<String>,
+    /// Último comando usado en la terminal secundaria (p. ej. "npm run dev").
+    #[serde(default)]
+    pub term_cmd: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +146,7 @@ impl State {
             cwd,
             created_at: Utc::now(),
             task: None,
+            term_cmd: None,
         };
         self.agents.push(agent.clone());
         agent

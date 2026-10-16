@@ -62,6 +62,22 @@ enum Cmd {
         )]
         text: Vec<String>,
     },
+    /// Abre (o cierra) una terminal al lado del agente, p. ej. para `npm run dev`
+    Term {
+        /// Id o nombre del agente
+        #[arg(value_name = "AGENTE")]
+        agent: String,
+        /// Comando a ejecutar en la terminal (opcional)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMANDO"
+        )]
+        cmd: Vec<String>,
+        /// Cierra la terminal en vez de abrirla
+        #[arg(long, conflicts_with = "cmd")]
+        close: bool,
+    },
     /// Termina un agente
     Kill {
         /// Id o nombre del agente
@@ -219,7 +235,16 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Attach { agent }) => tmux::attach(&State::load()?.find_agent(&agent)?.id),
+        Some(Cmd::Attach { agent }) => ops::attach(&agent),
+        Some(Cmd::Term {
+            agent, close: true, ..
+        }) => ops::close_term(&agent),
+        Some(Cmd::Term { agent, cmd, .. }) => {
+            let cmd = cmd.join(" ");
+            ops::open_term(&agent, Some(&cmd))?;
+            println!("Terminal abierta junto a {agent}. Entra con `pastor attach {agent}`.");
+            Ok(())
+        }
         Some(Cmd::Send { agent, text }) => ops::send(&agent, &text.join(" ")),
         Some(Cmd::Kill { agent }) => ops::kill_agent(&agent),
         Some(Cmd::Task(cmd)) => task_cmd(cmd),

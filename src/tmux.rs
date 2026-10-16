@@ -65,8 +65,10 @@ pub fn new_session(name: &str, cwd: &Path, env: &[(&str, &str)], cmd: &[String])
     for e in &env {
         args.extend(["-e", e.as_str()]);
     }
+    args.extend(["-P", "-F", "#{pane_id}"]);
     args.push(&shell_cmd);
-    run(&args)?;
+    let pane = run(&args)?.trim().to_string();
+    set_role(&pane, "agent")?;
 
     // Si el agente termina, dejamos el panel visible para poder leer su salida.
     run(&["set-option", "-w", "-t", name, "remain-on-exit", "on"])?;
@@ -76,32 +78,92 @@ pub fn new_session(name: &str, cwd: &Path, env: &[(&str, &str)], cmd: &[String])
         ("status-style", "bg=colour236,fg=colour250"),
         ("status-left", " pastor:#S "),
         ("status-left-length", "30"),
-        ("status-right", " Ctrl-b d → volver a pastor "),
-        ("status-right-length", "40"),
+        (
+            "status-right",
+            " Ctrl-b ←→ cambiar panel · Ctrl-b d volver a pastor ",
+        ),
+        ("status-right-length", "60"),
     ] {
         run(&["set-option", "-t", name, opt, val])?;
     }
     Ok(())
 }
 
-pub struct PaneInfo {
-    pub dead: bool,
+/// Marca un panel como `agent` o `term` para encontrarlo después.
+fn set_role(pane: &str, role: &str) -> Result<()> {
+    run(&["set-option", "-p", "-t", pane, "@pastor_role", role]).map(|_| ())
 }
 
-/// Paneles vivos por nombre de sesión. Vacío si el servidor no está corriendo.
-pub fn panes() -> HashMap<String, PaneInfo> {
-    let Ok(out) = run(&["list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}"]) else {
+#[derive(Clone, Debug)]
+pub struct Pane {
+    pub id: String,
+    pub dead: bool,
+    /// Ancho y alto; si cambian, el redibujo no es actividad del agente.
+    pub size: String,
+    /// "agent", "term" o vacío (agentes creados antes de existir las marcas).
+    pub role: String,
+}
+
+/// Paneles de cada sesión. Vacío si el servidor no está corriendo.
+pub fn panes() -> HashMap<String, Vec<Pane>> {
+    let format =
+        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{@pastor_role}";
+    let Ok(out) = run(&["list-panes", "-a", "-F", format]) else {
         return HashMap::new();
     };
-    out.lines()
-        .filter_map(|l| l.split_once('\t'))
-        .map(|(s, d)| (s.to_string(), PaneInfo { dead: d == "1" }))
-        .collect()
+    let mut map: HashMap<String, Vec<Pane>> = HashMap::new();
+    for line in out.lines() {
+        let mut f = line.split('\t');
+        let (Some(session), Some(id), Some(dead), Some(size)) =
+            (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        map.entry(session.to_string()).or_default().push(Pane {
+            id: id.to_string(),
+            dead: dead == "1",
+            size: size.to_string(),
+            role: f.next().unwrap_or_default().to_string(),
+        });
+    }
+    map
+}
+
+/// Abre una terminal a la derecha de `pane` (sin quitarle el foco) y devuelve su id.
+pub fn split_right(pane: &str, cwd: &Path) -> Result<String> {
+    let cwd = cwd.to_string_lossy();
+    let args = [
+        "split-window",
+        "-h",
+        "-d",
+        "-l",
+        "40%",
+        "-t",
+        pane,
+        "-c",
+        &cwd,
+        "-P",
+        "-F",
+        "#{pane_id}",
+    ];
+    let id = run(&args)?.trim().to_string();
+    set_role(&id, "term")?;
+    Ok(id)
+}
+
+/// Escribe `line` en el panel y pulsa Enter, como si lo tecleara el usuario.
+pub fn type_line(pane: &str, line: &str) -> Result<()> {
+    run(&["send-keys", "-t", pane, "-l", line])?;
+    run(&["send-keys", "-t", pane, "Enter"]).map(|_| ())
+}
+
+pub fn kill_pane(pane: &str) -> Result<()> {
+    run(&["kill-pane", "-t", pane]).map(|_| ())
 }
 
 /// Texto visible del panel.
-pub fn capture(name: &str) -> Result<String> {
-    run(&["capture-pane", "-p", "-J", "-t", name])
+pub fn capture(target: &str) -> Result<String> {
+    run(&["capture-pane", "-p", "-J", "-t", target])
 }
 
 /// Pega `text` en el agente (bracketed paste) y pulsa Enter.
@@ -122,8 +184,12 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Se engancha a la sesión en la terminal actual (bloquea hasta Ctrl-b d).
-pub fn attach(name: &str) -> Result<()> {
+/// Se engancha a la sesión en la terminal actual (bloquea hasta Ctrl-b d),
+/// con el foco en `focus` si se indica.
+pub fn attach(name: &str, focus: Option<&str>) -> Result<()> {
+    if let Some(pane) = focus {
+        run(&["select-pane", "-t", pane])?;
+    }
     let status = tmux()
         .args(["attach-session", "-t", name])
         .env_remove("TMUX")

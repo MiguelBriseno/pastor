@@ -24,7 +24,6 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::agent::{Kind, Status};
 use crate::ops::{self, AssignTarget, Snapshot, Tracker};
 use crate::store::{Agent, State, Task, TaskStatus};
-use crate::tmux;
 
 const REFRESH: Duration = Duration::from_secs(1);
 const SELECTED: Color = Color::Rgb(45, 45, 60);
@@ -48,6 +47,10 @@ enum Mode {
     Normal,
     NewAgent(NewAgentForm),
     Send {
+        agent: String,
+        input: String,
+    },
+    Term {
         agent: String,
         input: String,
     },
@@ -275,7 +278,7 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('a') => {
                 if let Some((id, _)) = selected {
-                    let result = suspend(term, || tmux::attach(&id));
+                    let result = suspend(term, || ops::attach(&id));
                     self.refresh();
                     result?;
                 }
@@ -286,6 +289,33 @@ impl App {
                         agent: id,
                         input: String::new(),
                     };
+                }
+            }
+            KeyCode::Char('t') => {
+                if let Some(a) = self.selected_agent() {
+                    let open = self
+                        .snaps
+                        .get(&a.id)
+                        .and_then(|s| s.term.as_ref())
+                        .is_some_and(|t| !t.dead);
+                    if open {
+                        self.set_flash(format!(
+                            "{} ya tiene terminal · ⏎ para verla, T para cerrarla",
+                            a.name
+                        ));
+                    } else {
+                        self.mode = Mode::Term {
+                            agent: a.id.clone(),
+                            input: ops::suggest_term_cmd(a),
+                        };
+                    }
+                }
+            }
+            KeyCode::Char('T') => {
+                if let Some((id, name)) = selected {
+                    ops::close_term(&id)?;
+                    self.set_flash(format!("Terminal de {name} cerrada"));
+                    self.refresh();
                 }
             }
             KeyCode::Char('x') => {
@@ -431,6 +461,19 @@ impl App {
                 } else {
                     edit(&mut input, &key);
                     self.mode = Mode::Send { agent, input };
+                }
+            }
+            Mode::Term { agent, mut input } => {
+                if key.code == KeyCode::Enter {
+                    ops::open_term(&agent, Some(&input))?;
+                    self.set_flash(format!(
+                        "Terminal abierta junto a {} · ⏎ para entrar",
+                        self.agent_name(&agent)
+                    ));
+                    self.refresh();
+                } else {
+                    edit(&mut input, &key);
+                    self.mode = Mode::Term { agent, input };
                 }
             }
             Mode::NewTask {
@@ -582,6 +625,11 @@ impl App {
                 .iter()
                 .map(|a| {
                     let st = self.status(&a.id);
+                    let term_open = self
+                        .snaps
+                        .get(&a.id)
+                        .and_then(|s| s.term.as_ref())
+                        .is_some_and(|t| !t.dead);
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" {} ", st.icon()), Style::default().fg(st.color())),
                         Span::styled(
@@ -592,7 +640,14 @@ impl App {
                             format!(" {:<9}", a.kind.to_string()),
                             Style::default().fg(Color::DarkGray),
                         ),
-                        Span::styled(st.label(), Style::default().fg(st.color())),
+                        Span::styled(
+                            format!("{:<11}", st.label()),
+                            Style::default().fg(st.color()),
+                        ),
+                        Span::styled(
+                            if term_open { "⊞" } else { " " },
+                            Style::default().fg(Color::Cyan),
+                        ),
                     ]))
                 })
                 .collect();
@@ -606,13 +661,32 @@ impl App {
             f.render_widget(Block::bordered().border_type(BorderType::Rounded), right);
             return;
         };
-        let screen = self.snaps.get(&a.id).map_or("", |s| s.screen.as_str());
-        let mut lines: Vec<&str> = screen.lines().collect();
-        while lines.last().is_some_and(|l| l.trim().is_empty()) {
-            lines.pop();
-        }
+        let snap = self.snaps.get(&a.id);
+        let screen = snap.map_or("", |s| s.screen.as_str());
+
+        // Con terminal abierta, la vista se divide igual que en tmux: agente | terminal.
+        let right = match snap.and_then(|s| s.term.as_ref()) {
+            Some(t) => {
+                let [l, r] =
+                    Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .areas(right);
+                let title = match (&a.term_cmd, t.dead) {
+                    (_, true) => " terminal · cerrada ".to_string(),
+                    (Some(c), false) => format!(" terminal · {c} "),
+                    (None, false) => " terminal ".to_string(),
+                };
+                let block = Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(title);
+                let h = r.height.saturating_sub(2) as usize;
+                f.render_widget(Paragraph::new(tail(&t.screen, h)).block(block), r);
+                l
+            }
+            None => right,
+        };
         let h = right.height.saturating_sub(2) as usize;
-        let text = lines[lines.len().saturating_sub(h)..].join("\n");
+        let text = tail(screen, h);
 
         let st = self.status(&a.id);
         let mut block = Block::bordered()
@@ -841,7 +915,7 @@ impl App {
             }
         }
         let help = match (&self.mode, self.tab) {
-            (Mode::Normal, Tab::Agents) => "↑↓ mover · ⏎ entrar · n nuevo · s enviar mensaje · x terminar · 1-3 pestañas · q salir",
+            (Mode::Normal, Tab::Agents) => "↑↓ mover · ⏎ entrar · n nuevo · s mensaje · t terminal · T cerrar terminal · x terminar · q salir",
             (Mode::Normal, Tab::Tasks) => "↑↓ mover · n nueva · ⏎ asignar · espacio avanzar estado · d hecha · g ir al agente · x borrar",
             (Mode::Normal, Tab::Dashboard) => "1-3 pestañas · q salir",
             (Mode::Confirm { .. }, _) => "y confirmar · cualquier otra tecla cancela",
@@ -894,6 +968,20 @@ impl App {
                     Paragraph::new(vec![Line::raw(""), field_line("Mensaje", input, true)]),
                     inner,
                 );
+            }
+            Mode::Term { agent, input } => {
+                let inner = popup(
+                    f,
+                    &format!(" Terminal junto a {} ", self.agent_name(agent)),
+                    80,
+                    5,
+                );
+                let lines = vec![
+                    Line::raw(""),
+                    field_line("Comando", input, true),
+                    Line::from("  Déjalo vacío para abrir solo una terminal.".dark_gray()),
+                ];
+                f.render_widget(Paragraph::new(lines), inner);
             }
             Mode::NewTask { title, desc, field } => {
                 let inner = popup(f, " Nueva tarea ", 80, 5);
@@ -949,6 +1037,15 @@ fn suspend<T>(term: &mut DefaultTerminal, f: impl FnOnce() -> Result<T>) -> Resu
     execute!(io::stdout(), EnterAlternateScreen)?;
     term.clear()?;
     result
+}
+
+/// Las últimas `h` líneas con contenido de una pantalla capturada.
+fn tail(screen: &str, h: usize) -> String {
+    let mut lines: Vec<&str> = screen.lines().collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines[lines.len().saturating_sub(h)..].join("\n")
 }
 
 fn notify(msg: &str) {

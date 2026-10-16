@@ -16,6 +16,7 @@ pastor es un cliente que lanza sesiones, lee sus pantallas y guarda su propio es
                  ▼
    ┌──────────────── servidor tmux "pastor" ─────────────────┐
    │  sesión a1: claude --settings …   ──hooks──▶ pastor hook │
+   │             └ panel "term": npm run dev                  │
    │  sesión a2: codex                                        │
    │  sesión a3: opencode                                     │
    └──────────────────────────────────────────────────────────┘
@@ -39,6 +40,18 @@ pastor es un cliente que lanza sesiones, lee sus pantallas y guarda su propio es
 
 Todos los comandos usan `tmux -L pastor`, así las sesiones de los agentes no se mezclan con las
 del usuario. Las sesiones se llaman como el id del agente (`a1`, `a2`…).
+
+### Los paneles se marcan por rol
+
+Una sesión puede tener dos paneles: el del agente y, si se abrió, la terminal secundaria. Cada
+panel lleva la opción de tmux `@pastor_role` con el valor `agent` o `term`, y pastor les habla
+por su id de panel (`%3`, `%7`…), nunca por el nombre de la sesión. Así, aunque dejes el foco en
+la terminal, los mensajes y la lectura de pantalla siempre van al agente. Los agentes creados
+antes de existir las marcas se tratan como si su primer panel fuera el agente.
+
+Abrir la terminal cambia el ancho del panel del agente y lo obliga a redibujarse. Para que eso no
+parezca actividad, el `Tracker` guarda también el tamaño del panel y no cuenta como cambio un
+redibujo causado por un cambio de tamaño.
 
 Cada sesión se crea con `remain-on-exit on`: si el agente termina, su panel sigue visible para
 leer lo último que escribió, y tmux lo marca como `pane_dead`.

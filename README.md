@@ -22,6 +22,8 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   tu terminal, los agentes siguen trabajando; al volver los encuentras como los dejaste.
 - **Estado en vivo.** Cada agente aparece como *trabajando*, *esperando* (necesita tu
   aprobación o respuesta), *inactivo* o *terminado*.
+- **Terminal al lado de cada agente.** Abre una terminal junto al agente, en su mismo directorio,
+  para correr por ejemplo `npm run dev` mientras el agente hace cambios.
 - **Notificaciones de escritorio** cuando un agente te necesita o termina su trabajo.
 - **Tareas.** Crea tareas y asígnalas a un agente existente o a uno nuevo. Cuando el agente
   termina, la tarea pasa sola a *por revisar*.
@@ -36,7 +38,7 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
 | Requisito | Para qué |
 |---|---|
 | Linux o macOS | Windows no está soportado (se puede usar desde WSL) |
-| [tmux](https://github.com/tmux/tmux) 3.0 o superior | Mantiene vivas las terminales de los agentes |
+| [tmux](https://github.com/tmux/tmux) 3.1 o superior | Mantiene vivas las terminales de los agentes |
 | [Rust](https://rustup.rs) 1.82 o superior | Para compilar pastor |
 | Al menos un agente: `claude`, `codex` u `opencode` | Los agentes que vas a manejar; deben estar en tu `PATH` |
 | `notify-send` (opcional) | Notificaciones de escritorio en Linux |
@@ -117,7 +119,29 @@ Cambia de pestaña con `1`, `2`, `3` o `Tab`. Sal con `q` (los agentes siguen co
 | `⏎` o `a` | Entrar a la terminal del agente (volver con `Ctrl-b d`) |
 | `n` | Lanzar un agente nuevo |
 | `s` | Enviarle un mensaje sin entrar |
+| `t` | Abrir una terminal al lado del agente (ver abajo) |
+| `T` | Cerrar esa terminal |
 | `x` | Terminar el agente (pide confirmación) |
+
+#### Terminal al lado del agente
+
+Pulsa `t` sobre un agente para abrir una terminal a su derecha, en el mismo directorio del
+proyecto. pastor te propone un comando para ejecutar en ella:
+
+- el último que usaste con ese agente, o
+- si el proyecto tiene un script `dev` en `package.json`, `npm run dev` (o `pnpm dev`, `yarn dev`,
+  `bun dev`, según el lockfile que encuentre).
+
+Puedes cambiarlo o dejarlo vacío para abrir una terminal sin comando. Al confirmar:
+
+- En la lista, el agente muestra `⊞`.
+- La vista previa se divide en dos: el agente a la izquierda y la terminal a la derecha.
+- Al entrar con `⏎` ves los dos paneles lado a lado. El foco empieza en el agente; cambia de
+  panel con **`Ctrl-b` y una flecha** (o con el ratón).
+
+La terminal es un shell normal: `Ctrl-c` detiene el servidor y puedes escribir otros comandos.
+Pulsa `T` para cerrarla. Si la cierras escribiendo `exit`, aparecerá como *cerrada* y puedes
+abrir otra con `t`.
 
 ### 2 · Tareas
 
@@ -163,7 +187,10 @@ pastor new claude -p "arregla los tests que fallan" # con un primer mensaje
 pastor ls                     # lista agentes y su estado
 pastor attach web             # entra a su terminal (salir con Ctrl-b d)
 pastor send web "ahora agrega pruebas para el login"
-pastor kill web               # lo termina
+pastor term web npm run dev   # abre una terminal al lado y ejecuta el comando
+pastor term web               # abre una terminal sin comando
+pastor term web --close       # la cierra
+pastor kill web               # lo termina (y su terminal)
 ```
 
 Puedes referirte a un agente por su **id** (`a1`, `a2`…) o por su **nombre**. Si no le das
@@ -201,6 +228,14 @@ pastor task rm t1
   de permiso. Si una versión nueva cambia esos textos, la detección puede fallar; avísanos con un
   issue.
 
+  Con Codex y opencode, el paso automático de la tarea a *por revisar* lo hace la interfaz, así
+  que solo ocurre mientras `pastor` está abierto. Con Claude Code ocurre siempre, gracias a los
+  hooks.
+
+> **opencode no pide permisos por defecto:** ejecuta comandos y edita archivos sin preguntar, así
+> que nunca lo verás *esperando* por una aprobación. Si quieres que pregunte, agrega a tu
+> `opencode.json` algo como `"permission": { "bash": "ask", "edit": "ask" }`.
+
 ## Preguntas frecuentes
 
 **¿Qué pasa si cierro pastor?**
@@ -216,6 +251,10 @@ No. pastor usa su propio servidor (`tmux -L pastor`). Puedes verlo con `tmux -L 
 **Estoy dentro de un agente y no sé salir.**
 Pulsa `Ctrl-b` y luego `d`. Eso te saca sin cerrar al agente. No uses `/exit` a menos que quieras
 terminarlo.
+
+**¿Cómo paso del agente a su terminal?**
+Dentro de la sesión, pulsa `Ctrl-b` y luego la flecha `→` o `←`. También puedes hacer clic en el
+panel.
 
 **¿Dónde guarda sus datos?**
 En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` en macOS:
