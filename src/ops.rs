@@ -31,7 +31,16 @@ pub fn new_agent(
     let cmd = kind.launch_command(prompt)?;
     let agent = State::update(|s| Ok(s.add_agent(kind, cwd, name)))?;
     hooks::clear_status(&agent.id);
-    if let Err(e) = tmux::new_session(&agent.id, &agent.cwd, &[("PASTOR_AGENT", &agent.id)], &cmd) {
+    let started = hooks::relaunch_shell().and_then(|then| {
+        tmux::new_session(
+            &agent.id,
+            &agent.cwd,
+            &[("PASTOR_AGENT", &agent.id)],
+            &cmd,
+            &then,
+        )
+    });
+    if let Err(e) = started {
         let _ = State::update(|s| {
             s.agents.retain(|a| a.id != agent.id);
             Ok(())
@@ -70,11 +79,27 @@ pub fn agent_panes(agent_id: &str) -> AgentPanes {
     split_panes(tmux::panes().remove(agent_id).unwrap_or_default())
 }
 
-/// Panel al que hay que hablarle para llegar al agente.
-fn agent_target(agent_id: &str) -> String {
-    agent_panes(agent_id)
-        .agent
-        .map_or(agent_id.to_string(), |p| p.id)
+/// Si el panel del agente quedó en el shell (el agente salió con /exit, por
+/// ejemplo). Se mira el proceso en primer plano.
+fn at_shell(pane: &tmux::Pane) -> bool {
+    const SHELLS: &[&str] = &[
+        "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "xonsh", "elvish",
+    ];
+    let cmd = pane.command.trim_start_matches('-');
+    let user_shell = std::env::var("SHELL").unwrap_or_default();
+    SHELLS.contains(&cmd) || Path::new(&user_shell).file_name().is_some_and(|s| s == cmd)
+}
+
+/// Panel al que hay que hablarle para llegar al agente. Falla si el agente
+/// no está corriendo: el texto llegaría al shell y se ejecutaría como comando.
+fn agent_target(agent: &Agent) -> Result<String> {
+    match agent_panes(&agent.id).agent {
+        Some(p) if !p.dead && !at_shell(&p) => Ok(p.id),
+        _ => bail!(
+            "el agente {} no está corriendo; entra a su terminal y vuelve a abrirlo",
+            agent.name
+        ),
+    }
 }
 
 pub fn send(agent_key: &str, text: &str) -> Result<()> {
@@ -200,7 +225,7 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
     let agent = match target {
         AssignTarget::Existing(key) => {
             let a = state.find_agent(&key)?.clone();
-            tmux::send_text(&agent_target(&a.id), &prompt)?;
+            tmux::send_text(&agent_target(&a)?, &prompt)?;
             a
         }
         AssignTarget::New { kind, cwd } => new_agent(kind, Some(cwd), None, Some(&prompt))?,
@@ -339,6 +364,7 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
             });
             let obs = Observation {
                 dead: pane.is_none_or(|p| p.dead),
+                at_shell: pane.is_some_and(at_shell),
                 screen: &screen,
                 last_change: tracker.observe(&a.id, &screen, pane.map_or("", |p| p.size.as_str())),
                 age_secs: (Utc::now() - a.created_at).num_seconds(),

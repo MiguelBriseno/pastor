@@ -55,8 +55,21 @@ Abrir la terminal cambia el ancho del panel del agente y lo obliga a redibujarse
 parezca actividad, el `Tracker` guarda también el tamaño del panel y no cuenta como cambio un
 redibujo causado por un cambio de tamaño.
 
-Cada sesión se crea con `remain-on-exit on`: si el agente termina, su panel sigue visible para
-leer lo último que escribió, y tmux lo marca como `pane_dead`.
+### Al salir el agente queda un shell
+
+El panel del agente ejecuta `sh -c '<agente>; exec $SHELL'`. Si el agente termina (por ejemplo con
+`/exit`), en su panel queda el shell del usuario y desde ahí se puede volver a abrir. pastor sabe
+que el agente no está corriendo porque el proceso en primer plano (`pane_current_command`) es un
+shell. En ese caso lo muestra como **terminado** y no le pega mensajes, porque se ejecutarían como
+comandos.
+
+Ese shell lleva al inicio del PATH `~/.local/share/pastor/shell/bin`, donde hay un `claude` que
+llama al real con `--settings`. Así, si lo vuelves a abrir a mano, los hooks siguen funcionando. El
+PATH se ajusta después de leer la configuración del usuario (`--rcfile` en bash, `ZDOTDIR` en zsh,
+`-C` en fish), porque el `.bashrc` suele anteponer sus propios directorios.
+
+Además, cada sesión se crea con `remain-on-exit on`: si hasta el shell termina, el panel sigue
+visible para leer lo último que escribió, y tmux lo marca como `pane_dead`.
 
 ### El estado se lee del disco en cada operación
 
@@ -80,7 +93,7 @@ cambia de tamaño. Las líneas que no entiende se ignoran.
 
 `agent::classify` decide en este orden:
 
-1. Si el panel está muerto → **terminado**.
+1. Si el panel está muerto, o en primer plano hay un shell (el agente salió) → **terminado**.
 2. Si en las últimas líneas de la pantalla hay un diálogo de permiso o confirmación
    (`do you want to`, `enter to confirm`…) → **esperando**.
 3. Si aparece `esc to interrupt` → **trabajando**.

@@ -40,15 +40,27 @@ pub fn ensure_available() -> Result<()> {
     Ok(())
 }
 
-/// Crea una sesión desacoplada que ejecuta `cmd` en `cwd`.
-pub fn new_session(name: &str, cwd: &Path, env: &[(&str, &str)], cmd: &[String]) -> Result<()> {
+/// Crea una sesión desacoplada que ejecuta `cmd` en `cwd`. Cuando `cmd`
+/// termina, se ejecuta `then` (código de `sh`), que deja abierto un shell
+/// para poder volver a lanzar el agente.
+pub fn new_session(
+    name: &str,
+    cwd: &Path,
+    env: &[(&str, &str)],
+    cmd: &[String],
+    then: &str,
+) -> Result<()> {
     let cwd = cwd.to_string_lossy();
     let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let shell_cmd = cmd
+    let agent_cmd = cmd
         .iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
+    let script = format!(
+        "{agent_cmd}\nprintf '\\n\\033[2m%s\\033[0m\\n\\n' {}\n{then}",
+        shell_quote("El agente terminó. Escribe claude, codex u opencode para abrirlo de nuevo."),
+    );
 
     let mut args = vec![
         "new-session",
@@ -66,11 +78,13 @@ pub fn new_session(name: &str, cwd: &Path, env: &[(&str, &str)], cmd: &[String])
         args.extend(["-e", e.as_str()]);
     }
     args.extend(["-P", "-F", "#{pane_id}"]);
-    args.push(&shell_cmd);
+    // Varios argumentos: tmux ejecuta `sh` directamente, sin pasar por el
+    // shell del usuario (que podría ser fish).
+    args.extend(["sh", "-c", &script, "pastor"]);
     let pane = run(&args)?.trim().to_string();
     set_role(&pane, "agent")?;
 
-    // Si el agente termina, dejamos el panel visible para poder leer su salida.
+    // Si hasta el shell termina, dejamos el panel visible para poder leer su salida.
     run(&["set-option", "-w", "-t", name, "remain-on-exit", "on"])?;
     run(&["set-option", "-g", "focus-events", "on"])?;
     for (opt, val) in [
@@ -102,20 +116,22 @@ pub struct Pane {
     pub size: String,
     /// "agent", "term" o vacío (agentes creados antes de existir las marcas).
     pub role: String,
+    /// Proceso en primer plano (p. ej. "claude" o "bash").
+    pub command: String,
 }
 
 /// Paneles de cada sesión. Vacío si el servidor no está corriendo.
 pub fn panes() -> HashMap<String, Vec<Pane>> {
     let format =
-        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{@pastor_role}";
+        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{@pastor_role}";
     let Ok(out) = run(&["list-panes", "-a", "-F", format]) else {
         return HashMap::new();
     };
     let mut map: HashMap<String, Vec<Pane>> = HashMap::new();
     for line in out.lines() {
         let mut f = line.split('\t');
-        let (Some(session), Some(id), Some(dead), Some(size)) =
-            (f.next(), f.next(), f.next(), f.next())
+        let (Some(session), Some(id), Some(dead), Some(size), Some(command)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next())
         else {
             continue;
         };
@@ -123,6 +139,7 @@ pub fn panes() -> HashMap<String, Vec<Pane>> {
             id: id.to_string(),
             dead: dead == "1",
             size: size.to_string(),
+            command: command.to_string(),
             role: f.next().unwrap_or_default().to_string(),
         });
     }
