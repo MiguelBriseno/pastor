@@ -58,10 +58,13 @@ redibujo causado por un cambio de tamaño.
 ### Al salir el agente queda un shell
 
 El panel del agente ejecuta `sh -c '<agente>; exec $SHELL'`. Si el agente termina (por ejemplo con
-`/exit`), en su panel queda el shell del usuario y desde ahí se puede volver a abrir. pastor sabe
-que el agente no está corriendo porque el proceso en primer plano (`pane_current_command`) es un
-shell. En ese caso lo muestra como **terminado** y no le pega mensajes, porque se ejecutarían como
-comandos.
+`/exit`), en su panel queda el shell del usuario y desde ahí se puede volver a abrir. pastor lo
+sabe por el proceso en primer plano (`pane_current_command`). Mientras corre el primer agente es el
+`sh` que lo lanzó, porque comparte grupo de procesos con él; cuando el agente sale, ese `sh` marca
+el panel con `@pastor_exited`. Lo que se abre después desde el shell interactivo sí queda en primer
+plano, así que el agente cuenta como vivo solo si ahí está `claude`, `codex`, `opencode`, `node` o
+`bun`. Si no, lo muestra como **terminado**, borra el estado de sus hooks y no le pega mensajes,
+porque se ejecutarían como comandos.
 
 Ese shell lleva al inicio del PATH `~/.local/share/pastor/shell/bin`, donde hay un `claude` que
 llama al real con `--settings`. Así, si lo vuelves a abrir a mano, los hooks siguen funcionando. El
@@ -93,7 +96,7 @@ cambia de tamaño. Las líneas que no entiende se ignoran.
 
 `agent::classify` decide en este orden:
 
-1. Si el panel está muerto, o en primer plano hay un shell (el agente salió) → **terminado**.
+1. Si el panel está muerto, o el agente salió y en primer plano no hay un agente → **terminado**.
 2. Si en las últimas líneas de la pantalla hay un diálogo de permiso o confirmación
    (`do you want to`, `enter to confirm`…) → **esperando**.
 3. Si aparece `esc to interrupt` → **trabajando**.
