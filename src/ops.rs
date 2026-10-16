@@ -79,22 +79,24 @@ pub fn agent_panes(agent_id: &str) -> AgentPanes {
     split_panes(tmux::panes().remove(agent_id).unwrap_or_default())
 }
 
-/// Si el panel del agente quedó en el shell (el agente salió con /exit, por
-/// ejemplo). Se mira el proceso en primer plano.
-fn at_shell(pane: &tmux::Pane) -> bool {
-    const SHELLS: &[&str] = &[
-        "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "xonsh", "elvish",
-    ];
-    let cmd = pane.command.trim_start_matches('-');
-    let user_shell = std::env::var("SHELL").unwrap_or_default();
-    SHELLS.contains(&cmd) || Path::new(&user_shell).file_name().is_some_and(|s| s == cmd)
+/// Si el agente ya no corre en su panel: salió (con /exit, por ejemplo) y
+/// quedó el shell, o lo que el usuario haya abierto ahí. Se mira el proceso en
+/// primer plano. Mientras corre el primer agente es el `sh` que lo lanzó, porque
+/// comparte grupo de procesos con él, hasta que ese `sh` marca la salida. Lo que
+/// se abre después desde el shell interactivo sí queda en primer plano.
+fn agent_gone(pane: &tmux::Pane) -> bool {
+    match pane.command.as_str() {
+        "sh" => pane.exited,
+        // Instalados con npm o bun, los agentes aparecen como su intérprete.
+        cmd => !(Kind::ALL.iter().any(|k| k.bin() == cmd) || cmd == "node" || cmd == "bun"),
+    }
 }
 
 /// Panel al que hay que hablarle para llegar al agente. Falla si el agente
 /// no está corriendo: el texto llegaría al shell y se ejecutaría como comando.
 fn agent_target(agent: &Agent) -> Result<String> {
     match agent_panes(&agent.id).agent {
-        Some(p) if !p.dead && !at_shell(&p) => Ok(p.id),
+        Some(p) if !p.dead && !agent_gone(&p) => Ok(p.id),
         _ => bail!(
             "el agente {} no está corriendo; entra a su terminal y vuelve a abrirlo",
             agent.name
@@ -364,11 +366,15 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
             });
             let obs = Observation {
                 dead: pane.is_none_or(|p| p.dead),
-                at_shell: pane.is_some_and(at_shell),
+                gone: pane.is_some_and(agent_gone),
                 screen: &screen,
                 last_change: tracker.observe(&a.id, &screen, pane.map_or("", |p| p.size.as_str())),
                 age_secs: (Utc::now() - a.created_at).num_seconds(),
             };
+            // Si lo vuelven a abrir a mano, que no herede el estado de la vez anterior.
+            if obs.gone {
+                hooks::clear_status(&a.id);
+            }
             let status = agent::classify(&obs, hooks::read_status(&a.id).as_ref());
             (
                 a.id.clone(),

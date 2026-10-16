@@ -57,8 +57,12 @@ pub fn new_session(
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
+    // Al salir el agente marcamos el panel (`$TMUX` apunta a nuestro
+    // servidor). Sin la marca no se puede saber si salió: mientras corre,
+    // `sh` comparte grupo de procesos con él y tmux reporta "sh" como el
+    // proceso en primer plano.
     let script = format!(
-        "{agent_cmd}\nprintf '\\n\\033[2m%s\\033[0m\\n\\n' {}\n{then}",
+        "{agent_cmd}\ntmux set-option -p -t \"$TMUX_PANE\" @pastor_exited 1 2>/dev/null\nprintf '\\n\\033[2m%s\\033[0m\\n\\n' {}\n{then}",
         shell_quote("El agente terminó. Escribe claude, codex u opencode para abrirlo de nuevo."),
     );
 
@@ -118,12 +122,14 @@ pub struct Pane {
     pub role: String,
     /// Proceso en primer plano (p. ej. "claude" o "bash").
     pub command: String,
+    /// El primer agente que se lanzó en el panel ya salió.
+    pub exited: bool,
 }
 
 /// Paneles de cada sesión. Vacío si el servidor no está corriendo.
 pub fn panes() -> HashMap<String, Vec<Pane>> {
     let format =
-        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{@pastor_role}";
+        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{@pastor_exited}\t#{@pastor_role}";
     let Ok(out) = run(&["list-panes", "-a", "-F", format]) else {
         return HashMap::new();
     };
@@ -140,6 +146,7 @@ pub fn panes() -> HashMap<String, Vec<Pane>> {
             dead: dead == "1",
             size: size.to_string(),
             command: command.to_string(),
+            exited: f.next() == Some("1"),
             role: f.next().unwrap_or_default().to_string(),
         });
     }

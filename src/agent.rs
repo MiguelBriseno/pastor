@@ -20,7 +20,7 @@ pub enum Kind {
 impl Kind {
     pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Codex, Kind::Opencode];
 
-    fn bin(self) -> &'static str {
+    pub fn bin(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
             Kind::Codex => "codex",
@@ -107,8 +107,8 @@ impl Status {
 
 pub struct Observation<'a> {
     pub dead: bool,
-    /// El agente salió y en el panel quedó el shell.
-    pub at_shell: bool,
+    /// El agente salió y en su panel quedó el shell (u otro programa).
+    pub gone: bool,
     pub screen: &'a str,
     /// Última vez que vimos cambiar la pantalla (None = no ha cambiado desde que miramos).
     pub last_change: Option<DateTime<Utc>>,
@@ -134,16 +134,8 @@ const BLOCKED: &[&str] = &[
 const WORKING: &[&str] = &["esc to interrupt", "esc interrupt"];
 
 pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
-    if obs.dead {
+    if obs.dead || obs.gone {
         return Status::Dead;
-    }
-    // Al arrancar, `sh` está en primer plano un instante antes que el agente.
-    if obs.at_shell {
-        return if obs.age_secs < 5 {
-            Status::Starting
-        } else {
-            Status::Dead
-        };
     }
     let tail = tail_lower(obs.screen, 15);
     if BLOCKED.iter().any(|p| tail.contains(p)) {
