@@ -6,14 +6,14 @@
 cuando alguno necesita tu respuesta y te deja repartirles tareas.
 
 ```
- pastor    1 Agentes  │  2 Tareas  │  3 Dashboard                          ● 2  ▲ 1  ○ 1
+ pastor    1 Agentes  │  2 Tareas  │  3 Dashboard  │  4 Historial          ● 2  ▲ 1  ○ 1
 ╭ Agentes ─────────────────────────────────╮╭ api · claude · ~/proyectos/api ─────────────╮
 │ ● api              claude   trabajando   ││ ● Ejecutando los tests…                      │
 │ ▲ web              codex    esperando    ││                                              │
 │ ○ docs             opencode inactivo     ││   ✓ 42 pruebas pasaron                       │
 │ ● infra            claude   trabajando   ││                                              │
 ╰──────────────────────────────────────────╯╰ tarea t3: Migrar login a OAuth ──────────────╯
- ↑↓ mover · ⏎ entrar · n nuevo · s enviar mensaje · x terminar · 1-3 pestañas · q salir
+ ↑↓ mover · ⏎ entrar · n nuevo · s enviar mensaje · x terminar · 1-4 pestañas · q salir
 ```
 
 ## Características
@@ -27,6 +27,8 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
 - **Notificaciones de escritorio** cuando un agente te necesita o termina su trabajo.
 - **Tareas.** Crea tareas y asígnalas a un agente existente o a uno nuevo. Cuando el agente
   termina, la tarea pasa sola a *por revisar*.
+- **Historial** desde que instalaste pastor: sesiones, tareas, mensajes, tiempos y actividad
+  por día.
 - **Dashboard** con el resumen de agentes, el progreso de las tareas y lo que necesita tu
   atención.
 - **CLI completa** para usarlo desde scripts o desde otros agentes.
@@ -110,7 +112,7 @@ which claude codex opencode
 
 ## La interfaz
 
-Cambia de pestaña con `1`, `2`, `3` o `Tab`. Sal con `q` (los agentes siguen corriendo).
+Cambia de pestaña con `1`, `2`, `3`, `4` o `Tab`. Sal con `q` (los agentes siguen corriendo).
 
 ### 1 · Agentes
 
@@ -165,6 +167,16 @@ marca *en curso*. Cuando el agente termina, pasa a *por revisar*.
 
 Cuántos agentes hay en cada estado, cuántas tareas en cada etapa, el porcentaje completado y una
 lista de lo que necesita tu atención: agentes esperando respuesta y tareas por revisar.
+
+### 4 · Historial
+
+Lo que ha pasado desde que instalaste pastor: sesiones de agentes, tareas creadas y terminadas,
+mensajes enviados, turnos de Claude Code, la duración media de una sesión y de una tarea, la
+actividad de los últimos 14 días, las sesiones por tipo de agente y los proyectos con más
+sesiones.
+
+El historial empezó a guardarse en esta versión. De antes solo se conocen los totales de agentes
+y tareas creados, que se suman a las cifras.
 
 ### En los formularios
 
@@ -294,6 +306,8 @@ panel.
 En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` en macOS:
 
 - `state.json`: agentes y tareas
+- `history.jsonl`: el historial de eventos para la pestaña Historial (puedes borrarlo para
+  empezar de cero)
 - `status/`: el último estado que reportó cada agente de Claude Code
 - `claude-settings.json`: los hooks que se le pasan a Claude Code
 
