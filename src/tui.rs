@@ -7,7 +7,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -16,22 +19,29 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    BarChart, Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
+    Bar, BarChart, BarGroup, Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
     TableState, Tabs, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::agent::{Kind, Status};
+use crate::icons::{self, pad};
 use crate::ops::{self, AssignTarget, Snapshot, Tracker};
 use crate::store::{Agent, State, Task, TaskStatus};
 
 const REFRESH: Duration = Duration::from_secs(1);
 const SELECTED: Color = Color::Rgb(45, 45, 60);
 const ACCENT: Color = Color::Magenta;
+/// Columnas de la etiqueta de un campo (`" {name:>11}: "`).
+const LABEL_W: usize = 14;
 
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
+    // Con bracketed paste, un texto pegado llega entero en vez de tecla por
+    // tecla, y sus saltos de línea no confirman el formulario.
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let result = App::new().run(&mut terminal);
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -99,6 +109,10 @@ struct App {
     tracker: Tracker,
     agent_sel: ListState,
     task_sel: TableState,
+    /// Tamaños ajustables de los paneles.
+    list_width: u16,
+    term_pct: u16,
+    desc_height: u16,
     flash: Option<(String, Instant)>,
     last_refresh: Instant,
     quit: bool,
@@ -114,6 +128,9 @@ impl App {
             tracker: Tracker::default(),
             agent_sel: ListState::default(),
             task_sel: TableState::default(),
+            list_width: 44,
+            term_pct: 40,
+            desc_height: 7,
             flash: None,
             last_refresh: Instant::now(),
             quit: false,
@@ -124,11 +141,11 @@ impl App {
         self.refresh();
         while !self.quit {
             term.draw(|f| self.draw(f))?;
-            if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.on_key(key, term);
-                    }
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key, term),
+                    Event::Paste(text) => self.on_paste(&text),
+                    _ => {}
                 }
             }
             if self.last_refresh.elapsed() >= REFRESH {
@@ -232,6 +249,35 @@ impl App {
         }
     }
 
+    /// Pega `text` en el campo activo del formulario abierto. Solo los campos
+    /// de mensaje y descripción conservan los saltos de línea.
+    fn on_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let (field, multiline) = match &mut self.mode {
+            Mode::NewAgent(f) => match f.field {
+                1 => (&mut f.cwd, false),
+                2 => (&mut f.name, false),
+                3 => (&mut f.prompt, true),
+                _ => return,
+            },
+            Mode::Send { input, .. } => (input, true),
+            Mode::Term { input, .. } => (input, false),
+            Mode::NewTask {
+                title, desc, field, ..
+            } => match field {
+                0 => (title, false),
+                _ => (desc, true),
+            },
+            Mode::Assign(f) => (&mut f.cwd, false),
+            Mode::Normal | Mode::Confirm { .. } => return,
+        };
+        if multiline {
+            field.push_str(&text);
+        } else {
+            field.push_str(text.trim_end_matches('\n').replace('\n', " ").as_str());
+        }
+    }
+
     fn on_normal(&mut self, key: KeyEvent, term: &mut DefaultTerminal) -> Result<()> {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -267,6 +313,10 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.agent_sel.select(step(self.agent_sel.selected(), n, 1))
             }
+            KeyCode::Char('<') => self.list_width = self.list_width.saturating_sub(4).max(20),
+            KeyCode::Char('>') => self.list_width = (self.list_width + 4).min(200),
+            KeyCode::Char('[') => self.term_pct = (self.term_pct + 5).min(80),
+            KeyCode::Char(']') => self.term_pct = self.term_pct.saturating_sub(5).max(20),
             KeyCode::Char('n') => {
                 self.mode = Mode::NewAgent(NewAgentForm {
                     kind: 0,
@@ -341,6 +391,8 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.task_sel.select(step(self.task_sel.selected(), n, 1))
             }
+            KeyCode::Char('<') => self.desc_height = (self.desc_height + 2).min(100),
+            KeyCode::Char('>') => self.desc_height = self.desc_height.saturating_sub(2).max(3),
             KeyCode::Char('n') => {
                 self.mode = Mode::NewTask {
                     title: String::new(),
@@ -565,15 +617,17 @@ impl App {
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
+        let ic = icons::get();
+        let logo_text = format!(" {}pastor ", pad(ic.logo));
         let [logo, tabs, summary] = Layout::horizontal([
-            Constraint::Length(9),
+            Constraint::Length(logo_text.chars().count() as u16),
             Constraint::Min(0),
             Constraint::Length(30),
         ])
         .areas(area);
         f.render_widget(
             Span::styled(
-                " pastor ",
+                logo_text,
                 Style::default().fg(Color::Black).bg(ACCENT).bold(),
             ),
             logo,
@@ -583,7 +637,11 @@ impl App {
             Tab::Tasks => 1,
             Tab::Dashboard => 2,
         };
-        let t = Tabs::new([" 1 Agentes ", " 2 Tareas ", " 3 Dashboard "])
+        let t = Tabs::new([
+            format!(" 1 {}Agentes ", pad(ic.agents)),
+            format!(" 2 {}Tareas ", pad(ic.tasks)),
+            format!(" 3 {}Dashboard ", pad(ic.dashboard)),
+        ])
             .select(idx)
             .style(Style::default().fg(Color::DarkGray))
             .highlight_style(Style::default().fg(Color::White).bold())
@@ -599,7 +657,7 @@ impl App {
                 .filter(|a| self.status(&a.id) == st)
                 .count();
             spans.push(Span::styled(
-                format!("{} {}  ", st.icon(), n),
+                format!("{} {}  ", ic.status(st), n),
                 Style::default().fg(st.color()),
             ));
         }
@@ -607,11 +665,15 @@ impl App {
     }
 
     fn draw_agents(&mut self, f: &mut Frame, area: Rect) {
+        let list_w = self.list_width.min(area.width.saturating_sub(20)).max(20);
+        let ic = icons::get();
+        let kind_w = Kind::ALL.iter().map(|k| pad(ic.kind(*k)).chars().count()).max().unwrap_or(0);
+        let name_w = (list_w as usize).saturating_sub(28 + kind_w).max(6);
         let [left, right] =
-            Layout::horizontal([Constraint::Length(44), Constraint::Min(0)]).areas(area);
+            Layout::horizontal([Constraint::Length(list_w), Constraint::Min(0)]).areas(area);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .title(" Agentes ");
+            .title(format!(" {}Agentes ", pad(ic.agents)));
 
         if self.state.agents.is_empty() {
             let p = Paragraph::new("\nNo hay agentes todavía.\n\nPulsa n para lanzar uno.")
@@ -631,13 +693,17 @@ impl App {
                         .and_then(|s| s.term.as_ref())
                         .is_some_and(|t| !t.dead);
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!(" {} ", st.icon()), Style::default().fg(st.color())),
+                        Span::styled(format!(" {} ", ic.status(st)), Style::default().fg(st.color())),
                         Span::styled(
-                            format!("{:<16}", truncate(&a.name, 16)),
+                            format!("{:<name_w$}", truncate(&a.name, name_w)),
                             Style::default().bold(),
                         ),
                         Span::styled(
-                            format!(" {:<9}", a.kind.to_string()),
+                            format!(" {:<kind_w$}", pad(ic.kind(a.kind))),
+                            Style::default().fg(kind_color(a.kind)),
+                        ),
+                        Span::styled(
+                            format!("{:<9}", a.kind.to_string()),
                             Style::default().fg(Color::DarkGray),
                         ),
                         Span::styled(
@@ -645,7 +711,7 @@ impl App {
                             Style::default().fg(st.color()),
                         ),
                         Span::styled(
-                            if term_open { "⊞" } else { " " },
+                            if term_open { ic.term } else { " " },
                             Style::default().fg(Color::Cyan),
                         ),
                     ]))
@@ -667,13 +733,15 @@ impl App {
         // Con terminal abierta, la vista se divide igual que en tmux: agente | terminal.
         let right = match snap.and_then(|s| s.term.as_ref()) {
             Some(t) => {
-                let [l, r] =
-                    Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-                        .areas(right);
+                let [l, r] = Layout::horizontal([
+                    Constraint::Percentage(100 - self.term_pct),
+                    Constraint::Percentage(self.term_pct),
+                ])
+                .areas(right);
                 let title = match (&a.term_cmd, t.dead) {
-                    (_, true) => " terminal · cerrada ".to_string(),
-                    (Some(c), false) => format!(" terminal · {c} "),
-                    (None, false) => " terminal ".to_string(),
+                    (_, true) => format!(" {}terminal · cerrada ", pad(ic.term)),
+                    (Some(c), false) => format!(" {}terminal · {c} ", pad(ic.term)),
+                    (None, false) => format!(" {}terminal ", pad(ic.term)),
                 };
                 let block = Block::bordered()
                     .border_type(BorderType::Rounded)
@@ -692,19 +760,35 @@ impl App {
         let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(st.color()))
-            .title(format!(" {} · {} · {} ", a.name, a.kind, tilde(&a.cwd)));
+            .title(Line::from(vec![
+                Span::styled(format!(" {} ", ic.status(st)), Style::default().fg(st.color())),
+                Span::styled(a.name.clone(), Style::default().bold()),
+                Span::raw(" · "),
+                Span::styled(
+                    format!("{}{}", pad(ic.kind(a.kind)), a.kind),
+                    Style::default().fg(kind_color(a.kind)),
+                ),
+                Span::raw(format!(" · {}{} ", pad(ic.folder), tilde(&a.cwd))),
+            ]));
         if let Some(t) = a.task.as_ref().and_then(|t| self.state.find_task(t).ok()) {
-            block = block.title_bottom(format!(" tarea {}: {} ", t.id, truncate(&t.title, 50)));
+            block = block.title_bottom(format!(
+                " {}tarea {}: {} ",
+                pad(ic.task),
+                t.id,
+                truncate(&t.title, 50)
+            ));
         }
         f.render_widget(Paragraph::new(text).block(block), right);
     }
 
     fn draw_tasks(&mut self, f: &mut Frame, area: Rect) {
+        let ic = icons::get();
+        let desc_h = self.desc_height.min(area.height.saturating_sub(5)).max(3);
         let [top, bottom] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(area);
+            Layout::vertical([Constraint::Min(0), Constraint::Length(desc_h)]).areas(area);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .title(" Tareas ");
+            .title(format!(" {}Tareas ", pad(ic.tasks)));
 
         if self.state.tasks.is_empty() {
             let p = Paragraph::new("\nNo hay tareas todavía.\n\nPulsa n para crear una.")
@@ -722,7 +806,7 @@ impl App {
                             let st = self.status(id);
                             Line::from(vec![
                                 Span::styled(
-                                    format!("{} ", st.icon()),
+                                    format!("{} ", ic.status(st)),
                                     Style::default().fg(st.color()),
                                 ),
                                 Span::raw(self.agent_name(id)),
@@ -733,7 +817,7 @@ impl App {
                     Row::new(vec![
                         Cell::from(t.id.clone()),
                         Cell::from(Span::styled(
-                            t.status.label(),
+                            format!("{}{}", pad(ic.task_status(t.status)), t.status.label()),
                             Style::default().fg(task_color(t.status)),
                         )),
                         Cell::from(t.title.clone()),
@@ -745,7 +829,7 @@ impl App {
                 rows,
                 [
                     Constraint::Length(5),
-                    Constraint::Length(12),
+                    Constraint::Length(14),
                     Constraint::Min(10),
                     Constraint::Length(22),
                 ],
@@ -775,6 +859,8 @@ impl App {
     }
 
     fn draw_dashboard(&self, f: &mut Frame, area: Rect) {
+        let ic = icons::get();
+        let named = |icon: &str, name: &str| format!("{}{name}", pad(icon));
         let [r1, r2, r3] = Layout::vertical([
             Constraint::Length(4),
             Constraint::Length(4),
@@ -793,35 +879,35 @@ impl App {
         stat(
             f,
             a,
-            "agentes",
+            &named(ic.agents, "agentes"),
             self.state.agents.len().to_string(),
             Color::White,
         );
         stat(
             f,
             b,
-            "trabajando",
+            &named(ic.status(Status::Working), "trabajando"),
             (count(Status::Working) + count(Status::Starting)).to_string(),
             Status::Working.color(),
         );
         stat(
             f,
             c,
-            "esperándote",
+            &named(ic.status(Status::Blocked), "esperándote"),
             count(Status::Blocked).to_string(),
             Status::Blocked.color(),
         );
         stat(
             f,
             d,
-            "inactivos",
+            &named(ic.status(Status::Idle), "inactivos"),
             count(Status::Idle).to_string(),
             Status::Idle.color(),
         );
         stat(
             f,
             e,
-            "terminados",
+            &named(ic.status(Status::Dead), "terminados"),
             count(Status::Dead).to_string(),
             Status::Dead.color(),
         );
@@ -838,9 +924,10 @@ impl App {
             (c, TaskStatus::Review),
             (d, TaskStatus::Done),
         ] {
-            stat(f, area, st.label(), tcount(st).to_string(), task_color(st));
+            let name = named(ic.task_status(st), st.label());
+            stat(f, area, &name, tcount(st).to_string(), task_color(st));
         }
-        stat(f, e, "completado", format!("{pct}%"), ACCENT);
+        stat(f, e, &named(ic.done, "completado"), format!("{pct}%"), ACCENT);
 
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(r3);
@@ -848,7 +935,10 @@ impl App {
         for a in &self.state.agents {
             if self.status(&a.id) == Status::Blocked {
                 items.push(ListItem::new(Line::from(vec![
-                    Span::styled(" ▲ ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!(" {} ", ic.status(Status::Blocked)),
+                        Style::default().fg(Status::Blocked.color()),
+                    ),
                     Span::raw(format!("{} está esperando tu respuesta", a.name)),
                 ])));
             }
@@ -860,7 +950,10 @@ impl App {
             .filter(|t| t.status == TaskStatus::Review)
         {
             items.push(ListItem::new(Line::from(vec![
-                Span::styled(" ◆ ", Style::default().fg(task_color(TaskStatus::Review))),
+                Span::styled(
+                    format!(" {} ", ic.task_status(TaskStatus::Review)),
+                    Style::default().fg(task_color(TaskStatus::Review)),
+                ),
                 Span::raw(format!("{} {} — revisar", t.id, t.title)),
             ])));
         }
@@ -871,36 +964,31 @@ impl App {
             List::new(items).block(
                 Block::bordered()
                     .border_type(BorderType::Rounded)
-                    .title(" Necesita tu atención "),
+                    .title(format!(" {}Necesita tu atención ", pad(ic.bell))),
             ),
             left,
         );
 
-        let data: Vec<(&str, u64)> = Kind::ALL
+        let bars: Vec<Bar> = Kind::ALL
             .iter()
             .map(|k| {
-                let label = match k {
-                    Kind::Claude => "claude",
-                    Kind::Codex => "codex",
-                    Kind::Opencode => "opencode",
-                };
-                (
-                    label,
-                    self.state.agents.iter().filter(|a| a.kind == *k).count() as u64,
-                )
+                let n = self.state.agents.iter().filter(|a| a.kind == *k).count() as u64;
+                Bar::default()
+                    .value(n)
+                    .label(Line::from(format!("{}{k}", pad(ic.kind(*k)))))
+                    .style(Style::default().fg(kind_color(*k)))
+                    .value_style(Style::default().fg(Color::Black).bg(kind_color(*k)).bold())
             })
             .collect();
         let chart = BarChart::default()
             .block(
                 Block::bordered()
                     .border_type(BorderType::Rounded)
-                    .title(" Agentes por tipo "),
+                    .title(format!(" {}Agentes por tipo ", pad(ic.agents))),
             )
-            .data(data.as_slice())
-            .bar_width(9)
-            .bar_gap(2)
-            .bar_style(Style::default().fg(ACCENT))
-            .value_style(Style::default().fg(Color::Black).bg(ACCENT).bold());
+            .data(BarGroup::default().bars(&bars))
+            .bar_width(10)
+            .bar_gap(2);
         f.render_widget(chart, right);
     }
 
@@ -908,15 +996,18 @@ impl App {
         if let Some((msg, at)) = &self.flash {
             if at.elapsed() < Duration::from_secs(5) {
                 f.render_widget(
-                    Span::styled(format!(" {msg}"), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!(" {}{msg}", pad(icons::get().bell)),
+                        Style::default().fg(Color::Yellow),
+                    ),
                     area,
                 );
                 return;
             }
         }
         let help = match (&self.mode, self.tab) {
-            (Mode::Normal, Tab::Agents) => "↑↓ mover · ⏎ entrar · n nuevo · s mensaje · t terminal · T cerrar terminal · x terminar · q salir",
-            (Mode::Normal, Tab::Tasks) => "↑↓ mover · n nueva · ⏎ asignar · espacio avanzar estado · d hecha · g ir al agente · x borrar",
+            (Mode::Normal, Tab::Agents) => "↑↓ mover · ⏎ entrar · n nuevo · s mensaje · t terminal · T cerrar terminal · x terminar · < > ancho lista · [ ] ancho terminal · q salir",
+            (Mode::Normal, Tab::Tasks) => "↑↓ mover · n nueva · ⏎ asignar · espacio avanzar estado · d hecha · g ir al agente · x borrar · < > alto descripción",
             (Mode::Normal, Tab::Dashboard) => "1-3 pestañas · q salir",
             (Mode::Confirm { .. }, _) => "y confirmar · cualquier otra tecla cancela",
             _ => "Tab cambiar campo · ⏎ confirmar · Esc cancelar",
@@ -931,70 +1022,78 @@ impl App {
         match &self.mode {
             Mode::Normal => {}
             Mode::NewAgent(form) => {
-                let inner = popup(f, " Nuevo agente ", 70, 9);
+                let w = modal_width(f, 100);
                 let mut kinds = vec![Span::styled(
                     label("Tipo", form.field == 0),
                     label_style(form.field == 0),
                 )];
                 for (i, k) in Kind::ALL.iter().enumerate() {
                     let style = if i == form.kind {
-                        Style::default().fg(Color::Black).bg(ACCENT).bold()
+                        Style::default().fg(Color::Black).bg(kind_color(*k)).bold()
                     } else {
                         Style::default().fg(Color::DarkGray)
                     };
-                    kinds.push(Span::styled(format!(" {k} "), style));
+                    let icon = pad(icons::get().kind(*k));
+                    kinds.push(Span::styled(format!(" {icon}{k} "), style));
                     kinds.push(Span::raw(" "));
                 }
                 if form.field == 0 {
                     kinds.push(Span::styled("← →", Style::default().fg(Color::DarkGray)));
                 }
-                let lines = vec![
-                    Line::from(kinds),
-                    Line::raw(""),
-                    field_line("Directorio", &form.cwd, form.field == 1),
-                    field_line("Nombre", &form.name, form.field == 2),
-                    field_line("Mensaje", &form.prompt, form.field == 3),
-                ];
+                let mut lines = vec![Line::from(kinds), Line::raw("")];
+                lines.extend(field_lines("Directorio", &form.cwd, form.field == 1, w));
+                lines.extend(field_lines("Nombre", &form.name, form.field == 2, w));
+                let room = modal_room(f, 2).saturating_sub(lines.len());
+                lines.extend(keep_tail(
+                    field_lines("Mensaje", &form.prompt, form.field == 3, w),
+                    room,
+                ));
+                let inner = popup(f, " Nuevo agente ", w, lines.len() as u16 + 4);
                 f.render_widget(Paragraph::new(lines), inner);
             }
             Mode::Send { agent, input } => {
+                let w = modal_width(f, 100);
+                let mut lines = vec![Line::raw("")];
+                let room = modal_room(f, 0).saturating_sub(lines.len());
+                lines.extend(keep_tail(field_lines("Mensaje", input, true, w), room));
                 let inner = popup(
                     f,
                     &format!(" Mensaje para {} ", self.agent_name(agent)),
-                    80,
-                    4,
+                    w,
+                    lines.len() as u16 + 2,
                 );
-                f.render_widget(
-                    Paragraph::new(vec![Line::raw(""), field_line("Mensaje", input, true)]),
-                    inner,
-                );
+                f.render_widget(Paragraph::new(lines), inner);
             }
             Mode::Term { agent, input } => {
+                let w = modal_width(f, 100);
+                let mut lines = vec![Line::raw("")];
+                let room = modal_room(f, 0).saturating_sub(lines.len() + 1);
+                lines.extend(keep_tail(field_lines("Comando", input, true, w), room));
+                lines.push(Line::from(
+                    "  Déjalo vacío para abrir solo una terminal.".dark_gray(),
+                ));
                 let inner = popup(
                     f,
                     &format!(" Terminal junto a {} ", self.agent_name(agent)),
-                    80,
-                    5,
+                    w,
+                    lines.len() as u16 + 2,
                 );
-                let lines = vec![
-                    Line::raw(""),
-                    field_line("Comando", input, true),
-                    Line::from("  Déjalo vacío para abrir solo una terminal.".dark_gray()),
-                ];
                 f.render_widget(Paragraph::new(lines), inner);
             }
             Mode::NewTask { title, desc, field } => {
-                let inner = popup(f, " Nueva tarea ", 80, 5);
-                let lines = vec![
-                    Line::raw(""),
-                    field_line("Título", title, *field == 0),
-                    field_line("Descripción", desc, *field == 1),
-                ];
+                let w = modal_width(f, 100);
+                let mut lines = vec![Line::raw("")];
+                lines.extend(field_lines("Título", title, *field == 0, w));
+                let room = modal_room(f, 0).saturating_sub(lines.len());
+                lines.extend(keep_tail(
+                    field_lines("Descripción", desc, *field == 1, w),
+                    room,
+                ));
+                let inner = popup(f, " Nueva tarea ", w, lines.len() as u16 + 2);
                 f.render_widget(Paragraph::new(lines), inner);
             }
             Mode::Assign(form) => {
-                let h = form.options.len() as u16 + 6;
-                let inner = popup(f, &format!(" Asignar {} ", form.task), 64, h);
+                let w = modal_width(f, 64);
                 let mut lines = vec![Line::from(" ¿A quién se la das?".dark_gray())];
                 for (i, opt) in form.options.iter().enumerate() {
                     let text = match opt {
@@ -1010,11 +1109,18 @@ impl App {
                     lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
                 }
                 lines.push(Line::raw(""));
-                lines.push(field_line(
+                lines.extend(field_lines(
                     "Directorio",
                     &form.cwd,
                     matches!(form.options[form.sel], AssignOpt::New(_)),
+                    w,
                 ));
+                let inner = popup(
+                    f,
+                    &format!(" Asignar {} ", form.task),
+                    w,
+                    lines.len() as u16 + 3,
+                );
                 f.render_widget(Paragraph::new(lines), inner);
             }
             Mode::Confirm { msg, .. } => {
@@ -1031,10 +1137,10 @@ impl App {
 /// Sale de la TUI mientras corre `f` (p. ej. tmux attach) y vuelve después.
 fn suspend<T>(term: &mut DefaultTerminal, f: impl FnOnce() -> Result<T>) -> Result<T> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
     let result = f();
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     term.clear()?;
     result
 }
@@ -1105,15 +1211,61 @@ fn label_style(active: bool) -> Style {
     }
 }
 
-fn field_line(name: &str, value: &str, active: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(label(name, active), label_style(active)),
-        Span::raw(value.to_string()),
-    ];
-    if active {
-        spans.push(Span::styled("█", Style::default().fg(ACCENT)));
+/// Ancho de un modal: `w` columnas o lo que quepa en pantalla.
+fn modal_width(f: &Frame, w: u16) -> u16 {
+    w.min(f.area().width.saturating_sub(2))
+}
+
+/// Líneas de contenido que caben en un modal, dejando `pad` líneas de margen.
+fn modal_room(f: &Frame, pad: usize) -> usize {
+    (f.area().height as usize).saturating_sub(4 + pad).max(1)
+}
+
+/// Un campo de formulario partido en varias líneas para que quepa en un modal
+/// de ancho `w`; las líneas siguientes quedan alineadas con el valor.
+fn field_lines(name: &str, value: &str, active: bool, w: u16) -> Vec<Line<'static>> {
+    // Bordes del modal + hueco para el cursor.
+    let avail = (w as usize).saturating_sub(LABEL_W + 3).max(1);
+    let mut chunks: Vec<String> = Vec::new();
+    for line in value.split('\n') {
+        let mut rest: &[char] = &line.chars().collect::<Vec<_>>();
+        while rest.len() > avail {
+            // Corta después del último espacio que quepa; si no hay, a media palabra.
+            let cut = rest[..avail]
+                .iter()
+                .rposition(|c| *c == ' ')
+                .map_or(avail, |i| i + 1);
+            chunks.push(rest[..cut].iter().collect());
+            rest = &rest[cut..];
+        }
+        chunks.push(rest.iter().collect());
     }
-    Line::from(spans)
+    let n = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let head = if i == 0 {
+                Span::styled(label(name, active), label_style(active))
+            } else {
+                Span::raw(" ".repeat(LABEL_W))
+            };
+            let mut spans = vec![head, Span::raw(chunk)];
+            if active && i == n - 1 {
+                spans.push(Span::styled("█", Style::default().fg(ACCENT)));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Las últimas `n` líneas (donde está el cursor) si no caben todas.
+fn keep_tail(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
+    let n = n.max(1);
+    if lines.len() > n {
+        lines.drain(..lines.len() - n);
+    }
+    lines
 }
 
 fn edit(s: &mut String, key: &KeyEvent) {
@@ -1142,6 +1294,14 @@ fn clamp(sel: &mut ListState, n: usize) {
         None => sel.select(Some(0)),
         Some(i) if i >= n => sel.select(Some(n - 1)),
         _ => {}
+    }
+}
+
+fn kind_color(k: Kind) -> Color {
+    match k {
+        Kind::Claude => Color::Rgb(217, 119, 87),
+        Kind::Codex => Color::Rgb(16, 163, 127),
+        Kind::Opencode => Color::Cyan,
     }
 }
 
