@@ -105,7 +105,7 @@ fn agent_target(agent: &Agent) -> Result<String> {
 pub fn send(agent_key: &str, text: &str) -> Result<()> {
     let state = State::load()?;
     let agent = state.find_agent(agent_key)?;
-    tmux::send_text(&agent_target(&agent.id), text)?;
+    tmux::send_text(&agent_target(agent)?, text)?;
     history::record(Event::MessageSent {
         agent: agent.id.clone(),
     });
