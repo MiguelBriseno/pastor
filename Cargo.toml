@@ -5,6 +5,7 @@ edition = "2021"
 description = "Gestor de agentes de código (Claude Code, Codex, opencode) sobre tmux"
 repository = "https://github.com/MiguelBriseno/pastor"
 rust-version = "1.82"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

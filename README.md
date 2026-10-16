@@ -246,3 +246,9 @@ rm -rf ~/.local/share/pastor
 
 Las contribuciones son bienvenidas. Lee [CONTRIBUTING.md](CONTRIBUTING.md) y, para entender el
 código, [docs/arquitectura.md](docs/arquitectura.md).
+
+## Licencia
+
+pastor se distribuye bajo la [licencia MIT](LICENSE): puedes usarlo, copiarlo, modificarlo y
+distribuirlo libremente, siempre que conserves el aviso de copyright. El texto de la licencia está
+en inglés porque es la versión oficial con validez legal.
