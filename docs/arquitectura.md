@@ -10,6 +10,7 @@ pastor es un cliente que lanza sesiones, lee sus pantallas y guarda su propio es
                  │  lee/escribe     │
                  ▼                  ▼
    ~/.local/share/pastor/state.json   (agentes y tareas)
+   ~/.local/share/pastor/history.jsonl (eventos para el historial)
    ~/.local/share/pastor/status/*.json (estado que reportan los hooks)
                  │
                  │ tmux -L pastor  (new-session, capture-pane, paste-buffer…)
@@ -33,6 +34,7 @@ pastor es un cliente que lanza sesiones, lee sus pantallas y guarda su propio es
 | `src/hooks.rs` | Recibe los hooks de Claude Code y genera el `settings.json` que se le pasa |
 | `src/tmux.rs` | Capa fina sobre el binario `tmux` |
 | `src/store.rs` | Modelo de datos (`Agent`, `Task`) y persistencia en `state.json` |
+| `src/history.rs` | Historial de eventos en `history.jsonl` y las estadísticas de la pestaña Historial |
 
 ## Decisiones importantes
 
@@ -61,6 +63,18 @@ leer lo último que escribió, y tmux lo marca como `pane_dead`.
 `State::update` carga `state.json`, aplica el cambio y lo guarda con escritura atómica (archivo
 temporal y `rename`). La TUI recarga el archivo cada segundo. Así la CLI y la TUI pueden usarse a
 la vez.
+
+### El historial solo crece
+
+`state.json` olvida los agentes terminados y las tareas borradas, así que el historial va aparte:
+`history.jsonl` tiene una línea JSON por evento (agente iniciado o terminado, tarea creada,
+cambio de estado o borrada, mensaje enviado y turno de Claude Code). Cada evento se agrega con una
+sola escritura en modo *append*, así que la CLI, la TUI y los hooks pueden anotar a la vez.
+
+La primera línea es un evento `baseline` que se escribe al arrancar pastor si el archivo no existe.
+Guarda los contadores `next_agent` y `next_task` de `state.json`, que nunca bajan, para contar lo
+que ya había antes de llevar historial. La TUI recalcula las estadísticas solo cuando el archivo
+cambia de tamaño. Las líneas que no entiende se ignoran.
 
 ### Cómo se clasifica el estado de un agente
 

@@ -9,8 +9,9 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::agent::{self, Kind, Observation, Status};
+use crate::history::{self, Event};
 use crate::hooks;
-use crate::store::{Agent, State, TaskStatus};
+use crate::store::{Agent, State, Task, TaskStatus};
 use crate::tmux;
 
 pub fn new_agent(
@@ -37,6 +38,11 @@ pub fn new_agent(
         });
         return Err(e);
     }
+    history::record(Event::AgentStarted {
+        agent: agent.id.clone(),
+        kind: agent.kind,
+        cwd: agent.cwd.clone(),
+    });
     Ok(agent)
 }
 
@@ -74,7 +80,11 @@ fn agent_target(agent_id: &str) -> String {
 pub fn send(agent_key: &str, text: &str) -> Result<()> {
     let state = State::load()?;
     let agent = state.find_agent(agent_key)?;
-    tmux::send_text(&agent_target(&agent.id), text)
+    tmux::send_text(&agent_target(&agent.id), text)?;
+    history::record(Event::MessageSent {
+        agent: agent.id.clone(),
+    });
+    Ok(())
 }
 
 /// Entra a la sesión del agente con el foco en el agente.
@@ -148,9 +158,15 @@ pub fn suggest_term_cmd(agent: &Agent) -> String {
 }
 
 pub fn kill_agent(agent_key: &str) -> Result<()> {
-    let id = State::load()?.find_agent(agent_key)?.id.clone();
+    let agent = State::load()?.find_agent(agent_key)?.clone();
+    let id = agent.id.clone();
     let _ = tmux::kill_session(&id);
     hooks::clear_status(&id);
+    history::record(Event::AgentEnded {
+        agent: id.clone(),
+        kind: agent.kind,
+        secs: (Utc::now() - agent.created_at).num_seconds(),
+    });
     State::update(|s| {
         s.agents.retain(|a| a.id != id);
         for t in s
@@ -192,6 +208,7 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
     State::update(|s| {
         let t = s.find_task_mut(&task.id)?;
         t.agent = Some(agent.id.clone());
+        record_status(t, TaskStatus::InProgress);
         t.status = TaskStatus::InProgress;
         if let Some(a) = s.agents.iter_mut().find(|a| a.id == agent.id) {
             a.task = Some(task.id.clone());
@@ -203,9 +220,30 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
 
 pub fn set_task_status(task_id: &str, status: TaskStatus) -> Result<()> {
     State::update(|s| {
-        s.find_task_mut(task_id)?.status = status;
+        let t = s.find_task_mut(task_id)?;
+        record_status(t, status);
+        t.status = status;
         Ok(())
     })
+}
+
+/// Anota en el historial que la tarea pasa a `to`, si de verdad cambia.
+pub fn record_status(task: &Task, to: TaskStatus) {
+    if task.status != to {
+        history::record(Event::TaskStatus {
+            task: task.id.clone(),
+            to,
+            secs: (Utc::now() - task.created_at).num_seconds(),
+        });
+    }
+}
+
+pub fn add_task(title: String, description: String) -> Result<Task> {
+    let task = State::update(|s| Ok(s.add_task(title, description)))?;
+    history::record(Event::TaskCreated {
+        task: task.id.clone(),
+    });
+    Ok(task)
 }
 
 pub fn delete_task(task_id: &str) -> Result<()> {
@@ -220,7 +258,11 @@ pub fn delete_task(task_id: &str) -> Result<()> {
             a.task = None;
         }
         Ok(())
-    })
+    })?;
+    history::record(Event::TaskDeleted {
+        task: task_id.to_string(),
+    });
+    Ok(())
 }
 
 struct Seen {

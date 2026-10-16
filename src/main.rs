@@ -1,4 +1,5 @@
 mod agent;
+mod history;
 mod hooks;
 mod icons;
 mod ops;
@@ -195,6 +196,8 @@ fn main() -> Result<()> {
     let cli = Cli::from_arg_matches(&cmd.get_matches())
         .map_err(|e| e.exit())
         .unwrap();
+    // Antes de cualquier cambio, para que la línea base cuente solo lo previo.
+    let _ = history::ensure_baseline();
     match cli.cmd {
         None => tui::run(),
         Some(Cmd::Hook { event }) => {
@@ -255,7 +258,7 @@ fn main() -> Result<()> {
 fn task_cmd(cmd: TaskCmd) -> Result<()> {
     match cmd {
         TaskCmd::Add { title, description } => {
-            let t = State::update(|s| Ok(s.add_task(title, description.unwrap_or_default())))?;
+            let t = ops::add_task(title, description.unwrap_or_default())?;
             println!("Tarea {} creada", t.id);
         }
         TaskCmd::List => {

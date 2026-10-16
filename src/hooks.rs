@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::history::{self, Event};
+use crate::ops;
 use crate::store::{data_dir, ensure_dirs, State, TaskStatus};
 use crate::tmux::shell_quote;
 
@@ -66,6 +68,7 @@ pub fn handle(event: &str) -> Result<()> {
 
     // Claude terminó su turno: su tarea queda lista para revisar.
     if event == "idle" {
+        history::record(Event::Turn { agent: id.clone() });
         State::update(|s| {
             let task = s
                 .agents
@@ -74,6 +77,7 @@ pub fn handle(event: &str) -> Result<()> {
                 .and_then(|a| a.task.clone());
             if let Some(t) = task.and_then(|t| s.tasks.iter_mut().find(|x| x.id == t)) {
                 if t.status == TaskStatus::InProgress {
+                    ops::record_status(t, TaskStatus::Review);
                     t.status = TaskStatus::Review;
                 }
             }
