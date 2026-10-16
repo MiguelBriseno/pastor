@@ -123,6 +123,11 @@ impl State {
         Ok(out)
     }
 
+    /// Cuántos agentes y tareas se han creado en total.
+    pub fn counters(&self) -> (u32, u32) {
+        (self.next_agent, self.next_task)
+    }
+
     pub fn add_agent(&mut self, kind: Kind, cwd: PathBuf, name: Option<String>) -> Agent {
         self.next_agent += 1;
         let base = name

@@ -1,4 +1,4 @@
-//! Interfaz de terminal: pestañas de Agentes, Tareas y Dashboard.
+//! Interfaz de terminal: pestañas de Agentes, Tareas, Dashboard e Historial.
 
 use std::collections::HashMap;
 use std::io;
@@ -25,6 +25,7 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::agent::{Kind, Status};
+use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::ops::{self, AssignTarget, Snapshot, Tracker};
 use crate::store::{Agent, State, Task, TaskStatus};
@@ -51,6 +52,7 @@ enum Tab {
     Agents,
     Tasks,
     Dashboard,
+    History,
 }
 
 enum Mode {
@@ -114,6 +116,9 @@ struct App {
     term_pct: u16,
     desc_height: u16,
     flash: Option<(String, Instant)>,
+    /// Tamaño de history.jsonl al calcular `stats`; se recalcula si crece.
+    history_len: u64,
+    stats: Stats,
     last_refresh: Instant,
     quit: bool,
 }
@@ -132,6 +137,8 @@ impl App {
             term_pct: 40,
             desc_height: 7,
             flash: None,
+            history_len: u64::MAX,
+            stats: Stats::default(),
             last_refresh: Instant::now(),
             quit: false,
         }
@@ -195,6 +202,12 @@ impl App {
                 }
             }
             self.set_flash(msg);
+        }
+
+        let len = std::fs::metadata(history::path()).map_or(0, |m| m.len());
+        if len != self.history_len {
+            self.history_len = len;
+            self.stats = history::stats(&history::load());
         }
 
         clamp(&mut self.agent_sel, self.state.agents.len());
@@ -284,17 +297,19 @@ impl App {
             KeyCode::Char('1') => self.tab = Tab::Agents,
             KeyCode::Char('2') => self.tab = Tab::Tasks,
             KeyCode::Char('3') => self.tab = Tab::Dashboard,
+            KeyCode::Char('4') => self.tab = Tab::History,
             KeyCode::Tab => {
                 self.tab = match self.tab {
                     Tab::Agents => Tab::Tasks,
                     Tab::Tasks => Tab::Dashboard,
-                    Tab::Dashboard => Tab::Agents,
+                    Tab::Dashboard => Tab::History,
+                    Tab::History => Tab::Agents,
                 }
             }
             _ => match self.tab {
                 Tab::Agents => self.on_agents(key, term)?,
                 Tab::Tasks => self.on_tasks(key)?,
-                Tab::Dashboard => {}
+                Tab::Dashboard | Tab::History => {}
             },
         }
         Ok(())
@@ -534,9 +549,7 @@ impl App {
                 mut field,
             } => match key.code {
                 KeyCode::Enter if !title.trim().is_empty() => {
-                    let t = State::update(|s| {
-                        Ok(s.add_task(title.trim().to_string(), desc.trim().to_string()))
-                    })?;
+                    let t = ops::add_task(title.trim().to_string(), desc.trim().to_string())?;
                     self.refresh();
                     let i = self.state.tasks.iter().position(|x| x.id == t.id);
                     self.task_sel.select(i);
@@ -611,6 +624,7 @@ impl App {
             Tab::Agents => self.draw_agents(f, body),
             Tab::Tasks => self.draw_tasks(f, body),
             Tab::Dashboard => self.draw_dashboard(f, body),
+            Tab::History => self.draw_history(f, body),
         }
         self.draw_footer(f, footer);
         self.draw_modal(f);
@@ -636,11 +650,13 @@ impl App {
             Tab::Agents => 0,
             Tab::Tasks => 1,
             Tab::Dashboard => 2,
+            Tab::History => 3,
         };
         let t = Tabs::new([
             format!(" 1 {}Agentes ", pad(ic.agents)),
             format!(" 2 {}Tareas ", pad(ic.tasks)),
             format!(" 3 {}Dashboard ", pad(ic.dashboard)),
+            format!(" 4 {}Historial ", pad(ic.history)),
         ])
             .select(idx)
             .style(Style::default().fg(Color::DarkGray))
@@ -992,6 +1008,131 @@ impl App {
         f.render_widget(chart, right);
     }
 
+    fn draw_history(&self, f: &mut Frame, area: Rect) {
+        let ic = icons::get();
+        let s = &self.stats;
+        let named = |icon: &str, name: &str| format!("{}{name}", pad(icon));
+        let [r1, r2, r3] = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Length(4),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+
+        let since = s.since.map_or_else(
+            || "—".to_string(),
+            |d| d.with_timezone(&chrono::Local).format("%d/%m/%Y").to_string(),
+        );
+        let days = s.since.map_or(0, |d| (chrono::Utc::now() - d).num_days());
+        let [a, b, c, d, e, g] = Layout::horizontal([Constraint::Ratio(1, 6); 6]).areas(r1);
+        stat(f, a, &format!("desde (hace {days} días)"), since, ACCENT);
+        stat(f, b, &named(ic.agents, "sesiones"), s.sessions.to_string(), Color::White);
+        stat(f, c, &named(ic.tasks, "tareas creadas"), s.tasks_created.to_string(), Color::White);
+        stat(
+            f,
+            d,
+            &named(ic.task_status(TaskStatus::Done), "tareas hechas"),
+            s.tasks_done.to_string(),
+            Color::Green,
+        );
+        stat(f, e, "mensajes enviados", s.messages.to_string(), Color::Cyan);
+        stat(f, g, "turnos de Claude", s.turns.to_string(), kind_color(Kind::Claude));
+
+        let dash = |v: Option<i64>| v.map_or_else(|| "—".to_string(), history::human);
+        let per_day = format!("{:.1}", s.sessions as f64 / days.max(1) as f64);
+        let [a, b, c, d] = Layout::horizontal([Constraint::Ratio(1, 4); 4]).areas(r2);
+        stat(f, a, "duración media de sesión", dash(s.avg_session_secs), Color::White);
+        stat(f, b, "tiempo medio por tarea", dash(s.avg_task_secs), Color::White);
+        stat(f, c, "tiempo total de agentes", history::human(s.agent_secs), Color::White);
+        stat(f, d, "sesiones por día", per_day, Color::White);
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(r3);
+        let bars: Vec<Bar> = s
+            .daily
+            .iter()
+            .map(|(day, n)| {
+                Bar::default()
+                    .value(*n)
+                    .label(Line::from(day.format("%d").to_string()))
+                    .style(Style::default().fg(ACCENT))
+                    .value_style(Style::default().fg(Color::Black).bg(ACCENT).bold())
+            })
+            .collect();
+        // Que las barras llenen el ancho disponible.
+        let n = s.daily.len().max(1) as u16;
+        let bar_w = (left.width.saturating_sub(2) / n).saturating_sub(1).clamp(2, 8);
+        f.render_widget(
+            BarChart::default()
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(format!(
+                            " {}Actividad de los últimos {} días ",
+                            pad(ic.history),
+                            history::DAYS
+                        ))
+                        .title_bottom(Line::from(
+                            " sesiones, tareas, mensajes y turnos por día ".dark_gray(),
+                        )),
+                )
+                .data(BarGroup::default().bars(&bars))
+                .bar_width(bar_w)
+                .bar_gap(1),
+            left,
+        );
+
+        let [kinds, projects] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
+        let bars: Vec<Bar> = Kind::ALL
+            .iter()
+            .zip(&s.by_kind)
+            .map(|(k, n)| {
+                Bar::default()
+                    .value(*n)
+                    .label(Line::from(format!("{}{k}", pad(ic.kind(*k)))))
+                    .style(Style::default().fg(kind_color(*k)))
+                    .value_style(Style::default().fg(Color::Black).bg(kind_color(*k)).bold())
+            })
+            .collect();
+        f.render_widget(
+            BarChart::default()
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(format!(" {}Sesiones por tipo ", pad(ic.agents))),
+                )
+                .data(BarGroup::default().bars(&bars))
+                .bar_width(10)
+                .bar_gap(2),
+            kinds,
+        );
+
+        let room = projects.width.saturating_sub(10) as usize;
+        let mut items: Vec<ListItem> = s
+            .projects
+            .iter()
+            .take(projects.height.saturating_sub(2) as usize)
+            .map(|(p, n)| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {n:>4}  "), Style::default().fg(ACCENT).bold()),
+                    Span::raw(truncate(&tilde(p), room.max(4))),
+                ]))
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(ListItem::new(" Aún no hay sesiones registradas".dark_gray()));
+        }
+        f.render_widget(
+            List::new(items).block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(format!(" {}Proyectos con más sesiones ", pad(ic.folder))),
+            ),
+            projects,
+        );
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         if let Some((msg, at)) = &self.flash {
             if at.elapsed() < Duration::from_secs(5) {
@@ -1008,7 +1149,7 @@ impl App {
         let help = match (&self.mode, self.tab) {
             (Mode::Normal, Tab::Agents) => "↑↓ mover · ⏎ entrar · n nuevo · s mensaje · t terminal · T cerrar terminal · x terminar · < > ancho lista · [ ] ancho terminal · q salir",
             (Mode::Normal, Tab::Tasks) => "↑↓ mover · n nueva · ⏎ asignar · espacio avanzar estado · d hecha · g ir al agente · x borrar · < > alto descripción",
-            (Mode::Normal, Tab::Dashboard) => "1-3 pestañas · q salir",
+            (Mode::Normal, Tab::Dashboard | Tab::History) => "1-4 pestañas · Tab siguiente · q salir",
             (Mode::Confirm { .. }, _) => "y confirmar · cualquier otra tecla cancela",
             _ => "Tab cambiar campo · ⏎ confirmar · Esc cancelar",
         };
@@ -1263,7 +1404,12 @@ fn field_lines(name: &str, value: &str, active: bool, w: u16) -> Vec<Line<'stati
 fn keep_tail(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
     let n = n.max(1);
     if lines.len() > n {
+        // La primera línea visible conserva la etiqueta del campo.
+        let head = lines[0].spans.first().cloned();
         lines.drain(..lines.len() - n);
+        if let (Some(head), Some(first)) = (head, lines[0].spans.first_mut()) {
+            *first = head;
+        }
     }
     lines
 }
