@@ -577,7 +577,7 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
                 cmd: Some(t.cmd).filter(|c| !c.is_empty()),
             });
             let size = pane.map_or("", |p| p.size.as_str());
-            let hash = hooks::screen_hash(&screen);
+            let hash = hooks::activity_hash(&screen);
             let fingerprint = hooks::fingerprint(&screen);
             let obs = Observation {
                 dead: pane.is_none_or(|p| p.dead),
@@ -608,6 +608,16 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn el_parpadeo_del_punto_no_es_actividad() {
+        let mut t = Tracker::default();
+        let obs =
+            |t: &mut Tracker, screen: &str| t.observe("a1", hooks::activity_hash(screen), "80x24");
+        assert_eq!(obs(&mut t, "● Bash(curl)\nDo you want to proceed?"), None);
+        assert_eq!(obs(&mut t, "  Bash(curl)\nDo you want to proceed?"), None);
+        assert!(obs(&mut t, "  Bash(curl)\n⎿ Interrupted").is_some());
+    }
 
     /// Dos agentes (a1, a2) y dos tareas (t1, t2), sin tocar el historial.
     fn two_and_two() -> State {

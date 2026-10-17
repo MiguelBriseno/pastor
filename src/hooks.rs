@@ -77,11 +77,44 @@ pub fn clear_status(id: &str) {
     let _ = fs::remove_file(data_dir().join("status").join(format!("{id}.lock")));
 }
 
+/// Borra los estados de hook de agentes que ya no existen.
+pub fn prune_status(state: &store::State) {
+    prune_status_in(&data_dir().join("status"), state);
+}
+
+fn prune_status_in(dir: &Path, state: &store::State) {
+    let Ok(dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let known = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|id| state.agents.iter().any(|a| a.id == id));
+        if !known {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Huella sin el `●` que parpadea mientras una herramienta espera permiso,
+/// para que el observador no lo tome por actividad.
+pub fn activity_hash(screen: &str) -> u64 {
+    screen_hash(&screen.replace('●', " "))
+}
+
 /// Llamado por Claude Code. Nunca debe fallar ruidosamente.
 pub fn handle(event: &str) -> Result<()> {
     let Ok(id) = std::env::var("PASTOR_AGENT") else {
         return Ok(());
     };
+    // Un proceso que heredó `PASTOR_AGENT` de un agente ya cerrado (p. ej. un
+    // servicio que arrancó desde él y lanza sus propios `claude`) no debe
+    // revivir su estado. Si no se puede leer el estado, mejor seguir.
+    if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
+        return Ok(());
+    }
     if event == "settle" {
         return settle(&id);
     }
@@ -351,6 +384,28 @@ mod tests {
         let p = |s: &str| PathBuf::from(s);
         assert_eq!(strip_deleted(p("/bin/pastor (deleted)")), p("/bin/pastor"));
         assert_eq!(strip_deleted(p("/bin/pastor")), p("/bin/pastor"));
+    }
+
+    #[test]
+    fn borra_los_estados_de_agentes_que_ya_no_existen() {
+        let dir = TempHome(std::env::temp_dir().join(format!(
+            "pastor-prune-{}-{}",
+            std::process::id(),
+            store::unique_suffix()
+        )));
+        fs::create_dir_all(&dir.0).unwrap();
+        for f in ["a1.json", "a1.lock", "a2.json", "a2.lock"] {
+            fs::write(dir.0.join(f), "{}").unwrap();
+        }
+        let mut state = store::State::default();
+        state.add_agent(agent::Kind::Claude, PathBuf::from("/tmp"), None);
+        prune_status_in(&dir.0, &state);
+        let mut quedan: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        quedan.sort();
+        assert_eq!(quedan, ["a1.json", "a1.lock"]);
     }
 
     /// HOME temporal que se borra al terminar, aunque falle la prueba.

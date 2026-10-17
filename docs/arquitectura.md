@@ -141,6 +141,11 @@ variable `PASTOR_AGENT=<id>`. Los hooks llaman a `pastor hook <evento>`, que esc
 `status/<id>.json`. Con el evento `Stop`, además, la tarea del agente pasa a *por revisar* aunque
 la TUI esté cerrada.
 
+Un proceso que se arrancó desde un agente hereda su `PASTOR_AGENT`; si lanza sus propios `claude`
+(p. ej. un servicio en segundo plano), sus hooks llegan con ese id. Si el agente ya no está en
+`state.json`, el hook no escribe nada. La TUI y `pastor ls` borran al arrancar los estados de
+agentes que ya no existen.
+
 ### Envío de mensajes
 
 `tmux::send_text` carga el texto en un buffer de tmux y lo pega con *bracketed paste*

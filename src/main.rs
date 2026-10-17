@@ -201,7 +201,12 @@ fn main() -> Result<()> {
     // Antes de cualquier cambio, para que la línea base cuente solo lo previo.
     let _ = history::ensure_baseline();
     match cli.cmd {
-        None => tui::run(),
+        None => {
+            if let Ok(state) = State::load() {
+                hooks::prune_status(&state);
+            }
+            tui::run()
+        }
         Some(Cmd::Hook { event }) => {
             // Sin ruido para Claude Code, pero que quede rastro.
             if let Err(e) = hooks::handle(&event) {
@@ -226,6 +231,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::List) => {
             let state = State::load()?;
+            hooks::prune_status(&state);
             if state.agents.is_empty() {
                 println!("No hay agentes. Lanza uno con `pastor new claude`.");
             }
