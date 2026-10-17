@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use crate::agent::{self, Kind, Observation, Status};
 use crate::history::{self, Event};
 use crate::hooks;
-use crate::store::{Agent, State, Task, TaskStatus};
+use crate::store::{self, Agent, State, Task, TaskStatus};
 use crate::tmux;
 
 pub fn new_agent(
@@ -22,6 +22,11 @@ pub fn new_agent(
     prompt: Option<&str>,
 ) -> Result<Agent> {
     tmux::ensure_available()?;
+    if let Some(n) = name.as_deref().map(str::trim) {
+        if store::looks_like_id(n) {
+            bail!("`{n}` parece el id de un agente; elige otro nombre");
+        }
+    }
     let cwd = match cwd {
         Some(c) => c,
         None => std::env::current_dir()?,
@@ -215,8 +220,9 @@ pub fn open_term(agent_key: &str, cmd: Option<&str>) -> Result<()> {
     let term = tmux::split_right(&agent_pane.id, &agent.cwd)?;
     let cmd = cmd.map(str::trim).filter(|c| !c.is_empty());
     if let Some(c) = cmd {
-        tmux::set_cmd(&term, c)?;
         tmux::type_line(&term, c)?;
+        // Solo para el título: no vale la pena fallar por ello.
+        let _ = tmux::set_cmd(&term, c);
     }
     State::update(|s| {
         if let Some(a) = s.agents.iter_mut().find(|a| a.id == agent.id) {
@@ -435,26 +441,28 @@ pub fn set_task_status(task_id: &str, status: TaskStatus) -> Result<()> {
 }
 
 /// Como `State::update`, pero `f` recibe con qué anotar los cambios de
-/// estado de las tareas, y solo pasan al historial si el estado se guardó.
+/// estado de las tareas, y solo pasan al historial si el estado se guardó
+/// (con el candado aún tomado, para que queden en el mismo orden).
 fn update_recording<T>(
     f: impl FnOnce(&mut State, &mut dyn FnMut(&Task, TaskStatus)) -> Result<T>,
 ) -> Result<T> {
-    let mut events = Vec::new();
-    let out = State::update(|s| {
-        f(s, &mut |task: &Task, to| {
-            // Solo si de verdad cambia.
-            if task.status != to {
-                events.push(Event::TaskStatus {
-                    task: task.id.clone(),
-                    to,
-                    secs: (Utc::now() - task.created_at).num_seconds(),
-                });
-            }
-        })
-    })?;
-    for e in events {
-        history::record(e);
-    }
+    let (out, _) = State::update_then(
+        |s| {
+            let mut events = Vec::new();
+            let out = f(s, &mut |task: &Task, to| {
+                // Solo si de verdad cambia.
+                if task.status != to {
+                    events.push(Event::TaskStatus {
+                        task: task.id.clone(),
+                        to,
+                        secs: (Utc::now() - task.created_at).num_seconds(),
+                    });
+                }
+            })?;
+            Ok((out, events))
+        },
+        |(_, events)| events.drain(..).for_each(history::record),
+    )?;
     Ok(out)
 }
 

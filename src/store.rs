@@ -1,8 +1,10 @@
 //! Estado persistente: agentes y tareas en ~/.local/share/pastor/state.json.
 
 use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -104,8 +106,17 @@ impl State {
     /// necesita: `rename` cambia el archivo de golpe. `f` no debe llamar a
     /// `update` (se quedaría esperando su propio candado).
     pub fn update<T>(f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        Self::update_then(f, |_| {})
+    }
+
+    /// Como `update`, y si se guardó, `saved` corre todavía con el candado
+    /// tomado: lo que anote queda en el mismo orden que los guardados.
+    pub fn update_then<T>(
+        f: impl FnOnce(&mut State) -> Result<T>,
+        saved: impl FnOnce(&mut T),
+    ) -> Result<T> {
         ensure_dirs()?;
-        Self::update_in(&data_dir(), f)
+        Self::update_in(&data_dir(), f, saved)
     }
 
     fn load_in(dir: &Path) -> Result<Self> {
@@ -116,7 +127,11 @@ impl State {
         }
     }
 
-    fn update_in<T>(dir: &Path, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+    fn update_in<T>(
+        dir: &Path,
+        f: impl FnOnce(&mut State) -> Result<T>,
+        saved: impl FnOnce(&mut T),
+    ) -> Result<T> {
         let lock_path = dir.join("state.lock");
         let lock = OpenOptions::new()
             .create(true)
@@ -131,11 +146,12 @@ impl State {
             r => r.with_context(|| format!("no pude bloquear {}", lock_path.display()))?,
         }
         let mut s = Self::load_in(dir)?;
-        let out = f(&mut s)?;
+        let mut out = f(&mut s)?;
         write_atomic(
             &dir.join("state.json"),
             serde_json::to_string_pretty(&s)?.as_bytes(),
         )?;
+        saved(&mut out);
         Ok(out)
     }
 
@@ -220,33 +236,47 @@ impl State {
 }
 
 /// Si `s` tiene la forma de un id de agente (`a1`, `a27`…).
-fn looks_like_id(s: &str) -> bool {
+pub fn looks_like_id(s: &str) -> bool {
     s.strip_prefix('a')
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Reemplaza `path` de golpe: escribe un temporal propio, lo
-/// lleva a disco y lo renombra. Quien lo lea a la vez ve el archivo viejo o
-/// el nuevo, nunca uno a medias, y un corte de luz no lo deja vacío.
+/// Sufijo distinto en cada llamada, también entre procesos y hilos, para
+/// nombres temporales.
+pub fn unique_suffix() -> String {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{n}", std::process::id())
+}
+
+/// Reemplaza `path` de golpe: escribe un temporal propio, lo lleva a disco y
+/// lo renombra. Quien lo lea a la vez ve el archivo viejo o el nuevo, nunca
+/// uno a medias, y un corte de luz no lo deja vacío.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     write_atomic_mode(path, contents, None)
 }
 
 /// Como `write_atomic`, con permisos `mode` (p. ej. 0o755 para un script).
-/// Si el archivo ya tiene ese contenido no lo toca.
+/// Si el archivo ya tiene ese contenido no lo reescribe.
 pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    // Propio también de cada escritura: dos hilos del mismo proceso no comparten temporal.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
     if fs::read(path).is_ok_and(|old| old == contents) {
+        if let Some(m) = mode {
+            fs::set_permissions(path, fs::Permissions::from_mode(m))?;
+        }
         return Ok(());
     }
+    replace(path, contents, mode, true)
+}
+
+/// Como `write_atomic`, sin llevarlo a disco ni comparar: para archivos que
+/// cambian a menudo y se pueden perder (el estado que reportan los hooks).
+pub fn write_volatile(path: &Path, contents: &[u8]) -> Result<()> {
+    replace(path, contents, None, false)
+}
+
+fn replace(path: &Path, contents: &[u8], mode: Option<u32>, durable: bool) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    tmp.push(format!(".{}-{n}.tmp", std::process::id()));
+    tmp.push(format!(".{}.tmp", unique_suffix()));
     let tmp = PathBuf::from(tmp);
     let written = (|| -> Result<()> {
         let mut f = fs::File::create(&tmp)?;
@@ -254,7 +284,9 @@ pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> Res
         if let Some(m) = mode {
             f.set_permissions(fs::Permissions::from_mode(m))?;
         }
-        f.sync_all()?;
+        if durable {
+            f.sync_all()?;
+        }
         fs::rename(&tmp, path)?;
         Ok(())
     })();
@@ -337,9 +369,11 @@ mod tests {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
                     for i in 0..por_hilo {
-                        State::update_in(&dir, |s| {
-                            Ok(s.add_task(format!("{h}-{i}"), String::new()))
-                        })
+                        State::update_in(
+                            &dir,
+                            |s| Ok(s.add_task(format!("{h}-{i}"), String::new())),
+                            |_| {},
+                        )
                         .unwrap();
                     }
                 })

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::agent;
 use crate::history::{self, Event};
 use crate::ops;
-use crate::store::{data_dir, ensure_dirs, write_atomic, write_atomic_mode};
+use crate::store::{data_dir, ensure_dirs, write_atomic, write_atomic_mode, write_volatile};
 use crate::tmux::shell_quote;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -65,7 +65,7 @@ pub fn handle(event: &str) -> Result<()> {
         at: Utc::now(),
         message,
     };
-    write_atomic(
+    write_volatile(
         &status_path(&id),
         serde_json::to_string(&status)?.as_bytes(),
     )?;

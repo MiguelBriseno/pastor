@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+
+use crate::store::unique_suffix;
 
 // Las pruebas usan su propio servidor, para no tocar los agentes de verdad.
 const SOCKET: &str = if cfg!(test) { "pastor-test" } else { "pastor" };
@@ -28,7 +29,7 @@ fn session(name: &str) -> String {
 
 fn run(args: &[&str]) -> Result<String> {
     let out = tmux()
-        .args(args)
+        .args(args.iter().map(|a| arg(a)))
         .output()
         .context("no pude ejecutar tmux")?;
     if !out.status.success() {
@@ -69,7 +70,7 @@ fn parse_version(s: &str) -> Option<(u32, u32)> {
 }
 
 /// tmux toma un argumento que termina en `;` como separador de comandos y
-/// se lo come; escapado con `\;` lo deja tal cual.
+/// se lo come; escapado con `\;` lo deja tal cual. `run` lo aplica a todos.
 fn arg(s: &str) -> String {
     match s.strip_suffix(';') {
         Some(rest) => format!("{rest}\\;"),
@@ -87,7 +88,7 @@ pub fn new_session(
     cmd: &[String],
     then: &str,
 ) -> Result<()> {
-    let cwd = arg(&cwd.to_string_lossy());
+    let cwd = cwd.to_string_lossy();
     let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let agent_cmd = cmd
         .iter()
@@ -146,8 +147,8 @@ pub fn new_session(
 }
 
 /// Ayuda de la barra de estado, con el prefijo real (puede que lo hayas
-/// cambiado en tu ~/.tmux.conf). Dentro de otro tmux con el mismo prefijo,
-/// el de fuera se lo queda: hay que pulsarlo dos veces.
+/// cambiado en tu ~/.tmux.conf). Dentro de otro tmux con el mismo prefijo
+/// (`nested`), el de fuera se lo queda: hay que pulsarlo dos veces.
 fn status_right(nested: bool) -> &'static str {
     if nested {
         " #{prefix} ←→ cambiar panel · #{prefix} #{prefix} d volver a pastor "
@@ -216,7 +217,7 @@ pub fn panes() -> HashMap<String, Vec<Pane>> {
 
 /// Abre una terminal a la derecha de `pane` (sin quitarle el foco) y devuelve su id.
 pub fn split_right(pane: &str, cwd: &Path) -> Result<String> {
-    let cwd = arg(&cwd.to_string_lossy());
+    let cwd = cwd.to_string_lossy();
     let args = [
         "split-window",
         "-h",
@@ -242,7 +243,7 @@ pub fn split_right(pane: &str, cwd: &Path) -> Result<String> {
 /// Escribe `line` en el panel y pulsa Enter, como si lo tecleara el usuario.
 pub fn type_line(pane: &str, line: &str) -> Result<()> {
     // Con `--`, una línea que empieza por `-` no se toma como opción.
-    run(&["send-keys", "-t", pane, "-l", "--", &arg(line)])?;
+    run(&["send-keys", "-t", pane, "-l", "--", line])?;
     run(&["send-keys", "-t", pane, "Enter"]).map(|_| ())
 }
 
@@ -259,9 +260,7 @@ pub fn capture(target: &str) -> Result<String> {
 pub fn send_text(name: &str, text: &str) -> Result<()> {
     // Único por envío: dos envíos a la vez al mismo panel (la TUI y la CLI)
     // no se pisan el buffer.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let buf = format!("pastor-{name}-{}-{n}", std::process::id());
+    let buf = format!("pastor-{name}-{}", unique_suffix());
     let mut child = tmux()
         .args(["load-buffer", "-b", &buf, "-"])
         .stdin(Stdio::piped())
@@ -288,7 +287,7 @@ pub fn attach(name: &str, focus: Option<&str>) -> Result<()> {
     if let Some(pane) = focus {
         run(&["select-pane", "-t", pane])?;
     }
-    let nested = std::env::var_os("TMUX").is_some();
+    let nested = std::env::var_os("TMUX").is_some() && same_prefix_outside();
     let target = format!("{}:", session(name));
     let _ = run(&[
         "set-option",
@@ -306,6 +305,20 @@ pub fn attach(name: &str, focus: Option<&str>) -> Result<()> {
         bail!("no pude entrar a la sesión {name}");
     }
     Ok(())
+}
+
+/// Si el tmux en el que corre pastor usa el mismo prefijo que el suyo.
+fn same_prefix_outside() -> bool {
+    let prefix = |c: &mut Command| {
+        c.args(["show-options", "-gv", "prefix"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    // Sin `-L`, tmux usa el servidor de `$TMUX`: el de fuera.
+    let outside = prefix(&mut Command::new("tmux"));
+    outside.is_none() || outside == prefix(&mut tmux())
 }
 
 pub fn kill_session(name: &str) -> Result<()> {
@@ -444,6 +457,16 @@ mod tests {
     fn escapa_el_punto_y_coma_final() {
         assert_eq!(arg("npm run dev;"), "npm run dev\\;");
         assert_eq!(arg("a;b"), "a;b");
+        // `run` lo aplica: la opción guarda el `;`.
+        if let Some(_serial) = have_tmux() {
+            let s = format!("puntoycoma{}", std::process::id());
+            run(&["new-session", "-d", "-s", &s, "sleep", "30"]).unwrap();
+            let pane = run(&["display", "-p", "-t", &format!("={s}:"), "#{pane_id}"]).unwrap();
+            super::set_cmd(pane.trim(), "npm run dev;").unwrap();
+            let got = run(&["show-options", "-pqv", "-t", pane.trim(), "@pastor_cmd"]);
+            let _ = kill_session(&s);
+            assert_eq!(got.unwrap().trim(), "npm run dev;");
+        }
     }
 
     #[test]
