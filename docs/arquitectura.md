@@ -112,7 +112,9 @@ se ignoran.
 2. Si en las últimas líneas de la pantalla hay un diálogo de permiso o confirmación
    (`do you want to`, `enter to confirm`…) → **esperando**.
 3. Si aparece `esc to interrupt` → **trabajando**.
-4. Si hay un estado de hook reciente (solo Claude Code), se usa ese.
+4. Si hay un estado de hook reciente (solo Claude Code), se usa ese. Un *esperando* del hook no
+   cuenta si al final de la pantalla está el aviso de turno interrumpido (`What should Claude do
+   instead?`): al rechazar un permiso con Esc, Claude Code no lanza `Stop`.
 5. Si la pantalla cambió en los últimos 3 segundos → **trabajando**; si no → **inactivo**.
 
 Un estado de hook se considera viejo cuando la pantalla cambió después de él; esto evita que un

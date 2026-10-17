@@ -347,4 +347,12 @@ mod tests {
             Some(r"echo 'it'\''s'")
         );
     }
+
+    #[test]
+    fn textos_que_empiezan_por_guion() {
+        let cli = Cli::try_parse_from(["pastor", "new", "codex", "--prompt=-v revisa"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::New { prompt: Some(p), .. }) if p == "-v revisa"));
+        // Sin texto, `-p` no se traga la opción siguiente.
+        assert!(Cli::try_parse_from(["pastor", "new", "codex", "-p", "--cwd", "/x"]).is_err());
+    }
 }

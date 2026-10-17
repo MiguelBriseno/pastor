@@ -166,6 +166,12 @@ const BLOCKED: &[&str] = &[
 /// Textos que muestran los tres agentes mientras trabajan.
 const WORKING: &[&str] = &["esc to interrupt", "esc interrupt"];
 
+/// Lo que deja Claude Code al interrumpir un turno (p. ej. al rechazar un
+/// permiso con Esc). No lanza `Stop`, así que su último hook puede ser un
+/// `blocked` que ya no vale. Solo cuenta al final de la pantalla: un diálogo
+/// posterior lo empuja hacia arriba.
+const INTERRUPTED: &[&str] = &["what should claude do instead"];
+
 pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     if obs.dead || obs.gone {
         return Status::Dead;
@@ -186,8 +192,10 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
         obs.last_change
             .is_none_or(|c| h.at + Duration::seconds(2) >= c)
     });
+    let last = tail_lower(obs.screen, 8);
+    let interrupted = INTERRUPTED.iter().any(|p| last.contains(p));
     match hook.map(|h| h.state.as_str()) {
-        Some("blocked") => return Status::Blocked,
+        Some("blocked") if !interrupted => return Status::Blocked,
         Some("idle") => return Status::Idle,
         Some("working") if changed_recently => return Status::Working,
         _ => {}
@@ -320,6 +328,32 @@ mod tests {
             ..obs("")
         };
         assert_eq!(classify(&o, Some(&hook("blocked", 10))), Status::Working);
+    }
+
+    /// Final de la pantalla de Claude Code tras rechazar un permiso con Esc.
+    const INTERRUMPIDO: &str = "❯ Ejecuta con Bash: curl -s https://example.com\n\
+        \x20 ⎿  Interrupted · What should Claude do instead?\n\
+        ✻ Baked for 8s · done 11:27 a.m.\n\
+        ────────\n❯ \n────────\n  ⏸ manual mode on · ? for shortcuts";
+
+    #[test]
+    fn rechazar_un_permiso_no_deja_esperando() {
+        assert_eq!(
+            classify(&obs(INTERRUMPIDO), Some(&hook("blocked", 30))),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn un_dialogo_posterior_a_la_interrupcion_sigue_esperando() {
+        let mut screen = format!("{INTERRUMPIDO}\n❯ y ahora pregúntame algo\n");
+        for i in 1..=8 {
+            screen.push_str(&format!("opción {i}\n"));
+        }
+        assert_eq!(
+            classify(&obs(&screen), Some(&hook("blocked", 1))),
+            Status::Blocked
+        );
     }
 
     #[test]
