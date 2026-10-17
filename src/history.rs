@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -140,14 +140,53 @@ fn write(event: &Event) -> Result<()> {
     Ok(())
 }
 
-/// Lee el historial. Las líneas que no se entienden (p. ej. eventos de una
-/// versión más nueva) se ignoran.
-pub fn load() -> Vec<Entry> {
-    fs::read_to_string(path())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+/// El historial leído hasta ahora. Como solo se le añaden líneas, cada
+/// `refresh` lee lo nuevo en vez del archivo entero. Las líneas que no se
+/// entienden (p. ej. eventos de una versión más nueva) se ignoran.
+#[derive(Default)]
+pub struct Tail {
+    entries: Vec<Entry>,
+    /// Bytes ya leídos, hasta el último salto de línea.
+    offset: u64,
+}
+
+impl Tail {
+    /// Lee lo añadido desde la última vez. `true` si cambió algo.
+    pub fn refresh(&mut self) -> bool {
+        self.refresh_from(&path())
+    }
+
+    fn refresh_from(&mut self, path: &Path) -> bool {
+        let len = fs::metadata(path).map_or(0, |m| m.len());
+        // Más corto que lo leído: lo borraron o lo rehicieron.
+        let reset = len < self.offset;
+        if reset {
+            *self = Tail::default();
+        }
+        if len == self.offset {
+            return reset;
+        }
+        let mut buf = Vec::new();
+        let read = fs::File::open(path).and_then(|mut f| {
+            f.seek(SeekFrom::Start(self.offset))?;
+            f.read_to_end(&mut buf)
+        });
+        // Una línea a medio escribir se deja para la próxima.
+        let Some(end) = read.ok().and(buf.iter().rposition(|b| *b == b'\n')) else {
+            return reset;
+        };
+        self.entries.extend(
+            String::from_utf8_lossy(&buf[..=end])
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok()),
+        );
+        self.offset += end as u64 + 1;
+        true
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
 }
 
 /// Días que muestra el gráfico de actividad.
@@ -260,6 +299,45 @@ pub fn human(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_lee_solo_lo_nuevo_y_espera_lineas_completas() {
+        let dir = std::env::temp_dir().join(format!("pastor-tail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let turn = |a: &str| line(&Event::Turn { agent: a.into() }).unwrap();
+        let mut t = Tail::default();
+        assert!(!t.refresh_from(&path));
+
+        fs::write(&path, turn("a1")).unwrap();
+        assert!(t.refresh_from(&path));
+        assert!(!t.refresh_from(&path));
+
+        // Media línea: todavía no cuenta.
+        let second = turn("a2");
+        let (half, rest) = second.split_at(10);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(half.as_bytes())
+            .unwrap();
+        assert!(!t.refresh_from(&path));
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(rest.as_bytes())
+            .unwrap();
+        assert!(t.refresh_from(&path));
+        assert_eq!(t.entries().len(), 2);
+
+        // Rehecho más corto: se vuelve a leer desde el principio.
+        fs::write(&path, turn("a3")).unwrap();
+        assert!(t.refresh_from(&path));
+        assert_eq!(t.entries().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn la_linea_base_se_escribe_una_sola_vez() {

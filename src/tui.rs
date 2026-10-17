@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -40,20 +40,31 @@ const ACCENT: Color = Color::Magenta;
 const LABEL_W: usize = 14;
 /// Nombre del hilo que observa los paneles.
 const OBSERVER: &str = "observador";
-/// Último pánico del observador, para mostrarlo al reiniciarlo.
-static OBSERVER_PANIC: Mutex<Option<String>> = Mutex::new(None);
+/// Nombre del hilo que ejecuta las acciones.
+const ACTIONS: &str = "acciones";
+/// Último pánico de esos hilos, para mostrarlo al reiniciarlos.
+static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+fn last_panic() -> String {
+    LAST_PANIC
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+}
 
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     // El hook de ratatui restaura la terminal ante cualquier pánico, también
-    // uno del observador, y la TUI seguiría dibujando sobre una terminal
-    // normal. Ese hilo se reinicia solo: su pánico no toca la terminal.
+    // uno del observador o de las acciones, y la TUI seguiría dibujando sobre
+    // una terminal normal. Esos hilos se reinician solos: su pánico no la toca.
     let restore = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().name() == Some(OBSERVER) {
-            *OBSERVER_PANIC
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) =
+        if std::thread::current()
+            .name()
+            .is_some_and(|n| [OBSERVER, ACTIONS].contains(&n))
+        {
+            *LAST_PANIC.lock().unwrap_or_else(PoisonError::into_inner) =
                 Some(info.to_string().replace('\n', " "));
         } else {
             restore(info);
@@ -130,6 +141,7 @@ struct App {
     state: State,
     snaps: HashMap<String, Snapshot>,
     observer: Observer,
+    actions: Actions,
     agent_sel: ListState,
     task_sel: TableState,
     /// Tamaños ajustables de los paneles.
@@ -137,8 +149,6 @@ struct App {
     term_pct: u16,
     desc_height: u16,
     flash: Option<(String, Instant)>,
-    /// Tamaño de history.jsonl al calcular `stats`; se recalcula si crece.
-    history_len: u64,
     stats: Stats,
     quit: bool,
 }
@@ -151,13 +161,13 @@ impl App {
             state: State::default(),
             snaps: HashMap::new(),
             observer: Observer::spawn(),
+            actions: Actions::spawn(),
             agent_sel: ListState::default(),
             task_sel: TableState::default(),
             list_width: 44,
             term_pct: 40,
             desc_height: 7,
             flash: None,
-            history_len: u64::MAX,
             stats: Stats::default(),
             quit: false,
         }
@@ -166,20 +176,29 @@ impl App {
     fn run(&mut self, term: &mut DefaultTerminal) -> Result<()> {
         self.reload();
         while !self.quit {
-            if let Some((state, snaps)) = self.observer.take() {
-                self.apply(&state, snaps);
+            if let Some(pass) = self.observer.take() {
+                self.snaps = pass.snaps;
+                if let Some(stats) = pass.stats {
+                    self.stats = stats;
+                }
+                for msg in pass.flashes {
+                    self.set_flash(msg);
+                }
                 self.reload();
             }
+            while let Ok((result, retry)) = self.actions.results.try_recv() {
+                self.finish(result, retry);
+            }
             if self.observer.died() {
-                let why = OBSERVER_PANIC
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-                    .unwrap_or_default();
                 self.set_flash(format!(
-                    "El observador de paneles falló; se reinició. {why}"
+                    "El observador de paneles falló; se reinició. {}",
+                    last_panic()
                 ));
                 self.observer = Observer::spawn();
+            }
+            if self.actions.died() {
+                self.set_flash(format!("Una acción falló. {}", last_panic()));
+                self.actions = Actions::spawn();
             }
             term.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
@@ -190,10 +209,37 @@ impl App {
                 }
             }
         }
+        // Que una acción a medias (lanzar un agente, por ejemplo) termine.
+        self.actions.wait();
         Ok(())
     }
 
     // ---------- estado ----------
+
+    /// Termina en la TUI una acción del hilo de acciones. Si falló y no se
+    /// abrió otra cosa mientras, vuelve al formulario con lo escrito.
+    fn finish(&mut self, result: Result<Done>, retry: Option<Mode>) {
+        match result {
+            Ok(done) => {
+                self.refresh();
+                match done {
+                    Done::Msg(msg) => self.set_flash(msg),
+                    Done::Agent { id, msg } => {
+                        self.set_flash(msg);
+                        let i = self.state.agents.iter().position(|a| a.id == id);
+                        self.agent_sel.select(i);
+                    }
+                    Done::Quiet => {}
+                }
+            }
+            Err(e) => {
+                self.set_flash(format!("Error: {e:#}"));
+                if let (Mode::Normal, Some(m)) = (&self.mode, retry) {
+                    self.mode = m;
+                }
+            }
+        }
+    }
 
     /// Recarga el estado y pide al observador que mire los paneles ya, para
     /// que lo que se acaba de hacer se vea sin esperar al siguiente segundo.
@@ -202,46 +248,10 @@ impl App {
         self.observer.wake();
     }
 
-    /// Toma lo que vio el observador y avisa de los cambios de estado.
-    fn apply(&mut self, state: &State, snaps: HashMap<String, Snapshot>) {
-        let mut events = Vec::new();
-        for a in &state.agents {
-            let (Some(old), Some(new)) = (self.snaps.get(&a.id), snaps.get(&a.id)) else {
-                continue;
-            };
-            match (old.status, new.status) {
-                (o, Status::Blocked) if o != Status::Blocked => {
-                    events.push((format!("{} necesita tu atención", a.name), None));
-                }
-                (Status::Working, Status::Idle | Status::Dead) => {
-                    // Sin tarea no hay nada que pasar a revisión.
-                    let id = a.task.is_some().then(|| a.id.clone());
-                    events.push((format!("{} terminó", a.name), id));
-                }
-                _ => {}
-            }
-        }
-        self.snaps = snaps;
-
-        for (msg, finished) in events {
-            notify(&msg);
-            self.set_flash(msg);
-            if let Some(Err(e)) = finished.map(|id| ops::finish_turn(&id)) {
-                self.set_flash(format!("Error: {e:#}"));
-            }
-        }
-    }
-
     fn reload(&mut self) {
         match State::load() {
             Ok(s) => self.state = s,
             Err(e) => self.set_flash(format!("Error: {e:#}")),
-        }
-
-        let len = std::fs::metadata(history::path()).map_or(0, |m| m.len());
-        if len != self.history_len {
-            self.history_len = len;
-            self.stats = history::stats(&history::load());
         }
 
         clamp(&mut self.agent_sel, self.state.agents.len());
@@ -512,18 +522,15 @@ impl App {
                     let kind = Kind::ALL[f.kind];
                     let name = Some(f.name.clone()).filter(|s| !s.trim().is_empty());
                     let prompt = Some(f.prompt.clone()).filter(|s| !s.trim().is_empty());
-                    match ops::new_agent(kind, Some(expand(&f.cwd)), name, prompt.as_deref()) {
-                        Ok(a) => {
-                            self.set_flash(format!("Agente {} lanzado", a.name));
-                            self.refresh();
-                            let i = self.state.agents.iter().position(|x| x.id == a.id);
-                            self.agent_sel.select(i);
-                        }
-                        Err(e) => {
-                            self.mode = Mode::NewAgent(f);
-                            return Err(e);
-                        }
-                    }
+                    let cwd = expand(&f.cwd);
+                    self.set_flash(format!("Lanzando {kind}…"));
+                    self.actions.run(Some(Mode::NewAgent(f)), move || {
+                        let a = ops::new_agent(kind, Some(cwd), name, prompt.as_deref())?;
+                        Ok(Done::Agent {
+                            id: a.id,
+                            msg: format!("Agente {} lanzado", a.name),
+                        })
+                    });
                 }
                 KeyCode::Tab | KeyCode::Down => {
                     f.field = (f.field + 1) % 4;
@@ -555,12 +562,15 @@ impl App {
             Mode::Send { agent, mut input } => {
                 if key.code == KeyCode::Enter {
                     if !input.trim().is_empty() {
-                        // Si falla (el agente salió, por ejemplo), lo escrito no se pierde.
-                        if let Err(e) = ops::send(&agent, &input) {
-                            self.mode = Mode::Send { agent, input };
-                            return Err(e);
-                        }
-                        self.set_flash(format!("Mensaje enviado a {}", self.agent_name(&agent)));
+                        let name = self.agent_name(&agent);
+                        let (a, text) = (agent.clone(), input.clone());
+                        self.set_flash(format!("Enviando a {name}…"));
+                        // Si falla (el agente salió, por ejemplo), lo escrito vuelve.
+                        self.actions
+                            .run(Some(Mode::Send { agent, input }), move || {
+                                ops::send(&a, &text)?;
+                                Ok(Done::Msg(format!("Mensaje enviado a {name}")))
+                            });
                     }
                 } else {
                     edit(&mut input, &key);
@@ -569,15 +579,15 @@ impl App {
             }
             Mode::Term { agent, mut input } => {
                 if key.code == KeyCode::Enter {
-                    if let Err(e) = ops::open_term(&agent, Some(&input)) {
-                        self.mode = Mode::Term { agent, input };
-                        return Err(e);
-                    }
-                    self.set_flash(format!(
-                        "Terminal abierta junto a {} · ⏎ para entrar",
-                        self.agent_name(&agent)
-                    ));
-                    self.refresh();
+                    let name = self.agent_name(&agent);
+                    let (a, cmd) = (agent.clone(), input.clone());
+                    self.actions
+                        .run(Some(Mode::Term { agent, input }), move || {
+                            ops::open_term(&a, Some(&cmd))?;
+                            Ok(Done::Msg(format!(
+                                "Terminal abierta junto a {name} · ⏎ para entrar"
+                            )))
+                        });
                 } else {
                     edit(&mut input, &key);
                     self.mode = Mode::Term { agent, input };
@@ -627,16 +637,12 @@ impl App {
                             cwd: expand(&f.cwd),
                         },
                     };
-                    match ops::assign_task(&f.task, target) {
-                        Ok(a) => {
-                            self.set_flash(format!("Tarea {} asignada a {}", f.task, a.name));
-                            self.refresh();
-                        }
-                        Err(e) => {
-                            self.mode = Mode::Assign(f);
-                            return Err(e);
-                        }
-                    }
+                    let task = f.task.clone();
+                    self.set_flash(format!("Asignando {task}…"));
+                    self.actions.run(Some(Mode::Assign(f)), move || {
+                        let a = ops::assign_task(&task, target)?;
+                        Ok(Done::Msg(format!("Tarea {task} asignada a {}", a.name)))
+                    });
                 }
                 _ => {
                     edit(&mut f.cwd, &key);
@@ -646,7 +652,10 @@ impl App {
             Mode::Confirm { action, .. } => {
                 if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('s') {
                     match action {
-                        Pending::KillAgent(id) => ops::kill_agent(&id)?,
+                        Pending::KillAgent(id) => self.actions.run(None, move || {
+                            ops::kill_agent(&id)?;
+                            Ok(Done::Quiet)
+                        }),
                         Pending::DeleteTask(id) => ops::delete_task(&id)?,
                     }
                     self.refresh();
@@ -1407,28 +1416,102 @@ fn tail(screen: &str, h: usize) -> String {
     lines[lines.len().saturating_sub(h)..].join("\n")
 }
 
-/// Lo que vio el observador: el estado que usó y una captura por agente.
-type Seen = (State, HashMap<String, Snapshot>);
+/// Lo que vio el observador en una pasada.
+#[derive(Default)]
+struct Pass {
+    snaps: HashMap<String, Snapshot>,
+    /// Solo si el historial cambió.
+    stats: Option<Stats>,
+    /// Avisos de agentes que terminaron o necesitan atención.
+    flashes: Vec<String>,
+}
 
-/// Hilo que mira los paneles de tmux (capturas y `ps`) cada `REFRESH`, o antes
-/// si se le pide, para que eso no frene el dibujo ni las teclas. Solo guarda la
-/// última pasada: mientras la TUI está suspendida no se acumulan.
+impl Pass {
+    /// Junta una pasada que la TUI no llegó a tomar con la siguiente.
+    fn after(mut self, old: Pass) -> Pass {
+        self.flashes = [old.flashes, self.flashes].concat();
+        self.stats = self.stats.or(old.stats);
+        self
+    }
+}
+
+/// Lo que el observador recuerda entre pasadas.
+#[derive(Default)]
+struct Watch {
+    tracker: Tracker,
+    status: HashMap<String, Status>,
+    history: history::Tail,
+}
+
+impl Watch {
+    fn look(&mut self) -> Option<Pass> {
+        let state = State::load().ok()?;
+        let snaps = ops::observe(&state, &mut self.tracker);
+        // Avisar desde aquí y no desde la TUI hace que lleguen también
+        // mientras estás dentro de un agente (la TUI está suspendida).
+        let mut flashes = Vec::new();
+        for (msg, finished) in transitions(&state, &self.status, &snaps) {
+            notify(&msg);
+            flashes.push(msg);
+            if let Some(Err(e)) = finished.map(|id| ops::finish_turn(&id)) {
+                flashes.push(format!("Error: {e:#}"));
+            }
+        }
+        self.status = snaps.iter().map(|(id, s)| (id.clone(), s.status)).collect();
+        let stats = self
+            .history
+            .refresh()
+            .then(|| history::stats(self.history.entries()));
+        Some(Pass {
+            snaps,
+            stats,
+            flashes,
+        })
+    }
+}
+
+/// Avisos por los cambios de estado de `old` a `new`, cada uno con el agente
+/// cuya tarea hay que pasar a revisión, si la tiene.
+fn transitions(
+    state: &State,
+    old: &HashMap<String, Status>,
+    new: &HashMap<String, Snapshot>,
+) -> Vec<(String, Option<String>)> {
+    let mut events = Vec::new();
+    for a in &state.agents {
+        let (Some(&old), Some(new)) = (old.get(&a.id), new.get(&a.id)) else {
+            continue;
+        };
+        match (old, new.status) {
+            (o, Status::Blocked) if o != Status::Blocked => {
+                events.push((format!("{} necesita tu atención", a.name), None));
+            }
+            (Status::Working, Status::Idle | Status::Dead) => {
+                // Sin tarea no hay nada que pasar a revisión.
+                let id = a.task.is_some().then(|| a.id.clone());
+                events.push((format!("{} terminó", a.name), id));
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+/// Hilo que mira los paneles de tmux (capturas y `ps`) y el historial cada
+/// `REFRESH`, o antes si se le pide, para que eso no frene el dibujo ni las
+/// teclas. Solo guarda la última pasada: mientras la TUI está suspendida no se
+/// acumulan capturas.
 struct Observer {
     wake: Sender<()>,
-    latest: Arc<Mutex<Option<Seen>>>,
+    latest: Arc<Mutex<Option<Pass>>>,
     thread: JoinHandle<()>,
 }
 
 impl Observer {
     /// La primera pasada se hace aquí, para que el primer cuadro ya la tenga.
     fn spawn() -> Self {
-        let mut tracker = Tracker::default();
-        let look = move |tracker: &mut Tracker| {
-            let state = State::load().ok()?;
-            let snaps = ops::observe(&state, tracker);
-            Some((state, snaps))
-        };
-        let latest = Arc::new(Mutex::new(look(&mut tracker)));
+        let mut watch = Watch::default();
+        let latest = Arc::new(Mutex::new(watch.look()));
         let (wake, wakes) = mpsc::channel();
         let slot = Arc::clone(&latest);
         let thread = std::thread::Builder::new()
@@ -1439,8 +1522,12 @@ impl Observer {
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
-                if let Some(seen) = look(&mut tracker) {
-                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(seen);
+                if let Some(pass) = watch.look() {
+                    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+                    *slot = Some(match slot.take() {
+                        Some(old) => pass.after(old),
+                        None => pass,
+                    });
                 }
             })
             // Lo mismo que haría `thread::spawn`.
@@ -1452,7 +1539,7 @@ impl Observer {
         }
     }
 
-    fn take(&self) -> Option<Seen> {
+    fn take(&self) -> Option<Pass> {
         self.latest
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1469,12 +1556,78 @@ impl Observer {
     }
 }
 
+/// Lo que queda por hacer en la TUI cuando termina una acción.
+enum Done {
+    Msg(String),
+    /// Se lanzó un agente: se selecciona.
+    Agent {
+        id: String,
+        msg: String,
+    },
+    Quiet,
+}
+
+type Job = Box<dyn FnOnce() -> Result<Done> + Send>;
+
+/// Hilo que ejecuta, de una en una, las acciones que hablan con tmux (lanzar,
+/// enviar, asignar…), para que la TUI no se congele mientras.
+struct Actions {
+    jobs: Option<Sender<(Job, Option<Mode>)>>,
+    results: Receiver<(Result<Done>, Option<Mode>)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Actions {
+    fn spawn() -> Self {
+        let (jobs, todo) = mpsc::channel::<(Job, Option<Mode>)>();
+        let (done, results) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name(ACTIONS.into())
+            .spawn(move || {
+                for (job, retry) in todo {
+                    if done.send((job(), retry)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("no pude lanzar el hilo de acciones");
+        Self {
+            jobs: Some(jobs),
+            results,
+            thread: Some(thread),
+        }
+    }
+
+    /// Si falla, `retry` es el formulario al que volver con lo escrito.
+    fn run(&self, retry: Option<Mode>, job: impl FnOnce() -> Result<Done> + Send + 'static) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send((Box::new(job), retry));
+        }
+    }
+
+    fn died(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    /// Espera a que terminen las acciones pendientes.
+    fn wait(&mut self) {
+        self.jobs = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 fn notify(msg: &str) {
-    let _ = Command::new("notify-send")
+    let child = Command::new("notify-send")
         .args(["-a", "pastor", "pastor", msg])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+    // Esperarlo, para que no quede un proceso zombi por aviso.
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || child.wait());
+    }
 }
 
 fn popup(f: &mut Frame, title: &str, w: u16, h: u16) -> Rect {
@@ -1660,5 +1813,71 @@ fn expand(s: &str) -> PathBuf {
     match (s.strip_prefix('~'), dirs::home_dir()) {
         (Some(rest), Some(home)) => home.join(rest.trim_start_matches('/')),
         _ => PathBuf::from(s),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snaps(list: &[(&str, Status)]) -> HashMap<String, Snapshot> {
+        list.iter()
+            .map(|&(id, status)| {
+                let snap = Snapshot {
+                    status,
+                    screen: String::new(),
+                    term: None,
+                };
+                (id.to_string(), snap)
+            })
+            .collect()
+    }
+
+    fn statuses(list: &[(&str, Status)]) -> HashMap<String, Status> {
+        list.iter().map(|&(id, s)| (id.to_string(), s)).collect()
+    }
+
+    #[test]
+    fn avisa_al_terminar_y_al_bloquearse() {
+        let mut state = State::default();
+        let a1 = state.add_agent(Kind::Claude, PathBuf::from("/tmp/web"), None);
+        state.add_agent(Kind::Claude, PathBuf::from("/tmp/api"), None);
+        state.agents[0].task = Some("t1".into());
+        let old = statuses(&[("a1", Status::Working), ("a2", Status::Idle)]);
+        let new = snaps(&[("a1", Status::Idle), ("a2", Status::Blocked)]);
+        assert_eq!(
+            transitions(&state, &old, &new),
+            [
+                (format!("{} terminó", a1.name), Some("a1".to_string())),
+                ("api necesita tu atención".to_string(), None),
+            ]
+        );
+        // Sin estado anterior (recién arrancado) no hay avisos.
+        assert!(transitions(&state, &HashMap::new(), &new).is_empty());
+    }
+
+    #[test]
+    fn sin_tarea_no_hay_nada_que_pasar_a_revision() {
+        let mut state = State::default();
+        state.add_agent(Kind::Claude, PathBuf::from("/tmp/web"), None);
+        let old = statuses(&[("a1", Status::Working)]);
+        let new = snaps(&[("a1", Status::Dead)]);
+        assert_eq!(transitions(&state, &old, &new)[0].1, None);
+    }
+
+    #[test]
+    fn una_pasada_no_tomada_no_pierde_avisos_ni_estadisticas() {
+        let old = Pass {
+            stats: Some(Stats::default()),
+            flashes: vec!["a terminó".into()],
+            ..Pass::default()
+        };
+        let new = Pass {
+            flashes: vec!["b terminó".into()],
+            ..Pass::default()
+        };
+        let p = new.after(old);
+        assert_eq!(p.flashes, ["a terminó", "b terminó"]);
+        assert!(p.stats.is_some());
     }
 }
