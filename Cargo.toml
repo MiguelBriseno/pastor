@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Gestor de agentes de código (Claude Code, Codex, opencode) sobre tmux"
 repository = "https://github.com/MiguelBriseno/pastor"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 
 [dependencies]
