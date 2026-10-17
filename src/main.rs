@@ -202,9 +202,7 @@ fn main() -> Result<()> {
     let _ = history::ensure_baseline();
     match cli.cmd {
         None => {
-            if let Ok(state) = State::load() {
-                hooks::prune_status(&state);
-            }
+            hooks::prune_status();
             tui::run()
         }
         Some(Cmd::Hook { event }) => {
@@ -230,8 +228,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::List) => {
+            hooks::prune_status();
             let state = State::load()?;
-            hooks::prune_status(&state);
             if state.agents.is_empty() {
                 println!("No hay agentes. Lanza uno con `pastor new claude`.");
             }

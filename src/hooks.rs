@@ -47,15 +47,25 @@ pub fn screen_hash(screen: &str) -> u64 {
 /// pie, donde Claude Code pone y quita pistas solo (`/effort`, el modo…).
 const FOOTER: usize = 5;
 
+/// Viñeta de una herramienta pendiente, que parpadea mientras espera
+/// permiso: `●`, o `⏺` en macOS.
+const BLINK: [char; 2] = ['●', '⏺'];
+
+/// `screen` sin el parpadeo de la viñeta, que no es actividad del agente.
+fn normalize_blink(screen: &str) -> String {
+    screen.replace(BLINK, " ")
+}
+
+/// Hash de la pantalla para el observador.
+pub fn activity_hash(screen: &str) -> u64 {
+    screen_hash(&normalize_blink(screen))
+}
+
 /// Huella de la pantalla para saber si un hook sigue valiendo. Responder un
-/// diálogo o interrumpir el turno cambia lo que hay encima del pie. El `●`
-/// de una herramienta pendiente parpadea mientras espera permiso: no cuenta.
+/// diálogo o interrumpir el turno cambia lo que hay encima del pie.
 pub fn fingerprint(screen: &str) -> u64 {
-    let lines: Vec<String> = screen
-        .trim_end()
-        .lines()
-        .map(|l| l.trim_end().replace('●', " "))
-        .collect();
+    let screen = normalize_blink(screen);
+    let lines: Vec<&str> = screen.trim_end().lines().map(str::trim_end).collect();
     screen_hash(&lines[..lines.len().saturating_sub(FOOTER)].join("\n"))
 }
 
@@ -77,9 +87,11 @@ pub fn clear_status(id: &str) {
     let _ = fs::remove_file(data_dir().join("status").join(format!("{id}.lock")));
 }
 
-/// Borra los estados de hook de agentes que ya no existen.
-pub fn prune_status(state: &store::State) {
-    prune_status_in(&data_dir().join("status"), state);
+/// Borra los estados de hook de agentes que ya no existen. Con el candado de
+/// `state.json`: un agente entra ahí antes de lanzarse, así que uno recién
+/// creado no pierde su estado.
+pub fn prune_status() {
+    let _ = store::State::with_lock(|s| prune_status_in(&data_dir().join("status"), s));
 }
 
 fn prune_status_in(dir: &Path, state: &store::State) {
@@ -87,21 +99,19 @@ fn prune_status_in(dir: &Path, state: &store::State) {
         return;
     };
     for entry in dir.flatten() {
-        let path = entry.path();
-        let known = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|id| state.agents.iter().any(|a| a.id == id));
-        if !known {
-            let _ = fs::remove_file(path);
+        // Solo `<id>.json` y `<id>.lock`: los temporales de una escritura en
+        // curso (`<id>.json.<sufijo>.tmp`) son de su hook.
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".json").or_else(|| n.strip_suffix(".lock")))
+        else {
+            continue;
+        };
+        if !state.agents.iter().any(|a| a.id == id) {
+            let _ = fs::remove_file(entry.path());
         }
     }
-}
-
-/// Huella sin el `●` que parpadea mientras una herramienta espera permiso,
-/// para que el observador no lo tome por actividad.
-pub fn activity_hash(screen: &str) -> u64 {
-    screen_hash(&screen.replace('●', " "))
 }
 
 /// Llamado por Claude Code. Nunca debe fallar ruidosamente.
@@ -394,7 +404,13 @@ mod tests {
             store::unique_suffix()
         )));
         fs::create_dir_all(&dir.0).unwrap();
-        for f in ["a1.json", "a1.lock", "a2.json", "a2.lock"] {
+        for f in [
+            "a1.json",
+            "a1.lock",
+            "a2.json",
+            "a2.lock",
+            "a1.json.9-1.tmp",
+        ] {
             fs::write(dir.0.join(f), "{}").unwrap();
         }
         let mut state = store::State::default();
@@ -405,7 +421,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         quedan.sort();
-        assert_eq!(quedan, ["a1.json", "a1.lock"]);
+        assert_eq!(quedan, ["a1.json", "a1.json.9-1.tmp", "a1.lock"]);
     }
 
     /// HOME temporal que se borra al terminar, aunque falle la prueba.

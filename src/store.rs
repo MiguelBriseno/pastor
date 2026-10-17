@@ -109,6 +109,15 @@ impl State {
         Self::update_then(f, |_| {})
     }
 
+    /// Lee con el candado tomado: nadie añade ni quita agentes mientras `f`
+    /// corre.
+    pub fn with_lock<T>(f: impl FnOnce(&State) -> T) -> Result<T> {
+        ensure_dirs()?;
+        let dir = data_dir();
+        let _lock = lock(&dir.join("state.lock"))?;
+        Ok(f(&Self::load_in(&dir)?))
+    }
+
     /// Como `update`, y si se guardó, `saved` corre todavía con el candado
     /// tomado: lo que anote queda en el mismo orden que los guardados.
     pub fn update_then<T>(

@@ -616,6 +616,7 @@ mod tests {
             |t: &mut Tracker, screen: &str| t.observe("a1", hooks::activity_hash(screen), "80x24");
         assert_eq!(obs(&mut t, "● Bash(curl)\nDo you want to proceed?"), None);
         assert_eq!(obs(&mut t, "  Bash(curl)\nDo you want to proceed?"), None);
+        assert_eq!(obs(&mut t, "⏺ Bash(curl)\nDo you want to proceed?"), None);
         assert!(obs(&mut t, "  Bash(curl)\n⎿ Interrupted").is_some());
     }
 
