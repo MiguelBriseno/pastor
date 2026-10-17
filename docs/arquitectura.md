@@ -143,7 +143,10 @@ la TUI esté cerrada.
 
 Un proceso que se arrancó desde un agente hereda su `PASTOR_AGENT`; si lanza sus propios `claude`
 (p. ej. un servicio en segundo plano), sus hooks llegan con ese id. Si el agente ya no está en
-`state.json`, el hook no escribe nada. La TUI y `pastor ls` borran al arrancar los estados de
+`state.json`, el hook no escribe nada. Si el agente sigue vivo, el hook solo cuenta si su proceso
+desciende de un panel de la sesión del agente (un `tmux list-panes` y un `ps`). Un servicio que se
+desligó cuelga de init y no pasa, aunque herede `PASTOR_AGENT` y `TMUX_PANE`. Si no se puede
+comprobar, el hook se da por bueno. La TUI y `pastor ls` borran al arrancar los estados de
 agentes que ya no existen, con el candado de `state.json` tomado para no llevarse los de un agente
 recién creado.
 

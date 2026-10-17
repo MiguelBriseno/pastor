@@ -1,6 +1,7 @@
 //! Hooks de Claude Code: `pastor hook <evento>` escribe el estado del agente
 //! en ~/.local/share/pastor/status/<id>.json.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,48 @@ fn prune_status_in(dir: &Path, state: &store::State) {
     }
 }
 
+/// Si este proceso desciende de un panel del agente. Un servicio que arrancó
+/// desde él y se desligó (p. ej. un worker que lanza sus propios `claude`)
+/// hereda `PASTOR_AGENT` pero ya no cuelga de su panel, y su `Stop` mandaría
+/// la tarea del agente a revisar. Si no se puede saber, se da por bueno.
+fn from_agent(id: &str) -> bool {
+    let Ok(panes) = tmux::pane_pids(id) else {
+        return true;
+    };
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+    else {
+        return true;
+    };
+    let parents = parse_parents(&String::from_utf8_lossy(&out.stdout));
+    descends_from(&parents, std::process::id(), &panes)
+}
+
+/// Lee la salida de `ps -o pid=,ppid=`.
+fn parse_parents(out: &str) -> HashMap<u32, u32> {
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+fn descends_from(parents: &HashMap<u32, u32>, mut pid: u32, ancestors: &[u32]) -> bool {
+    // Con tope, por si la tabla tuviera un ciclo (pids reutilizados).
+    for _ in 0..64 {
+        if ancestors.contains(&pid) {
+            return true;
+        }
+        match parents.get(&pid) {
+            Some(&ppid) if ppid != 0 && ppid != pid => pid = ppid,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Llamado por Claude Code. Nunca debe fallar ruidosamente.
 pub fn handle(event: &str) -> Result<()> {
     let Ok(id) = std::env::var("PASTOR_AGENT") else {
@@ -125,8 +168,13 @@ pub fn handle(event: &str) -> Result<()> {
     if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
         return Ok(());
     }
+    // `settle` lo lanza un hook que ya pasó el filtro de abajo, y al salir
+    // ese hook queda colgando de init.
     if event == "settle" {
         return settle(&id);
+    }
+    if !from_agent(&id) {
+        return Ok(());
     }
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
@@ -422,6 +470,18 @@ mod tests {
             .collect();
         quedan.sort();
         assert_eq!(quedan, ["a1.json", "a1.json.9-1.tmp", "a1.lock"]);
+    }
+
+    #[test]
+    fn solo_cuentan_los_procesos_del_panel() {
+        // 100: panel; 101 claude, 102 hook. 200: worker desligado (padre 1).
+        let parents = parse_parents("  1 0\n100 1\n101 100\n102 101\n200 1\n201 200\n202 201\n");
+        assert!(descends_from(&parents, 102, &[100]));
+        assert!(!descends_from(&parents, 202, &[100]));
+        assert!(!descends_from(&parents, 999, &[100]));
+        // Un ciclo no lo cuelga.
+        let ciclo = parse_parents("5 6\n6 5\n");
+        assert!(!descends_from(&ciclo, 5, &[100]));
     }
 
     /// HOME temporal que se borra al terminar, aunque falle la prueba.

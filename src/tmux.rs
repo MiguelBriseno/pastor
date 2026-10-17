@@ -332,6 +332,21 @@ fn same_prefix_outside() -> bool {
     outside.is_none() || outside == prefix(&mut tmux())
 }
 
+/// Procesos con los que arrancaron los paneles de la sesión `name`.
+pub fn pane_pids(name: &str) -> Result<Vec<u32>> {
+    Ok(run(&[
+        "list-panes",
+        "-s",
+        "-t",
+        &session(name),
+        "-F",
+        "#{pane_pid}",
+    ])?
+    .lines()
+    .filter_map(|l| l.trim().parse().ok())
+    .collect())
+}
+
 pub fn kill_session(name: &str) -> Result<()> {
     run(&["kill-session", "-t", &session(name)]).map(|_| ())
 }
