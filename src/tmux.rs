@@ -256,6 +256,19 @@ pub fn capture(target: &str) -> Result<String> {
     run(&["capture-pane", "-p", "-J", "-t", target])
 }
 
+/// Tamaño del panel con el mismo formato que `Pane::size`.
+pub fn pane_size(target: &str) -> Result<String> {
+    Ok(run(&[
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{pane_width}x#{pane_height}",
+    ])?
+    .trim()
+    .to_string())
+}
+
 /// Pega `text` en el agente (bracketed paste) y pulsa Enter.
 pub fn send_text(name: &str, text: &str) -> Result<()> {
     // Único por envío: dos envíos a la vez al mismo panel (la TUI y la CLI)

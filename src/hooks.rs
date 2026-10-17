@@ -14,7 +14,7 @@ use crate::agent;
 use crate::history::{self, Event};
 use crate::ops;
 use crate::store::{data_dir, ensure_dirs, write_atomic, write_atomic_mode, write_volatile};
-use crate::tmux::shell_quote;
+use crate::tmux::{self, shell_quote};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct HookStatus {
@@ -22,6 +22,25 @@ pub struct HookStatus {
     pub at: DateTime<Utc>,
     #[serde(default)]
     pub message: String,
+    /// Huella de la pantalla del agente cuando se asentó tras el hook. Si la
+    /// pantalla ya es otra, el hook es viejo aunque nadie la viera cambiar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<Screen>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Screen {
+    pub hash: u64,
+    /// Si el panel cambió de tamaño, el agente se redibuja: no se compara.
+    pub size: String,
+}
+
+/// FNV-1a: estable entre versiones de pastor, a diferencia de `DefaultHasher`
+/// (el hook y quien lo lee pueden ser binarios distintos).
+pub fn screen_hash(screen: &str) -> u64 {
+    screen.bytes().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn status_path(id: &str) -> PathBuf {
@@ -41,6 +60,9 @@ pub fn handle(event: &str) -> Result<()> {
     let Ok(id) = std::env::var("PASTOR_AGENT") else {
         return Ok(());
     };
+    if event == "settle" {
+        return settle(&id);
+    }
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: Value = serde_json::from_str(&input).unwrap_or_default();
@@ -64,11 +86,15 @@ pub fn handle(event: &str) -> Result<()> {
         state: state.into(),
         at: Utc::now(),
         message,
+        screen: None,
     };
     write_volatile(
         &status_path(&id),
         serde_json::to_string(&status)?.as_bytes(),
     )?;
+    if state != "working" {
+        spawn_settle();
+    }
 
     // Claude terminó su turno: su tarea queda lista para revisar.
     if event == "idle" {
@@ -76,6 +102,56 @@ pub fn handle(event: &str) -> Result<()> {
         ops::finish_turn(&id)?;
     }
     Ok(())
+}
+
+/// Lanza `pastor hook settle` sin esperarlo: Claude Code espera al hook, y
+/// la pantalla aún no tiene su forma final (el diálogo, el resumen del turno).
+fn spawn_settle() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let Ok(exe) = pastor_exe() else { return };
+    // Sin heredar stdout: Claude Code esperaría a que se cierre.
+    let _ = Command::new(exe)
+        .args(["hook", "settle"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+}
+
+/// Espera a que la pantalla del agente deje de cambiar y guarda su huella en
+/// el estado del hook, si mientras tanto no llegó otro.
+fn settle(id: &str) -> Result<()> {
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
+        return Ok(());
+    };
+    let Some(at) = read_status(id).map(|s| s.at) else {
+        return Ok(());
+    };
+    let mut last = None;
+    let mut seen = None;
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let now = Screen {
+            hash: screen_hash(&tmux::capture(&pane)?),
+            size: tmux::pane_size(&pane)?,
+        };
+        if last.as_ref() == Some(&now) {
+            seen = Some(now);
+            break;
+        }
+        last = Some(now);
+    }
+    // Si no se quedó quieta, mejor sin huella que con una que no es.
+    let Some(screen) = seen else { return Ok(()) };
+    match read_status(id) {
+        Some(mut s) if s.at == at => {
+            s.screen = Some(screen);
+            write_volatile(&status_path(id), serde_json::to_string(&s)?.as_bytes())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Anota en `hooks.log` un hook que falló, porque Claude Code no lo muestra.

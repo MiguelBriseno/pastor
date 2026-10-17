@@ -118,7 +118,13 @@ se ignoran.
 5. Si la pantalla cambió en los últimos 3 segundos → **trabajando**; si no → **inactivo**.
 
 Un estado de hook se considera viejo cuando la pantalla cambió después de él; esto evita que un
-*esperando* quede pegado después de que respondiste.
+*esperando* quede pegado después de que respondiste. Hay dos formas de saberlo:
+
+- El observador (la TUI) vio cambiar la pantalla después del hook.
+- Tras un `blocked` o un `idle`, el hook lanza `pastor hook settle` en segundo plano. Ese proceso
+  espera a que la pantalla deje de cambiar y guarda su huella (hash FNV-1a y tamaño del panel) en
+  `status/<id>.json`. Si la pantalla actual es otra, el hook es viejo aunque nadie la viera
+  cambiar, como en `pastor ls` o una TUI recién abierta. Con otro tamaño de panel no se compara.
 
 ### Hooks de Claude Code
 

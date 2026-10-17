@@ -143,6 +143,8 @@ pub struct Observation<'a> {
     /// El agente salió y en su panel quedó el shell (u otro programa).
     pub gone: bool,
     pub screen: &'a str,
+    /// Ancho y alto del panel (`80x24`).
+    pub size: &'a str,
     /// Última vez que vimos cambiar la pantalla (None = no ha cambiado desde que miramos).
     pub last_change: Option<DateTime<Utc>>,
     pub age_secs: i64,
@@ -187,10 +189,15 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     let changed_recently = obs
         .last_change
         .is_some_and(|t| now - t < Duration::seconds(3));
-    // Un hook vale mientras la pantalla no haya cambiado después de él.
+    // Un hook vale mientras la pantalla no haya cambiado después de él: lo
+    // dice quien la observa o, si acaba de empezar, la huella que guardó el
+    // hook (con otro tamaño de panel no se pueden comparar).
     let hook = hook.filter(|h| {
         obs.last_change
             .is_none_or(|c| h.at + Duration::seconds(2) >= c)
+            && h.screen
+                .as_ref()
+                .is_none_or(|s| s.size != obs.size || s.hash == hooks::screen_hash(obs.screen))
     });
     let last = tail_lower(obs.screen, 8);
     let interrupted = INTERRUPTED.iter().any(|p| last.contains(p));
@@ -233,6 +240,7 @@ mod tests {
             dead: false,
             gone: false,
             screen,
+            size: "80x24",
             last_change: None,
             age_secs: 60,
         }
@@ -243,6 +251,7 @@ mod tests {
             state: state.into(),
             at: Utc::now() - Duration::seconds(secs_ago),
             message: String::new(),
+            screen: None,
         }
     }
 
@@ -354,6 +363,27 @@ mod tests {
             classify(&obs(&screen), Some(&hook("blocked", 1))),
             Status::Blocked
         );
+    }
+
+    #[test]
+    fn hook_con_huella_de_otra_pantalla_es_viejo() {
+        let con_huella = |pantalla: &str, size: &str| HookStatus {
+            screen: Some(hooks::Screen {
+                hash: hooks::screen_hash(pantalla),
+                size: size.into(),
+            }),
+            ..hook("blocked", 30)
+        };
+        let o = obs("Elige una opción\n❯ 1. Sí");
+        // La misma pantalla: el hook vale aunque el texto no diga nada.
+        let h = con_huella(o.screen, "80x24");
+        assert_eq!(classify(&o, Some(&h)), Status::Blocked);
+        // Otra pantalla: se respondió por otra vía.
+        let h = con_huella("Elige una opción\n❯ 2. No", "80x24");
+        assert_eq!(classify(&o, Some(&h)), Status::Idle);
+        // Otro tamaño: no se puede comparar y vale el hook.
+        let h = con_huella("Elige una opción\n❯ 2. No", "120x40");
+        assert_eq!(classify(&o, Some(&h)), Status::Blocked);
     }
 
     #[test]

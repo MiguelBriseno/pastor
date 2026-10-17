@@ -585,6 +585,7 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
                 dead: pane.is_none_or(|p| p.dead),
                 gone,
                 screen: &screen,
+                size: pane.map_or("", |p| p.size.as_str()),
                 last_change: tracker.observe(&a.id, &screen, pane.map_or("", |p| p.size.as_str())),
                 age_secs: (Utc::now() - a.created_at).num_seconds(),
             };
