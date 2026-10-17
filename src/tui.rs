@@ -33,6 +33,7 @@ use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::ops::{self, AssignTarget, Snapshot, Tracker};
 use crate::store::{Agent, State, Task, TaskStatus};
+use crate::text::{self, truncate};
 
 const REFRESH: Duration = Duration::from_secs(1);
 const SELECTED: Color = Color::Rgb(45, 45, 60);
@@ -694,7 +695,7 @@ impl App {
         let ic = icons::get();
         let logo_text = format!(" {}pastor ", pad(ic.logo));
         let [logo, tabs, summary] = Layout::horizontal([
-            Constraint::Length(logo_text.chars().count() as u16),
+            Constraint::Length(text::width(&logo_text) as u16),
             Constraint::Min(0),
             Constraint::Length(30),
         ])
@@ -745,7 +746,7 @@ impl App {
         let ic = icons::get();
         let kind_w = Kind::ALL
             .iter()
-            .map(|k| pad(ic.kind(*k)).chars().count())
+            .map(|k| text::width(&pad(ic.kind(*k))))
             .max()
             .unwrap_or(0);
         let name_w = (list_w as usize).saturating_sub(28 + kind_w).max(6);
@@ -778,11 +779,11 @@ impl App {
                             Style::default().fg(st.color()),
                         ),
                         Span::styled(
-                            format!("{:<name_w$}", truncate(&a.name, name_w)),
+                            text::pad_right(&truncate(&a.name, name_w), name_w),
                             Style::default().bold(),
                         ),
                         Span::styled(
-                            format!(" {:<kind_w$}", pad(ic.kind(a.kind))),
+                            format!(" {}", text::pad_right(&pad(ic.kind(a.kind)), kind_w)),
                             Style::default().fg(kind_color(a.kind)),
                         ),
                         Span::styled(
@@ -1718,12 +1719,16 @@ fn field_lines(name: &str, value: &str, active: bool, w: u16) -> Vec<Line<'stati
     let mut chunks: Vec<String> = Vec::new();
     for line in value.split('\n') {
         let mut rest: &[char] = &line.chars().collect::<Vec<_>>();
-        while rest.len() > avail {
+        loop {
+            let fits = text::fit(rest, avail);
+            if fits == rest.len() {
+                break;
+            }
             // Corta después del último espacio que quepa; si no hay, a media palabra.
-            let cut = rest[..avail]
+            let cut = rest[..fits]
                 .iter()
                 .rposition(|c| *c == ' ')
-                .map_or(avail, |i| i + 1);
+                .map_or(fits, |i| i + 1);
             chunks.push(rest[..cut].iter().collect());
             rest = &rest[cut..];
         }
@@ -1805,14 +1810,6 @@ fn task_color(s: TaskStatus) -> Color {
         TaskStatus::InProgress => Color::Green,
         TaskStatus::Review => Color::Yellow,
         TaskStatus::Done => Color::DarkGray,
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n - 1).collect::<String>() + "…"
     }
 }
 

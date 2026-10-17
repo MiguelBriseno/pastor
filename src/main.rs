@@ -4,6 +4,7 @@ mod hooks;
 mod icons;
 mod ops;
 mod store;
+mod text;
 mod tmux;
 mod tui;
 
@@ -69,7 +70,8 @@ enum Cmd {
         /// Id o nombre del agente
         #[arg(value_name = "AGENTE")]
         agent: String,
-        /// Comando a ejecutar en la terminal (opcional)
+        /// Comando a ejecutar en la terminal (opcional). Un solo argumento se
+        /// pasa tal cual al shell; varios se citan uno por uno
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
@@ -228,11 +230,11 @@ fn main() -> Result<()> {
             for a in &state.agents {
                 let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
                 println!(
-                    "{:<5} {} {:<11} {:<20} {:<9} {}",
+                    "{:<5} {} {:<11} {} {:<9} {}",
                     a.id,
                     st.icon(),
                     st.label(),
-                    a.name,
+                    text::pad_right(&a.name, 20),
                     a.kind,
                     a.cwd.display()
                 );
@@ -244,14 +246,31 @@ fn main() -> Result<()> {
             agent, close: true, ..
         }) => ops::close_term(&agent),
         Some(Cmd::Term { agent, cmd, .. }) => {
-            let cmd = cmd.join(" ");
-            ops::open_term(&agent, Some(&cmd))?;
+            let cmd = term_command(&cmd);
+            ops::open_term(&agent, cmd.as_deref())?;
             println!("Terminal abierta junto a {agent}. Entra con `pastor attach {agent}`.");
             Ok(())
         }
         Some(Cmd::Send { agent, text }) => ops::send(&agent, &text.join(" ")),
         Some(Cmd::Kill { agent }) => ops::kill_agent(&agent),
         Some(Cmd::Task(cmd)) => task_cmd(cmd),
+    }
+}
+
+/// El comando de `pastor term` como texto para el shell. Un solo argumento va
+/// tal cual, para poder escribir `pastor term web "npm run dev | tee log"`;
+/// varios se citan uno por uno, para que `git commit -m "dos palabras"` llegue
+/// con el mensaje entero.
+fn term_command(args: &[String]) -> Option<String> {
+    match args {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => Some(
+            many.iter()
+                .map(|a| tmux::shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
     }
 }
 
@@ -273,10 +292,10 @@ fn task_cmd(cmd: TaskCmd) -> Result<()> {
                     .and_then(|id| state.agents.iter().find(|a| &a.id == id))
                     .map_or("-", |a| a.name.as_str());
                 println!(
-                    "{:<5} {:<12} {:<16} {}",
+                    "{:<5} {:<12} {} {}",
                     t.id,
                     t.status.label(),
-                    agent,
+                    text::pad_right(agent, 16),
                     t.title
                 );
             }
@@ -302,4 +321,30 @@ fn task_cmd(cmd: TaskCmd) -> Result<()> {
         TaskCmd::Rm { task } => ops::delete_task(&task)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cita_los_argumentos_de_term() {
+        assert_eq!(term_command(&[]), None);
+        assert_eq!(
+            term_command(&args(&["npm run dev | tee log"])).as_deref(),
+            Some("npm run dev | tee log")
+        );
+        assert_eq!(
+            term_command(&args(&["git", "commit", "-m", "dos palabras"])).as_deref(),
+            Some("git commit -m 'dos palabras'")
+        );
+        assert_eq!(
+            term_command(&args(&["echo", "it's"])).as_deref(),
+            Some(r"echo 'it'\''s'")
+        );
+    }
 }

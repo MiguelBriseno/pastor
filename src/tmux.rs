@@ -214,8 +214,12 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
         .stdin(Stdio::piped())
         .spawn()
         .context("no pude ejecutar tmux")?;
-    child.stdin.take().unwrap().write_all(text.as_bytes())?;
-    if !child.wait()?.success() {
+    // Cerrar la entrada y esperarlo aunque la escritura falle, para que no
+    // quede un proceso zombi.
+    let written = child.stdin.take().unwrap().write_all(text.as_bytes());
+    let status = child.wait()?;
+    written?;
+    if !status.success() {
         bail!("tmux load-buffer falló");
     }
     run(&["paste-buffer", "-p", "-d", "-b", &buf, "-t", name])?;
