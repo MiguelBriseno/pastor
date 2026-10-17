@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -14,7 +13,7 @@ use serde_json::{json, Value};
 use crate::agent;
 use crate::history::{self, Event};
 use crate::ops;
-use crate::store::{data_dir, ensure_dirs};
+use crate::store::{data_dir, ensure_dirs, write_atomic, write_atomic_mode, write_volatile};
 use crate::tmux::shell_quote;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -48,15 +47,15 @@ pub fn handle(event: &str) -> Result<()> {
     let message = v["message"].as_str().unwrap_or_default().to_string();
 
     let state = match event {
-        "notify" => {
-            let idle = v["notification_type"] == "idle_prompt"
-                || message.contains("waiting for your input");
-            if idle {
-                "idle"
-            } else {
-                "blocked"
-            }
-        }
+        "notify" => match v["notification_type"].as_str() {
+            Some("idle_prompt") => "idle",
+            Some("permission_prompt" | "elicitation_dialog") => "blocked",
+            // Versiones sin `notification_type`: se mira el mensaje.
+            None | Some("") if message.contains("waiting for your input") => "idle",
+            None | Some("") => "blocked",
+            // Otros avisos (p. ej. `auth_success`) no piden nada.
+            Some(_) => return Ok(()),
+        },
         "idle" => "idle",
         _ => "working",
     };
@@ -66,7 +65,10 @@ pub fn handle(event: &str) -> Result<()> {
         at: Utc::now(),
         message,
     };
-    fs::write(status_path(&id), serde_json::to_string(&status)?)?;
+    write_volatile(
+        &status_path(&id),
+        serde_json::to_string(&status)?.as_bytes(),
+    )?;
 
     // Claude terminó su turno: su tarea queda lista para revisar.
     if event == "idle" {
@@ -74,6 +76,18 @@ pub fn handle(event: &str) -> Result<()> {
         ops::finish_turn(&id)?;
     }
     Ok(())
+}
+
+/// Anota en `hooks.log` un hook que falló, porque Claude Code no lo muestra.
+pub fn log_error(event: &str, e: &anyhow::Error) {
+    use std::io::Write;
+    let agent = std::env::var("PASTOR_AGENT").unwrap_or_default();
+    let line = format!("{} {agent} {event}: {e:#}\n", Utc::now().to_rfc3339());
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir().join("hooks.log"))
+        .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 /// Ruta de este binario para los hooks. En Linux, si se reinstaló mientras
@@ -107,7 +121,7 @@ pub fn claude_settings() -> Result<PathBuf> {
     });
     ensure_dirs()?;
     let path = data_dir().join("claude-settings.json");
-    fs::write(&path, serde_json::to_string_pretty(&settings)?)?;
+    write_atomic(&path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
     Ok(path)
 }
 
@@ -129,9 +143,9 @@ fn shell_files(dir: &Path) -> Result<String> {
     let bin = dir.join("bin");
     let q = |p: &Path| shell_quote(&p.to_string_lossy());
     let prepend = format!("PATH={}:\"$PATH\"\n", q(&bin));
-    fs::write(
-        dir.join("bashrc"),
-        format!("[ -f ~/.bashrc ] && . ~/.bashrc\n{prepend}"),
+    write_atomic(
+        &dir.join("bashrc"),
+        format!("[ -f ~/.bashrc ] && . ~/.bashrc\n{prepend}").as_bytes(),
     )?;
     let zdot = dir.join("zsh");
     fs::create_dir_all(&zdot)?;
@@ -141,27 +155,29 @@ fn shell_files(dir: &Path) -> Result<String> {
     // se ajusta.
     let user_zdotdir = "if [ -n \"$PASTOR_ZDOTDIR\" ]; then ZDOTDIR=\"$PASTOR_ZDOTDIR\"; \
                         else unset ZDOTDIR; fi\n";
-    fs::write(
-        zdot.join(".zshenv"),
+    write_atomic(
+        &zdot.join(".zshenv"),
         format!(
             "PASTOR_ZSH=\"$ZDOTDIR\"\n{user_zdotdir}\
              [ -f \"${{ZDOTDIR:-$HOME}}/.zshenv\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshenv\"\n\
              PASTOR_ZDOTDIR=\"${{ZDOTDIR-}}\"\n\
              ZDOTDIR=\"$PASTOR_ZSH\"\n\
              unset PASTOR_ZSH\n"
-        ),
+        )
+        .as_bytes(),
     )?;
     // El /etc/zshrc de macOS pone HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history
     // cuando ZDOTDIR todavía es el de aquí: lo devolvemos a tu historial.
-    fs::write(
-        zdot.join(".zshrc"),
+    write_atomic(
+        &zdot.join(".zshrc"),
         format!(
             "PASTOR_ZSH=\"$ZDOTDIR\"\n{user_zdotdir}unset PASTOR_ZDOTDIR\n\
              [ \"$HISTFILE\" = \"$PASTOR_ZSH/.zsh_history\" ] && \
              HISTFILE=\"${{ZDOTDIR:-$HOME}}/.zsh_history\"\n\
              unset PASTOR_ZSH\n\
              [ -f \"${{ZDOTDIR:-$HOME}}/.zshrc\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshrc\"\n{prepend}"
-        ),
+        )
+        .as_bytes(),
     )?;
 
     Ok(format!(
@@ -202,15 +218,15 @@ fn write_claude_shim(bin: &PathBuf) -> Result<()> {
             shell_quote(&h.to_string_lossy())
         )
     });
+    // Un `claude` que lanza el propio agente (p. ej. `claude -p` desde su
+    // herramienta Bash) va sin los hooks: su fin de turno no es el del agente.
+    let real = shell_quote(&real.to_string_lossy());
     let script = format!(
-        "#!/bin/sh\n{via_headroom}exec {} --settings {} \"$@\"\n",
-        shell_quote(&real.to_string_lossy()),
+        "#!/bin/sh\n[ -n \"$CLAUDECODE\" ] && exec {real} \"$@\"\n\
+         {via_headroom}exec {real} --settings {} \"$@\"\n",
         shell_quote(&claude_settings()?.to_string_lossy()),
     );
-    let path = bin.join("claude");
-    fs::write(&path, script)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-    Ok(())
+    write_atomic_mode(&bin.join("claude"), script.as_bytes(), Some(0o755))
 }
 
 #[cfg(test)]

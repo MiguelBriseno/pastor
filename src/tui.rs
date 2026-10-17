@@ -60,17 +60,20 @@ pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     // El hook de ratatui restaura la terminal ante cualquier pánico, también
     // uno del observador o de las acciones, y la TUI seguiría dibujando sobre
-    // una terminal normal. Esos hilos se recuperan solos: su pánico no la toca.
+    // una terminal normal. Solo la restaura el hilo de la TUI: los demás se
+    // recuperan solos o no la necesitan, y su pánico no la toca.
     let restore = std::panic::take_hook();
+    let tui = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        match std::thread::current().name() {
+        let current = std::thread::current();
+        match current.name() {
+            _ if current.id() == tui => restore(info),
             Some(OBSERVER) => {
                 *LAST_PANIC.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(info.to_string().replace('\n', " "));
             }
-            // Ese pánico se atrapa y se vuelve un error de la acción.
-            Some(ACTIONS) => {}
-            _ => restore(info),
+            // El de las acciones se atrapa y se vuelve un error de la acción.
+            _ => {}
         }
     }));
     // Con bracketed paste, un texto pegado llega entero en vez de tecla por
@@ -138,6 +141,13 @@ struct AssignForm {
     cwd: String,
 }
 
+impl AssignForm {
+    /// El directorio solo cuenta (y solo se edita) para un agente nuevo.
+    fn new_selected(&self) -> bool {
+        matches!(self.options[self.sel], AssignOpt::New(_))
+    }
+}
+
 struct App {
     tab: Tab,
     mode: Mode,
@@ -163,7 +173,7 @@ impl App {
             mode: Mode::Normal,
             state: State::default(),
             snaps: HashMap::new(),
-            observer: Observer::spawn(HashMap::new()),
+            observer: Observer::spawn(HashMap::new(), true),
             actions: Actions::spawn(),
             agent_sel: ListState::default(),
             task_sel: TableState::default(),
@@ -201,7 +211,7 @@ impl App {
                 ));
                 // Con los estados que ya se veían, para no perder un aviso.
                 let seen = self.snaps.iter().map(|(id, s)| (id.clone(), s.status));
-                self.observer = Observer::spawn(seen.collect());
+                self.observer = Observer::spawn(seen.collect(), false);
             }
             term.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
@@ -331,8 +341,8 @@ impl App {
                 0 => (title, false),
                 _ => (desc, true),
             },
-            Mode::Assign(f) => (&mut f.cwd, false),
-            Mode::Normal | Mode::Confirm { .. } => return,
+            Mode::Assign(f) if f.new_selected() => (&mut f.cwd, false),
+            Mode::Assign(_) | Mode::Normal | Mode::Confirm { .. } => return,
         };
         if multiline {
             field.push_str(&text);
@@ -663,7 +673,9 @@ impl App {
                     });
                 }
                 _ => {
-                    edit(&mut f.cwd, &key);
+                    if f.new_selected() {
+                        edit(&mut f.cwd, &key);
+                    }
                     self.mode = Mode::Assign(f);
                 }
             },
@@ -834,7 +846,7 @@ impl App {
                     Constraint::Percentage(self.term_pct),
                 ])
                 .areas(right);
-                let title = match (&a.term_cmd, t.dead) {
+                let title = match (&t.cmd, t.dead) {
                     (_, true) => format!(" {}terminal · cerrada ", pad(ic.term)),
                     (Some(c), false) => format!(" {}terminal · {c} ", pad(ic.term)),
                     (None, false) => format!(" {}terminal ", pad(ic.term)),
@@ -1290,6 +1302,10 @@ impl App {
             (Mode::Normal, Tab::Tasks) => "↑↓ mover · n nueva · ⏎ asignar · espacio avanzar estado · d hecha · g ir al agente · x borrar · < > alto descripción",
             (Mode::Normal, Tab::Dashboard | Tab::History) => "1-4 pestañas · Tab siguiente · q salir",
             (Mode::Confirm { .. }, _) => "y confirmar · cualquier otra tecla cancela",
+            (Mode::Assign(form), _) if form.new_selected() => {
+                "↑↓ elegir · escribe el directorio · ⏎ asignar · Esc cancelar"
+            }
+            (Mode::Assign(_), _) => "↑↓ elegir · ⏎ asignar · Esc cancelar",
             _ => "Tab cambiar campo · ⏎ confirmar · Esc cancelar",
         };
         f.render_widget(
@@ -1375,7 +1391,16 @@ impl App {
             Mode::Assign(form) => {
                 let w = modal_width(f, 64);
                 let mut lines = vec![Line::from(" ¿A quién se la das?".dark_gray())];
-                for (i, opt) in form.options.iter().enumerate() {
+                // El directorio siempre se ve; las opciones, en una ventana
+                // que sigue a la elegida si no caben todas.
+                let room = modal_room(f, 1);
+                let dir = keep_tail(
+                    field_lines("Directorio", &form.cwd, form.new_selected(), w),
+                    room.saturating_sub(3),
+                );
+                let shown = room.saturating_sub(2 + dir.len()).max(1);
+                let first = form.sel.saturating_sub(shown - 1);
+                for (i, opt) in form.options.iter().enumerate().skip(first).take(shown) {
                     let text = match opt {
                         AssignOpt::Agent(_, label) => format!("  {label}"),
                         AssignOpt::New(k) => format!("+ nuevo agente {k}"),
@@ -1389,12 +1414,7 @@ impl App {
                     lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
                 }
                 lines.push(Line::raw(""));
-                lines.extend(field_lines(
-                    "Directorio",
-                    &form.cwd,
-                    matches!(form.options[form.sel], AssignOpt::New(_)),
-                    w,
-                ));
+                lines.extend(dir);
                 let inner = popup(
                     f,
                     &format!(" Asignar {} ", form.task),
@@ -1528,29 +1548,37 @@ struct Observer {
 }
 
 impl Observer {
-    /// La primera pasada se hace aquí, para que el primer cuadro ya la tenga.
-    fn spawn(status: HashMap<String, Status>) -> Self {
+    /// Con `look_now`, la primera pasada se hace aquí, para que el primer
+    /// cuadro ya la tenga. Al reiniciarlo tras un pánico no: si se repite,
+    /// en este hilo tumbaría la TUI; en el suyo solo lo vuelve a reiniciar.
+    fn spawn(status: HashMap<String, Status>, look_now: bool) -> Self {
         let mut watch = Watch {
             status,
             ..Watch::default()
         };
-        let latest = Arc::new(Mutex::new(watch.look()));
+        let latest = Arc::new(Mutex::new(if look_now { watch.look() } else { None }));
         let (wake, wakes) = mpsc::channel();
         let slot = Arc::clone(&latest);
         let thread = std::thread::Builder::new()
             .name(OBSERVER.into())
-            .spawn(move || loop {
-                match wakes.recv_timeout(REFRESH) {
-                    Ok(()) => while wakes.try_recv().is_ok() {},
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-                if let Some(pass) = watch.look() {
-                    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-                    *slot = Some(match slot.take() {
-                        Some(old) => pass.after(old),
-                        None => pass,
-                    });
+            .spawn(move || {
+                let mut wait = look_now;
+                loop {
+                    if wait {
+                        match wakes.recv_timeout(REFRESH) {
+                            Ok(()) => while wakes.try_recv().is_ok() {},
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    wait = true;
+                    if let Some(pass) = watch.look() {
+                        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+                        *slot = Some(match slot.take() {
+                            Some(old) => pass.after(old),
+                            None => pass,
+                        });
+                    }
                 }
             })
             // Lo mismo que haría `thread::spawn`.

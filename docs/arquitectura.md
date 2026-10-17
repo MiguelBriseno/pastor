@@ -15,6 +15,7 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
    ~/.local/share/pastor/state.json   (agentes y tareas)
    ~/.local/share/pastor/history.jsonl (eventos para el historial)
    ~/.local/share/pastor/status/*.json (estado que reportan los hooks)
+   ~/.local/share/pastor/hooks.log     (errores de los hooks, que Claude Code no muestra)
                  │
                  │ tmux -L pastor  (new-session, capture-pane, paste-buffer…)
                  ▼

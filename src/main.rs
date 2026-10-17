@@ -203,7 +203,10 @@ fn main() -> Result<()> {
     match cli.cmd {
         None => tui::run(),
         Some(Cmd::Hook { event }) => {
-            let _ = hooks::handle(&event);
+            // Sin ruido para Claude Code, pero que quede rastro.
+            if let Err(e) = hooks::handle(&event) {
+                hooks::log_error(&event, &e);
+            }
             Ok(())
         }
         Some(Cmd::New {

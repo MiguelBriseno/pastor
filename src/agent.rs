@@ -53,9 +53,9 @@ impl Kind {
             }
             Kind::Codex => push_prompt(&mut cmd, prompt),
             Kind::Opencode => {
+                // Junto con `=`: si empieza por `-`, que no se tome como opción.
                 if let Some(p) = prompt {
-                    cmd.push("--prompt".into());
-                    cmd.push(p.into());
+                    cmd.push(format!("--prompt={p}"));
                 }
             }
         }

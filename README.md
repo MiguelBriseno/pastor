@@ -40,7 +40,7 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
 | Requisito | Para qué |
 |---|---|
 | Linux o macOS | Windows no está soportado (se puede usar desde WSL) |
-| [tmux](https://github.com/tmux/tmux) 3.1 o superior | Mantiene vivas las terminales de los agentes |
+| [tmux](https://github.com/tmux/tmux) 3.2 o superior | Mantiene vivas las terminales de los agentes |
 | [Rust](https://rustup.rs) 1.89 o superior | Para compilar pastor |
 | Al menos un agente: `claude`, `codex` u `opencode` | Los agentes que vas a manejar; deben estar en tu `PATH` |
 | `notify-send` (opcional) | Notificaciones de escritorio en Linux; en macOS se usan las del sistema |
@@ -294,11 +294,16 @@ Los agentes se pierden (tmux no sobrevive a un reinicio). Aparecerán como *term
 con `x`. Restaurarlos automáticamente está en el plan.
 
 **¿Interfiere con mi tmux?**
-No. pastor usa su propio servidor (`tmux -L pastor`). Puedes verlo con `tmux -L pastor ls`.
+No. pastor usa su propio servidor (`tmux -L pastor`). Puedes verlo con `tmux -L pastor ls`. Ese
+servidor lee tu `~/.tmux.conf`, así que conserva tu prefijo y tus atajos.
 
 **Estoy dentro de un agente y no sé salir.**
 Pulsa `Ctrl-b` y luego `d`. Eso te saca sin cerrar al agente. Si usas `/exit`, el agente se cierra
 y su panel se queda con una terminal en el mismo directorio.
+
+Si cambiaste el prefijo en tu `~/.tmux.conf`, usa el tuyo en vez de `Ctrl-b`; la barra de abajo
+muestra el que corresponde. Si abriste pastor dentro de otro tmux con el mismo prefijo, el de fuera
+se lo queda: púlsalo dos veces (`Ctrl-b Ctrl-b d`).
 
 **Cerré el agente con `/exit`. ¿Cómo lo vuelvo a abrir?**
 Entra con `⏎` y escribe `claude`, `codex` u `opencode` en la terminal que quedó. Claude Code se
