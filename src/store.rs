@@ -1,8 +1,8 @@
 //! Estado persistente: agentes y tareas en ~/.local/share/pastor/state.json.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -94,32 +94,49 @@ pub struct State {
 }
 
 impl State {
-    fn path() -> PathBuf {
-        data_dir().join("state.json")
+    pub fn load() -> Result<Self> {
+        Self::load_in(&data_dir())
     }
 
-    pub fn load() -> Result<Self> {
-        match fs::read_to_string(Self::path()) {
+    /// Carga, modifica y guarda. Todas las escrituras pasan por aquí, con un
+    /// candado sobre `state.lock`, para que la TUI, la CLI y los hooks de
+    /// varios agentes puedan escribir a la vez sin pisarse. Leer no lo
+    /// necesita: `rename` cambia el archivo de golpe. `f` no debe llamar a
+    /// `update` (se quedaría esperando su propio candado).
+    pub fn update<T>(f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        ensure_dirs()?;
+        Self::update_in(&data_dir(), f)
+    }
+
+    fn load_in(dir: &Path) -> Result<Self> {
+        match fs::read_to_string(dir.join("state.json")) {
             Ok(s) => serde_json::from_str(&s).context("state.json está corrupto"),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub fn save(&self) -> Result<()> {
-        ensure_dirs()?;
-        let tmp = Self::path().with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        fs::rename(tmp, Self::path())?;
-        Ok(())
-    }
-
-    /// Carga, modifica y guarda. Todas las escrituras pasan por aquí para
-    /// que la TUI y la CLI puedan usarse a la vez sin pisarse.
-    pub fn update<T>(f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        let mut s = Self::load()?;
+    fn update_in<T>(dir: &Path, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let lock_path = dir.join("state.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("no pude abrir {}", lock_path.display()))?;
+        match lock.lock() {
+            // Algunos montajes (NFS, FUSE) no tienen candados: mejor seguir
+            // como antes que dejar de funcionar.
+            Err(e) if e.kind() == ErrorKind::Unsupported => {}
+            r => r.with_context(|| format!("no pude bloquear {}", lock_path.display()))?,
+        }
+        let mut s = Self::load_in(dir)?;
         let out = f(&mut s)?;
-        s.save()?;
+        // El temporal es compartido: solo se escribe con el candado tomado.
+        let path = dir.join("state.json");
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(&s)?)?;
+        fs::rename(tmp, path)?;
         Ok(out)
     }
 
@@ -192,5 +209,83 @@ impl State {
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| anyhow!("no existe la tarea `{id}`"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nombres_de_agente() {
+        let mut s = State::default();
+        let dir = PathBuf::from("/home/yo/web");
+        assert_eq!(s.add_agent(Kind::Claude, dir.clone(), None).name, "web");
+        assert_eq!(s.add_agent(Kind::Codex, dir.clone(), None).name, "web-2");
+        assert_eq!(s.add_agent(Kind::Claude, dir.clone(), None).name, "web-3");
+        let a = s.add_agent(Kind::Claude, dir.clone(), Some("  arreglar  login ".into()));
+        assert_eq!(a.name, "arreglar-login");
+        assert_eq!(a.id, "a4");
+        let a = s.add_agent(Kind::Opencode, PathBuf::from("/"), Some("   ".into()));
+        assert_eq!(a.name, "opencode");
+        assert_eq!(s.find_agent("web-2").unwrap().id, "a2");
+        assert!(s.find_agent("nadie").is_err());
+    }
+
+    #[test]
+    fn los_ids_no_se_reutilizan() {
+        let mut s = State::default();
+        s.add_task("uno".into(), String::new());
+        s.tasks.clear();
+        assert_eq!(s.add_task("dos".into(), String::new()).id, "t2");
+    }
+
+    #[test]
+    fn ciclo_de_estados_de_tarea() {
+        let mut t = TaskStatus::Todo;
+        for esperado in [
+            TaskStatus::InProgress,
+            TaskStatus::Review,
+            TaskStatus::Done,
+            TaskStatus::Todo,
+        ] {
+            t = t.next();
+            assert_eq!(t, esperado);
+        }
+    }
+
+    /// Muchos escritores a la vez (como los hooks de varios agentes) no
+    /// pierden cambios ni corrompen el archivo.
+    #[test]
+    fn escrituras_simultaneas() {
+        let dir = std::env::temp_dir().join(format!(
+            "pastor-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (hilos, por_hilo) = (8, 25);
+        let handles: Vec<_> = (0..hilos)
+            .map(|h| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for i in 0..por_hilo {
+                        State::update_in(&dir, |s| {
+                            Ok(s.add_task(format!("{h}-{i}"), String::new()))
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        // Esperar a todos antes de borrar, aunque alguno falle.
+        let joined: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+        let ok = joined.iter().all(|r| r.is_ok());
+        let s = State::load_in(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(ok);
+        let s = s.unwrap();
+        assert_eq!(s.tasks.len(), hilos * por_hilo);
+        assert_eq!(s.counters().1 as usize, hilos * por_hilo);
     }
 }
