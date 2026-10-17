@@ -185,12 +185,15 @@ impl Tail {
                 self.totals.add(&e);
             }
         }
+        // Del día a día solo hacen falta los del gráfico; la ventana solo avanza.
+        let first_day = Local::now().date_naive() - Duration::days(DAYS as i64 - 1);
+        self.totals.daily.retain(|d, _| *d >= first_day);
         self.offset += end as u64 + 1;
         true
     }
 
-    pub fn stats(&self) -> Stats {
-        self.totals.stats(Local::now().date_naive())
+    pub fn stats(&self, today: NaiveDate) -> Stats {
+        self.totals.stats(today)
     }
 }
 
@@ -233,7 +236,7 @@ struct Totals {
     done: HashSet<String>,
     session_secs: (i64, i64),
     task_secs: (i64, i64),
-    /// Eventos por día (hora local).
+    /// Eventos por día (hora local), solo de los días del gráfico.
     daily: HashMap<NaiveDate, u64>,
 }
 
@@ -265,8 +268,7 @@ impl Totals {
             }
             Event::TaskCreated { .. } => self.tasks_created += 1,
             Event::TaskStatus { task, to, secs } => {
-                if *to == TaskStatus::Done && !self.done.contains(task) {
-                    self.done.insert(task.clone());
+                if *to == TaskStatus::Done && self.done.insert(task.clone()) {
                     self.task_secs.0 += secs;
                     self.task_secs.1 += 1;
                 }
@@ -286,7 +288,7 @@ impl Totals {
 
     fn stats(&self, today: NaiveDate) -> Stats {
         let avg = |(total, n): (i64, i64)| (n > 0).then(|| total / n);
-        let mut projects: Vec<_> = self.projects.clone().into_iter().collect();
+        let mut projects: Vec<_> = self.projects.iter().map(|(p, n)| (p.clone(), *n)).collect();
         projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let first_day = today - Duration::days(DAYS as i64 - 1);
         Stats {
@@ -357,18 +359,18 @@ mod tests {
             .write_all(rest.as_bytes())
             .unwrap();
         assert!(t.refresh_from(&path));
-        assert_eq!(t.stats().turns, 2);
+        assert_eq!(t.stats(Local::now().date_naive()).turns, 2);
 
         // Rehecho más corto: se vuelve a leer desde el principio.
         fs::write(&path, turn("a3")).unwrap();
         assert!(t.refresh_from(&path));
-        assert_eq!(t.stats().turns, 1);
+        assert_eq!(t.stats(Local::now().date_naive()).turns, 1);
 
         // Borrado y vuelto a crear más largo: otro archivo, desde el principio.
         fs::remove_file(&path).unwrap();
         fs::write(&path, [turn("a4"), turn("a5"), turn("a6")].concat()).unwrap();
         assert!(t.refresh_from(&path));
-        assert_eq!(t.stats().turns, 3);
+        assert_eq!(t.stats(Local::now().date_naive()).turns, 3);
         fs::remove_dir_all(&dir).unwrap();
     }
 

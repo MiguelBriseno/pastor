@@ -311,34 +311,54 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
         prompt.push_str("\n\n");
         prompt.push_str(&task.description);
     }
-    let agent = match target {
+    let (agent, created) = match target {
         AssignTarget::Existing(key) => {
             let a = state.find_agent(&key)?.clone();
             tmux::send_text(&agent_target(&a)?, &prompt)?;
-            a
+            (a, false)
         }
-        AssignTarget::New { kind, cwd } => new_agent(kind, cwd, None, Some(&prompt))?,
+        AssignTarget::New { kind, cwd } => (new_agent(kind, cwd, None, Some(&prompt))?, true),
     };
-    // Lo que pasó entre leer la tarea y ahora (otra asignación, un cambio de
-    // estado) lo resuelve `link_task` dentro del candado.
-    State::update(|s| link_task(s, &task.id, &agent.id, &mut record_status))?;
+    // Lo que pasó entre leer la tarea y ahora (otra asignación, la tarea
+    // borrada o cerrada) lo resuelve `link_task` dentro del candado.
+    let linked =
+        State::update(|s| link_task(s, &task.id, &agent.id, task.status, &mut record_status));
+    if let Err(e) = linked {
+        // Un agente lanzado solo para esta tarea no tiene nada que hacer.
+        if created {
+            let _ = kill_agent(&agent.id);
+            bail!("{e:#}; se terminó {}", agent.name);
+        }
+        bail!("{e:#}; {} ya recibió el texto", agent.name);
+    }
     Ok(agent)
 }
 
-/// Deja `task_id` en curso con `agent_id`, y solo con él. `record` anota cada
-/// cambio de estado antes de hacerlo.
+/// Deja `task_id` en curso con `agent_id`, y solo con él. `seen` es el estado
+/// de la tarea cuando se pidió asignarla. `record` anota cada cambio de estado
+/// antes de hacerlo.
 fn link_task(
     s: &mut State,
     task_id: &str,
     agent_id: &str,
+    seen: TaskStatus,
     record: &mut impl FnMut(&Task, TaskStatus),
 ) -> Result<()> {
     // Lo pudieron matar desde otro proceso mientras se le mandaba el prompt.
     if !s.agents.iter().any(|a| a.id == agent_id) {
         bail!("el agente {agent_id} ya no existe");
     }
-    if s.find_task(task_id).is_err() {
-        bail!("la tarea {task_id} se borró mientras se asignaba; {agent_id} ya recibió el texto");
+    match s.find_task(task_id) {
+        Err(_) => bail!("la tarea {task_id} se borró mientras se asignaba"),
+        // Alguien la cerró entre medias: eso vale más que reabrirla. Asignar
+        // una tarea que ya estaba cerrada sí la reabre.
+        Ok(t) if t.status != seen && matches!(t.status, TaskStatus::Review | TaskStatus::Done) => {
+            bail!(
+                "la tarea {task_id} pasó a «{}» mientras se asignaba",
+                t.status.label()
+            )
+        }
+        Ok(_) => {}
     }
     let mut previous = None;
     for a in &mut s.agents {
@@ -571,7 +591,8 @@ mod tests {
     }
 
     fn link(s: &mut State, task: &str, agent: &str) {
-        link_task(s, task, agent, &mut |_, _| {}).unwrap();
+        let seen = status(s, task);
+        link_task(s, task, agent, seen, &mut |_, _| {}).unwrap();
     }
 
     fn turn(s: &mut State, agent: &str) -> Option<String> {
@@ -608,7 +629,7 @@ mod tests {
     #[test]
     fn no_asigna_a_un_agente_que_ya_no_existe() {
         let mut s = two_and_two();
-        assert!(link_task(&mut s, "t1", "a9", &mut |_, _| {}).is_err());
+        assert!(link_task(&mut s, "t1", "a9", TaskStatus::Todo, &mut |_, _| {}).is_err());
         assert_eq!(status(&s, "t1"), TaskStatus::Todo);
     }
 
@@ -650,10 +671,23 @@ mod tests {
         let mut s = two_and_two();
         link(&mut s, "t2", "a1");
         s.tasks.retain(|t| t.id != "t1");
-        let err = link_task(&mut s, "t1", "a1", &mut |_, _| {}).unwrap_err();
+        let err = link_task(&mut s, "t1", "a1", TaskStatus::Todo, &mut |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("se borró"), "{err}");
         assert_eq!(s.find_agent("a1").unwrap().task.as_deref(), Some("t2"));
         assert_eq!(status(&s, "t2"), TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn no_reabre_una_tarea_cerrada_mientras_se_asignaba() {
+        let mut s = two_and_two();
+        s.find_task_mut("t1").unwrap().status = TaskStatus::Done;
+        let err = link_task(&mut s, "t1", "a1", TaskStatus::Todo, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("hecha"), "{err}");
+        assert_eq!(status(&s, "t1"), TaskStatus::Done);
+        assert_eq!(s.find_agent("a1").unwrap().task, None);
+        // Si ya estaba cerrada al pedirlo, asignarla la reabre.
+        link(&mut s, "t1", "a1");
+        assert_eq!(status(&s, "t1"), TaskStatus::InProgress);
     }
 
     #[test]
