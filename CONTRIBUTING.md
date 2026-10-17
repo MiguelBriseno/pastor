@@ -41,11 +41,13 @@ tmux -L prueba kill-server
 
 ```sh
 cargo fmt
-cargo clippy --all-targets   # no debe haber advertencias
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-La CI corre lo mismo en Linux y macOS en cada pull request. Aun así, prueba a mano lo que cambiaste con al menos un agente real.
+La CI corre en cada pull request: comprueba el formato (`cargo fmt --check`), pasa clippy y los
+tests en Linux y macOS, y compila con la versión mínima de Rust (`rust-version` en
+`Cargo.toml`). Aun así, prueba a mano lo que cambiaste con al menos un agente real.
 
 ## Estilo
 

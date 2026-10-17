@@ -41,7 +41,7 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
 |---|---|
 | Linux o macOS | Windows no está soportado (se puede usar desde WSL) |
 | [tmux](https://github.com/tmux/tmux) 3.1 o superior | Mantiene vivas las terminales de los agentes |
-| [Rust](https://rustup.rs) 1.82 o superior | Para compilar pastor |
+| [Rust](https://rustup.rs) 1.88 o superior | Para compilar pastor |
 | Al menos un agente: `claude`, `codex` u `opencode` | Los agentes que vas a manejar; deben estar en tu `PATH` |
 | `notify-send` (opcional) | Notificaciones de escritorio en Linux |
 | Una [Nerd Font](https://www.nerdfonts.com) (recomendada) | Iconos en la interfaz; sin ella usa `PASTOR_ICONS=simple` (ver [Iconos y fuente](#iconos-y-fuente)) |
