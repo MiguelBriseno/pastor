@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
@@ -42,7 +43,7 @@ const LABEL_W: usize = 14;
 const OBSERVER: &str = "observador";
 /// Nombre del hilo que ejecuta las acciones.
 const ACTIONS: &str = "acciones";
-/// Último pánico de esos hilos, para mostrarlo al reiniciarlos.
+/// Último pánico del observador, para mostrarlo al reiniciarlo.
 static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
 
 fn last_panic() -> String {
@@ -57,17 +58,17 @@ pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     // El hook de ratatui restaura la terminal ante cualquier pánico, también
     // uno del observador o de las acciones, y la TUI seguiría dibujando sobre
-    // una terminal normal. Esos hilos se reinician solos: su pánico no la toca.
+    // una terminal normal. Esos hilos se recuperan solos: su pánico no la toca.
     let restore = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current()
-            .name()
-            .is_some_and(|n| [OBSERVER, ACTIONS].contains(&n))
-        {
-            *LAST_PANIC.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(info.to_string().replace('\n', " "));
-        } else {
-            restore(info);
+        match std::thread::current().name() {
+            Some(OBSERVER) => {
+                *LAST_PANIC.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(info.to_string().replace('\n', " "));
+            }
+            // Ese pánico se atrapa y se vuelve un error de la acción.
+            Some(ACTIONS) => {}
+            _ => restore(info),
         }
     }));
     // Con bracketed paste, un texto pegado llega entero en vez de tecla por
@@ -160,7 +161,7 @@ impl App {
             mode: Mode::Normal,
             state: State::default(),
             snaps: HashMap::new(),
-            observer: Observer::spawn(),
+            observer: Observer::spawn(HashMap::new()),
             actions: Actions::spawn(),
             agent_sel: ListState::default(),
             task_sel: TableState::default(),
@@ -181,12 +182,14 @@ impl App {
                 if let Some(stats) = pass.stats {
                     self.stats = stats;
                 }
-                for msg in pass.flashes {
-                    self.set_flash(msg);
+                // Al volver de un agente pueden ser varios: que se vean todos.
+                if !pass.flashes.is_empty() {
+                    self.set_flash(pass.flashes.join(" · "));
                 }
                 self.reload();
             }
             while let Ok((result, retry)) = self.actions.results.try_recv() {
+                self.actions.pending -= 1;
                 self.finish(result, retry);
             }
             if self.observer.died() {
@@ -194,11 +197,9 @@ impl App {
                     "El observador de paneles falló; se reinició. {}",
                     last_panic()
                 ));
-                self.observer = Observer::spawn();
-            }
-            if self.actions.died() {
-                self.set_flash(format!("Una acción falló. {}", last_panic()));
-                self.actions = Actions::spawn();
+                // Con los estados que ya se veían, para no perder un aviso.
+                let seen = self.snaps.iter().map(|(id, s)| (id.clone(), s.status));
+                self.observer = Observer::spawn(seen.collect());
             }
             term.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
@@ -210,6 +211,10 @@ impl App {
             }
         }
         // Que una acción a medias (lanzar un agente, por ejemplo) termine.
+        if self.actions.pending > 0 {
+            self.set_flash("Esperando a que termine la acción en curso…".to_string());
+            term.draw(|f| self.draw(f))?;
+        }
         self.actions.wait();
         Ok(())
     }
@@ -1509,8 +1514,11 @@ struct Observer {
 
 impl Observer {
     /// La primera pasada se hace aquí, para que el primer cuadro ya la tenga.
-    fn spawn() -> Self {
-        let mut watch = Watch::default();
+    fn spawn(status: HashMap<String, Status>) -> Self {
+        let mut watch = Watch {
+            status,
+            ..Watch::default()
+        };
         let latest = Arc::new(Mutex::new(watch.look()));
         let (wake, wakes) = mpsc::channel();
         let slot = Arc::clone(&latest);
@@ -1572,6 +1580,8 @@ type Job = Box<dyn FnOnce() -> Result<Done> + Send>;
 /// Hilo que ejecuta, de una en una, las acciones que hablan con tmux (lanzar,
 /// enviar, asignar…), para que la TUI no se congele mientras.
 struct Actions {
+    /// Enviadas y todavía sin resultado.
+    pending: usize,
     jobs: Option<Sender<(Job, Option<Mode>)>>,
     results: Receiver<(Result<Done>, Option<Mode>)>,
     thread: Option<JoinHandle<()>>,
@@ -1585,13 +1595,17 @@ impl Actions {
             .name(ACTIONS.into())
             .spawn(move || {
                 for (job, retry) in todo {
-                    if done.send((job(), retry)).is_err() {
+                    // Un pánico es un error más: el hilo sigue y lo escrito vuelve.
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(job))
+                        .unwrap_or_else(|p| Err(anyhow!("la acción falló: {}", panic_text(&*p))));
+                    if done.send((result, retry)).is_err() {
                         return;
                     }
                 }
             })
             .expect("no pude lanzar el hilo de acciones");
         Self {
+            pending: 0,
             jobs: Some(jobs),
             results,
             thread: Some(thread),
@@ -1599,14 +1613,12 @@ impl Actions {
     }
 
     /// Si falla, `retry` es el formulario al que volver con lo escrito.
-    fn run(&self, retry: Option<Mode>, job: impl FnOnce() -> Result<Done> + Send + 'static) {
+    fn run(&mut self, retry: Option<Mode>, job: impl FnOnce() -> Result<Done> + Send + 'static) {
         if let Some(jobs) = &self.jobs {
-            let _ = jobs.send((Box::new(job), retry));
+            if jobs.send((Box::new(job), retry)).is_ok() {
+                self.pending += 1;
+            }
         }
-    }
-
-    fn died(&self) -> bool {
-        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     /// Espera a que terminen las acciones pendientes.
@@ -1616,6 +1628,15 @@ impl Actions {
             let _ = t.join();
         }
     }
+}
+
+/// El mensaje de un pánico, si es texto.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("pánico")
 }
 
 fn notify(msg: &str) {

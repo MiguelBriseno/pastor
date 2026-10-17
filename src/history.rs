@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -148,6 +149,8 @@ pub struct Tail {
     entries: Vec<Entry>,
     /// Bytes ya leídos, hasta el último salto de línea.
     offset: u64,
+    /// Inode del archivo leído, para notar que lo borraron y se creó otro.
+    ino: u64,
 }
 
 impl Tail {
@@ -157,12 +160,13 @@ impl Tail {
     }
 
     fn refresh_from(&mut self, path: &Path) -> bool {
-        let len = fs::metadata(path).map_or(0, |m| m.len());
-        // Más corto que lo leído: lo borraron o lo rehicieron.
-        let reset = len < self.offset;
+        let (len, ino) = fs::metadata(path).map_or((0, 0), |m| (m.len(), m.ino()));
+        // Más corto que lo leído, u otro archivo: lo borraron o lo rehicieron.
+        let reset = len < self.offset || (self.offset > 0 && ino != self.ino);
         if reset {
             *self = Tail::default();
         }
+        self.ino = ino;
         if len == self.offset {
             return reset;
         }
@@ -336,6 +340,12 @@ mod tests {
         fs::write(&path, turn("a3")).unwrap();
         assert!(t.refresh_from(&path));
         assert_eq!(t.entries().len(), 1);
+
+        // Borrado y vuelto a crear más largo: otro archivo, desde el principio.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, [turn("a4"), turn("a5"), turn("a6")].concat()).unwrap();
+        assert!(t.refresh_from(&path));
+        assert_eq!(t.entries().len(), 3);
         fs::remove_dir_all(&dir).unwrap();
     }
 

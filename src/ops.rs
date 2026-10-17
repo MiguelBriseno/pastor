@@ -259,13 +259,8 @@ pub fn suggest_term_cmd(agent: &Agent) -> String {
 pub fn kill_agent(agent_key: &str) -> Result<()> {
     let agent = State::load()?.find_agent(agent_key)?.clone();
     let id = agent.id.clone();
-    let _ = tmux::kill_session(&id);
-    hooks::clear_status(&id);
-    history::record(Event::AgentEnded {
-        agent: id.clone(),
-        kind: agent.kind,
-        secs: (Utc::now() - agent.created_at).num_seconds(),
-    });
+    // Primero fuera del estado y después la sesión: si la TUI lo mirara entre
+    // medias, lo vería muerto y tomaría su tarea por terminada.
     State::update(|s| {
         s.agents.retain(|a| a.id != id);
         for t in s
@@ -276,7 +271,15 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
             release(t, &mut record_status);
         }
         Ok(())
-    })
+    })?;
+    let _ = tmux::kill_session(&id);
+    hooks::clear_status(&id);
+    history::record(Event::AgentEnded {
+        agent: id.clone(),
+        kind: agent.kind,
+        secs: (Utc::now() - agent.created_at).num_seconds(),
+    });
+    Ok(())
 }
 
 pub enum AssignTarget {
