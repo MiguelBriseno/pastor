@@ -271,10 +271,7 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
             .iter_mut()
             .filter(|t| t.agent.as_deref() == Some(&id))
         {
-            t.agent = None;
-            if t.status == TaskStatus::InProgress {
-                t.status = TaskStatus::Todo;
-            }
+            release(t, &mut record_status);
         }
         Ok(())
     })
@@ -302,17 +299,80 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
         }
         AssignTarget::New { kind, cwd } => new_agent(kind, Some(cwd), None, Some(&prompt))?,
     };
-    State::update(|s| {
-        let t = s.find_task_mut(&task.id)?;
-        t.agent = Some(agent.id.clone());
-        record_status(t, TaskStatus::InProgress);
-        t.status = TaskStatus::InProgress;
-        if let Some(a) = s.agents.iter_mut().find(|a| a.id == agent.id) {
-            a.task = Some(task.id.clone());
-        }
-        Ok(())
-    })?;
+    State::update(|s| link_task(s, &task.id, &agent.id, &mut record_status))?;
     Ok(agent)
+}
+
+/// Deja `task_id` en curso con `agent_id`, y solo con él. `record` anota cada
+/// cambio de estado antes de hacerlo.
+fn link_task(
+    s: &mut State,
+    task_id: &str,
+    agent_id: &str,
+    record: &mut impl FnMut(&Task, TaskStatus),
+) -> Result<()> {
+    // Lo pudieron matar desde otro proceso mientras se le mandaba el prompt.
+    if !s.agents.iter().any(|a| a.id == agent_id) {
+        bail!("el agente {agent_id} ya no existe");
+    }
+    let mut previous = None;
+    for a in &mut s.agents {
+        if a.id == agent_id {
+            previous = a.task.replace(task_id.to_string());
+        } else if a.task.as_deref() == Some(task_id) {
+            // El agente anterior ya no la lleva: que su próximo turno no la toque.
+            a.task = None;
+        }
+    }
+    // La tarea que el agente dejó a medias vuelve a quedar libre.
+    if let Some(p) = previous.filter(|p| p != task_id) {
+        if let Ok(t) = s.find_task_mut(&p) {
+            if t.status == TaskStatus::InProgress && t.agent.as_deref() == Some(agent_id) {
+                release(t, record);
+            }
+        }
+    }
+    let t = s.find_task_mut(task_id)?;
+    t.agent = Some(agent_id.to_string());
+    record(t, TaskStatus::InProgress);
+    t.status = TaskStatus::InProgress;
+    Ok(())
+}
+
+/// El agente terminó su turno: si su tarea sigue en curso, pasa a revisión.
+/// Todo se mira dentro del candado, para no pisar un cambio recién hecho por
+/// otro proceso (la tarea ya hecha, o reasignada a otro agente).
+pub fn finish_turn(agent_id: &str) -> Result<()> {
+    State::update(|s| {
+        finish_turn_in(s, agent_id, &mut record_status);
+        Ok(())
+    })
+}
+
+/// La tarea se queda sin agente; si estaba en curso, vuelve a pendiente.
+fn release(t: &mut Task, record: &mut impl FnMut(&Task, TaskStatus)) {
+    t.agent = None;
+    if t.status == TaskStatus::InProgress {
+        record(t, TaskStatus::Todo);
+        t.status = TaskStatus::Todo;
+    }
+}
+
+fn finish_turn_in(
+    s: &mut State,
+    agent_id: &str,
+    record: &mut impl FnMut(&Task, TaskStatus),
+) -> Option<String> {
+    let task = s.agents.iter().find(|a| a.id == agent_id)?.task.clone()?;
+    let t = s.tasks.iter_mut().find(|t| t.id == task)?;
+    // Sin `agent` (datos de antes de que se guardara) basta con `agent.task`.
+    let ours = t.agent.as_deref().is_none_or(|a| a == agent_id);
+    if t.status != TaskStatus::InProgress || !ours {
+        return None;
+    }
+    record(t, TaskStatus::Review);
+    t.status = TaskStatus::Review;
+    Some(task)
 }
 
 pub fn set_task_status(task_id: &str, status: TaskStatus) -> Result<()> {
@@ -474,6 +534,75 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dos agentes (a1, a2) y dos tareas (t1, t2), sin tocar el historial.
+    fn two_and_two() -> State {
+        let mut s = State::default();
+        for _ in 0..2 {
+            s.add_agent(Kind::Claude, PathBuf::from("/tmp"), None);
+            s.add_task("tarea".into(), String::new());
+        }
+        s
+    }
+
+    fn link(s: &mut State, task: &str, agent: &str) {
+        link_task(s, task, agent, &mut |_, _| {}).unwrap();
+    }
+
+    fn turn(s: &mut State, agent: &str) -> Option<String> {
+        finish_turn_in(s, agent, &mut |_, _| {})
+    }
+
+    fn status(s: &State, task: &str) -> TaskStatus {
+        s.find_task(task).unwrap().status
+    }
+
+    #[test]
+    fn reasignar_desliga_al_agente_anterior() {
+        let mut s = two_and_two();
+        link(&mut s, "t1", "a1");
+        link(&mut s, "t1", "a2");
+        assert_eq!(s.find_agent("a1").unwrap().task, None);
+        // El turno de a1 ya no manda t1 a revisión mientras a2 trabaja en ella.
+        assert_eq!(turn(&mut s, "a1"), None);
+        assert_eq!(status(&s, "t1"), TaskStatus::InProgress);
+        assert_eq!(turn(&mut s, "a2").as_deref(), Some("t1"));
+        assert_eq!(status(&s, "t1"), TaskStatus::Review);
+    }
+
+    #[test]
+    fn asignar_otra_tarea_libera_la_anterior() {
+        let mut s = two_and_two();
+        link(&mut s, "t1", "a1");
+        link(&mut s, "t2", "a1");
+        let t1 = s.find_task("t1").unwrap();
+        assert_eq!((t1.status, t1.agent.clone()), (TaskStatus::Todo, None));
+        assert_eq!(s.find_agent("a1").unwrap().task.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn no_asigna_a_un_agente_que_ya_no_existe() {
+        let mut s = two_and_two();
+        assert!(link_task(&mut s, "t1", "a9", &mut |_, _| {}).is_err());
+        assert_eq!(status(&s, "t1"), TaskStatus::Todo);
+    }
+
+    #[test]
+    fn el_turno_vale_con_tareas_sin_agente_guardado() {
+        let mut s = two_and_two();
+        link(&mut s, "t1", "a1");
+        s.find_task_mut("t1").unwrap().agent = None;
+        assert_eq!(turn(&mut s, "a1").as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn el_turno_no_toca_una_tarea_que_ya_no_esta_en_curso() {
+        let mut s = two_and_two();
+        link(&mut s, "t1", "a1");
+        s.find_task_mut("t1").unwrap().status = TaskStatus::Done;
+        assert_eq!(turn(&mut s, "a1"), None);
+        assert_eq!(status(&s, "t1"), TaskStatus::Done);
+    }
 
     fn procs(list: &[(u32, i64, i64, &str)]) -> Procs {
         let list: Vec<_> = list

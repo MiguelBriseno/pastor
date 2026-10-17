@@ -10,12 +10,19 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-const SOCKET: &str = "pastor";
+// Las pruebas usan su propio servidor, para no tocar los agentes de verdad.
+const SOCKET: &str = if cfg!(test) { "pastor-test" } else { "pastor" };
 
 fn tmux() -> Command {
     let mut c = Command::new("tmux");
     c.args(["-L", SOCKET]);
     c
+}
+
+/// Destino de la sesión `name` y solo de ella: sin `=`, si no existe, tmux
+/// acepta cualquier sesión que empiece igual (`a1` llegaría a `a12`).
+fn session(name: &str) -> String {
+    format!("={name}")
 }
 
 fn run(args: &[&str]) -> Result<String> {
@@ -89,7 +96,9 @@ pub fn new_session(
     set_role(&pane, "agent")?;
 
     // Si hasta el shell termina, dejamos el panel visible para poder leer su salida.
-    run(&["set-option", "-w", "-t", name, "remain-on-exit", "on"])?;
+    let target = session(name);
+    let window = format!("{target}:");
+    run(&["set-option", "-w", "-t", &window, "remain-on-exit", "on"])?;
     run(&["set-option", "-g", "focus-events", "on"])?;
     for (opt, val) in [
         ("mouse", "on"),
@@ -102,7 +111,7 @@ pub fn new_session(
         ),
         ("status-right-length", "60"),
     ] {
-        run(&["set-option", "-t", name, opt, val])?;
+        run(&["set-option", "-t", &target, opt, val])?;
     }
     Ok(())
 }
@@ -221,7 +230,7 @@ pub fn attach(name: &str, focus: Option<&str>) -> Result<()> {
         run(&["select-pane", "-t", pane])?;
     }
     let status = tmux()
-        .args(["attach-session", "-t", name])
+        .args(["attach-session", "-t", &session(name)])
         .env_remove("TMUX")
         .status()
         .context("no pude ejecutar tmux")?;
@@ -232,7 +241,7 @@ pub fn attach(name: &str, focus: Option<&str>) -> Result<()> {
 }
 
 pub fn kill_session(name: &str) -> Result<()> {
-    run(&["kill-session", "-t", name]).map(|_| ())
+    run(&["kill-session", "-t", &session(name)]).map(|_| ())
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -248,8 +257,31 @@ pub fn shell_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use super::{kill_session, panes, run, shell_quote};
     use std::process::Command;
+
+    #[test]
+    fn matar_una_sesion_no_toca_otra_que_empieza_igual() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            // En CI tmux se instala: ahí no vale omitirla.
+            assert!(std::env::var_os("CI").is_none(), "falta tmux");
+            eprintln!("sin tmux; se omite");
+            return;
+        }
+        // Se mata aunque la prueba falle.
+        struct Session(String);
+        impl Drop for Session {
+            fn drop(&mut self) {
+                let _ = kill_session(&self.0);
+            }
+        }
+        // Con el pid, una ejecución anterior interrumpida no estorba.
+        let pid = std::process::id();
+        let s = Session(format!("prueba{pid}-12"));
+        run(&["new-session", "-d", "-s", &s.0, "sleep", "30"]).unwrap();
+        assert!(kill_session(&format!("prueba{pid}-1")).is_err());
+        assert!(panes().contains_key(&s.0));
+    }
 
     #[test]
     fn deja_igual_lo_seguro() {
