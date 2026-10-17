@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -108,7 +111,7 @@ struct App {
     mode: Mode,
     state: State,
     snaps: HashMap<String, Snapshot>,
-    tracker: Tracker,
+    observer: Observer,
     agent_sel: ListState,
     task_sel: TableState,
     /// Tamaños ajustables de los paneles.
@@ -119,7 +122,6 @@ struct App {
     /// Tamaño de history.jsonl al calcular `stats`; se recalcula si crece.
     history_len: u64,
     stats: Stats,
-    last_refresh: Instant,
     quit: bool,
 }
 
@@ -130,7 +132,7 @@ impl App {
             mode: Mode::Normal,
             state: State::default(),
             snaps: HashMap::new(),
-            tracker: Tracker::default(),
+            observer: Observer::spawn(),
             agent_sel: ListState::default(),
             task_sel: TableState::default(),
             list_width: 44,
@@ -139,14 +141,23 @@ impl App {
             flash: None,
             history_len: u64::MAX,
             stats: Stats::default(),
-            last_refresh: Instant::now(),
             quit: false,
         }
     }
 
     fn run(&mut self, term: &mut DefaultTerminal) -> Result<()> {
-        self.refresh();
+        self.reload();
         while !self.quit {
+            if let Some((state, snaps)) = self.observer.take() {
+                self.apply(&state, snaps);
+                self.reload();
+            }
+            if self.observer.died() {
+                // El pánico se imprimió encima de la pantalla.
+                term.clear()?;
+                self.set_flash("El observador de paneles falló; se reinició".to_string());
+                self.observer = Observer::spawn();
+            }
             term.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
@@ -155,24 +166,24 @@ impl App {
                     _ => {}
                 }
             }
-            if self.last_refresh.elapsed() >= REFRESH {
-                self.refresh();
-            }
         }
         Ok(())
     }
 
     // ---------- estado ----------
 
+    /// Recarga el estado y pide al observador que mire los paneles ya, para
+    /// que lo que se acaba de hacer se vea sin esperar al siguiente segundo.
     fn refresh(&mut self) {
-        match State::load() {
-            Ok(s) => self.state = s,
-            Err(e) => self.set_flash(format!("Error: {e:#}")),
-        }
-        let snaps = ops::observe(&self.state, &mut self.tracker);
+        self.reload();
+        self.observer.wake();
+    }
 
+    /// Toma lo que vio el observador y avisa de los cambios de estado. `state`
+    /// es con el que se calcularon las capturas, para que agente y tarea casen.
+    fn apply(&mut self, state: &State, snaps: HashMap<String, Snapshot>) {
         let mut events = Vec::new();
-        for a in &self.state.agents {
+        for a in &state.agents {
             let (Some(old), Some(new)) = (self.snaps.get(&a.id), snaps.get(&a.id)) else {
                 continue;
             };
@@ -203,6 +214,13 @@ impl App {
             }
             self.set_flash(msg);
         }
+    }
+
+    fn reload(&mut self) {
+        match State::load() {
+            Ok(s) => self.state = s,
+            Err(e) => self.set_flash(format!("Error: {e:#}")),
+        }
 
         let len = std::fs::metadata(history::path()).map_or(0, |m| m.len());
         if len != self.history_len {
@@ -218,7 +236,6 @@ impl App {
             Some(i) if i >= n => self.task_sel.select(Some(n - 1)),
             _ => {}
         }
-        self.last_refresh = Instant::now();
     }
 
     fn status(&self, id: &str) -> Status {
@@ -1359,6 +1376,64 @@ fn tail(screen: &str, h: usize) -> String {
         lines.pop();
     }
     lines[lines.len().saturating_sub(h)..].join("\n")
+}
+
+/// Lo que vio el observador: el estado que usó y una captura por agente.
+type Seen = (State, HashMap<String, Snapshot>);
+
+/// Hilo que mira los paneles de tmux (capturas y `ps`) cada `REFRESH`, o antes
+/// si se le pide, para que eso no frene el dibujo ni las teclas. Solo guarda la
+/// última pasada: mientras la TUI está suspendida no se acumulan.
+struct Observer {
+    wake: Sender<()>,
+    latest: Arc<Mutex<Option<Seen>>>,
+    thread: JoinHandle<()>,
+}
+
+impl Observer {
+    /// La primera pasada se hace aquí, para que el primer cuadro ya la tenga.
+    fn spawn() -> Self {
+        let mut tracker = Tracker::default();
+        let look = move |tracker: &mut Tracker| {
+            let state = State::load().ok()?;
+            let snaps = ops::observe(&state, tracker);
+            Some((state, snaps))
+        };
+        let latest = Arc::new(Mutex::new(look(&mut tracker)));
+        let (wake, wakes) = mpsc::channel();
+        let slot = Arc::clone(&latest);
+        let thread = std::thread::spawn(move || loop {
+            match wakes.recv_timeout(REFRESH) {
+                Ok(()) => while wakes.try_recv().is_ok() {},
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            if let Some(seen) = look(&mut tracker) {
+                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(seen);
+            }
+        });
+        Self {
+            wake,
+            latest,
+            thread,
+        }
+    }
+
+    fn take(&self) -> Option<Seen> {
+        self.latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    fn wake(&self) {
+        let _ = self.wake.send(());
+    }
+
+    /// El hilo solo termina antes que `Observer` si entró en pánico.
+    fn died(&self) -> bool {
+        self.thread.is_finished()
+    }
 }
 
 fn notify(msg: &str) {
