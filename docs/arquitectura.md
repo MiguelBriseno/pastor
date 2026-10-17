@@ -118,7 +118,21 @@ se ignoran.
 5. Si la pantalla cambió en los últimos 3 segundos → **trabajando**; si no → **inactivo**.
 
 Un estado de hook se considera viejo cuando la pantalla cambió después de él; esto evita que un
-*esperando* quede pegado después de que respondiste.
+*esperando* quede pegado después de que respondiste. Hay dos formas de saberlo:
+
+- El observador (la TUI) vio cambiar la pantalla después del hook.
+- Tras un `blocked` o un `idle`, el hook lanza `pastor hook settle` en segundo plano. Ese proceso
+  espera a que la pantalla deje de cambiar (tres capturas iguales seguidas) y guarda su huella en
+  `status/<id>.json`: hash FNV-1a y tamaño del panel. La huella no incluye las últimas 5 líneas
+  (la caja del prompt y el pie, donde Claude Code pone y quita pistas solo) y trata como espacio el
+  `●` que parpadea mientras una herramienta espera permiso. Si la pantalla actual es otra, el hook es viejo aunque nadie la viera
+  cambiar, como en `pastor ls` o una TUI recién abierta. Con otro tamaño de panel no se compara.
+
+  El compromiso: cualquier otro cambio encima del pie con el mismo tamaño descarta el hook, también
+  un redibujo (abrir y cerrar la terminal secundaria). Para *inactivo* da igual,
+  porque el respaldo por tiempo también da inactivo. Un *esperando* de un diálogo cuyo texto no
+  reconoce la lista de `BLOCKED` (p. ej. uno de MCP) puede pasar a *inactivo*. Se prefiere eso a
+  un *esperando* que no se va nunca.
 
 ### Hooks de Claude Code
 
