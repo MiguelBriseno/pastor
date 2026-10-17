@@ -1,6 +1,7 @@
 //! Tipos de agente, cómo lanzarlos y cómo deducir su estado.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -32,7 +33,17 @@ impl Kind {
         if !in_path(self.bin()) {
             bail!("no encuentro `{}` en el PATH", self.bin());
         }
-        let mut cmd = vec![self.bin().to_string()];
+        // Con headroom instalado, Claude Code pasa por su proxy. Tu alias de
+        // `claude` no aplica aquí: tmux lanza `sh` directamente.
+        let mut cmd = match (self, headroom()) {
+            (Kind::Claude, Some(h)) => vec![
+                h.to_string_lossy().into_owned(),
+                "wrap".into(),
+                "claude".into(),
+                "--".into(),
+            ],
+            _ => vec![self.bin().to_string()],
+        };
         match self {
             Kind::Claude => {
                 // Los hooks nos avisan del estado real de Claude Code.
@@ -58,10 +69,24 @@ impl fmt::Display for Kind {
     }
 }
 
+/// headroom, si está instalado y no se desactivó con `PASTOR_HEADROOM=0`.
+pub fn headroom() -> Option<PathBuf> {
+    if std::env::var("PASTOR_HEADROOM").as_deref() == Ok("0") {
+        return None;
+    }
+    find_in_path("headroom")
+}
+
 fn in_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
-        .unwrap_or(false)
+    find_in_path(bin).is_some()
+}
+
+fn find_in_path(bin: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join(bin))
+            .find(|f| f.is_file())
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

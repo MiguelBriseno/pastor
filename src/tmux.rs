@@ -122,6 +122,8 @@ pub struct Pane {
     pub role: String,
     /// Proceso en primer plano (p. ej. "claude" o "bash").
     pub command: String,
+    /// Proceso con el que arrancó el panel; de él cuelga todo lo que corre ahí.
+    pub pid: Option<u32>,
     /// El primer agente que se lanzó en el panel ya salió.
     pub exited: bool,
 }
@@ -129,7 +131,7 @@ pub struct Pane {
 /// Paneles de cada sesión. Vacío si el servidor no está corriendo.
 pub fn panes() -> HashMap<String, Vec<Pane>> {
     let format =
-        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{@pastor_exited}\t#{@pastor_role}";
+        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{@pastor_exited}\t#{@pastor_role}\t#{pane_pid}";
     let Ok(out) = run(&["list-panes", "-a", "-F", format]) else {
         return HashMap::new();
     };
@@ -148,6 +150,7 @@ pub fn panes() -> HashMap<String, Vec<Pane>> {
             command: command.to_string(),
             exited: f.next() == Some("1"),
             role: f.next().unwrap_or_default().to_string(),
+            pid: f.next().and_then(|p| p.parse().ok()),
         });
     }
     map
