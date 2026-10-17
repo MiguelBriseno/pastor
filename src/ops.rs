@@ -180,6 +180,9 @@ fn agent_target(agent: &Agent) -> Result<String> {
 }
 
 pub fn send(agent_key: &str, text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        bail!("el mensaje está vacío");
+    }
     let state = State::load()?;
     let agent = state.find_agent(agent_key)?;
     tmux::send_text(&agent_target(agent)?, text)?;
@@ -212,6 +215,7 @@ pub fn open_term(agent_key: &str, cmd: Option<&str>) -> Result<()> {
     let term = tmux::split_right(&agent_pane.id, &agent.cwd)?;
     let cmd = cmd.map(str::trim).filter(|c| !c.is_empty());
     if let Some(c) = cmd {
+        tmux::set_cmd(&term, c)?;
         tmux::type_line(&term, c)?;
     }
     State::update(|s| {
@@ -264,7 +268,7 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
     // medias, lo vería muerto y tomaría su tarea por terminada. Se busca dentro
     // del candado: si dos lo matan a la vez, solo uno lo encuentra, y el fin
     // de la sesión no queda dos veces en el historial.
-    let agent = State::update(|s| remove_agent(s, agent_key, &mut record_status))?;
+    let agent = update_recording(|s, mut record| remove_agent(s, agent_key, &mut record))?;
     let _ = tmux::kill_session(&agent.id);
     hooks::clear_status(&agent.id);
     history::record(Event::AgentEnded {
@@ -321,8 +325,9 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
     };
     // Lo que pasó entre leer la tarea y ahora (otra asignación, la tarea
     // borrada o cerrada) lo resuelve `link_task` dentro del candado.
-    let linked =
-        State::update(|s| link_task(s, &task.id, &agent.id, task.status, &mut record_status));
+    let linked = update_recording(|s, mut record| {
+        link_task(s, &task.id, &agent.id, task.status, &mut record)
+    });
     if let Err(e) = linked {
         // Un agente lanzado solo para esta tarea no tiene nada que hacer.
         if created {
@@ -388,8 +393,8 @@ fn link_task(
 /// Todo se mira dentro del candado, para no pisar un cambio recién hecho por
 /// otro proceso (la tarea ya hecha, o reasignada a otro agente).
 pub fn finish_turn(agent_id: &str) -> Result<()> {
-    State::update(|s| {
-        finish_turn_in(s, agent_id, &mut record_status);
+    update_recording(|s, mut record| {
+        finish_turn_in(s, agent_id, &mut record);
         Ok(())
     })
 }
@@ -421,23 +426,36 @@ fn finish_turn_in(
 }
 
 pub fn set_task_status(task_id: &str, status: TaskStatus) -> Result<()> {
-    State::update(|s| {
+    update_recording(|s, record| {
         let t = s.find_task_mut(task_id)?;
-        record_status(t, status);
+        record(t, status);
         t.status = status;
         Ok(())
     })
 }
 
-/// Anota en el historial que la tarea pasa a `to`, si de verdad cambia.
-pub fn record_status(task: &Task, to: TaskStatus) {
-    if task.status != to {
-        history::record(Event::TaskStatus {
-            task: task.id.clone(),
-            to,
-            secs: (Utc::now() - task.created_at).num_seconds(),
-        });
+/// Como `State::update`, pero `f` recibe con qué anotar los cambios de
+/// estado de las tareas, y solo pasan al historial si el estado se guardó.
+fn update_recording<T>(
+    f: impl FnOnce(&mut State, &mut dyn FnMut(&Task, TaskStatus)) -> Result<T>,
+) -> Result<T> {
+    let mut events = Vec::new();
+    let out = State::update(|s| {
+        f(s, &mut |task: &Task, to| {
+            // Solo si de verdad cambia.
+            if task.status != to {
+                events.push(Event::TaskStatus {
+                    task: task.id.clone(),
+                    to,
+                    secs: (Utc::now() - task.created_at).num_seconds(),
+                });
+            }
+        })
+    })?;
+    for e in events {
+        history::record(e);
     }
+    Ok(out)
 }
 
 pub fn add_task(title: String, description: String) -> Result<Task> {
@@ -521,6 +539,8 @@ pub struct Snapshot {
 pub struct TermSnapshot {
     pub screen: String,
     pub dead: bool,
+    /// Comando con el que se abrió esta vez, si se abrió con uno.
+    pub cmd: Option<String>,
 }
 
 pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot> {
@@ -551,6 +571,7 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
             let term = panes.term.map(|t| TermSnapshot {
                 screen: tmux::capture(&t.id).unwrap_or_default(),
                 dead: t.dead,
+                cmd: Some(t.cmd).filter(|c| !c.is_empty()),
             });
             let obs = Observation {
                 dead: pane.is_none_or(|p| p.dead),

@@ -132,11 +132,10 @@ impl State {
         }
         let mut s = Self::load_in(dir)?;
         let out = f(&mut s)?;
-        // El temporal es compartido: solo se escribe con el candado tomado.
-        let path = dir.join("state.json");
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(&s)?)?;
-        fs::rename(tmp, path)?;
+        write_atomic(
+            &dir.join("state.json"),
+            serde_json::to_string_pretty(&s)?.as_bytes(),
+        )?;
         Ok(out)
     }
 
@@ -155,6 +154,12 @@ impl State {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| kind.to_string())
             });
+        // Un nombre como `a3` se confundiría con el id de otro agente.
+        let base = if looks_like_id(&base) {
+            format!("{base}-agente")
+        } else {
+            base
+        };
         let mut name = base.clone();
         let mut i = 2;
         while self.agents.iter().any(|a| a.name == name) {
@@ -174,10 +179,12 @@ impl State {
         agent
     }
 
+    /// Por id y, si no hay ninguno con ese id, por nombre.
     pub fn find_agent(&self, key: &str) -> Result<&Agent> {
         self.agents
             .iter()
-            .find(|a| a.id == key || a.name == key)
+            .find(|a| a.id == key)
+            .or_else(|| self.agents.iter().find(|a| a.name == key))
             .ok_or_else(|| anyhow!("no existe el agente `{key}`"))
     }
 
@@ -212,6 +219,51 @@ impl State {
     }
 }
 
+/// Si `s` tiene la forma de un id de agente (`a1`, `a27`…).
+fn looks_like_id(s: &str) -> bool {
+    s.strip_prefix('a')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Reemplaza `path` de golpe: escribe un temporal propio, lo
+/// lleva a disco y lo renombra. Quien lo lea a la vez ve el archivo viejo o
+/// el nuevo, nunca uno a medias, y un corte de luz no lo deja vacío.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomic_mode(path, contents, None)
+}
+
+/// Como `write_atomic`, con permisos `mode` (p. ej. 0o755 para un script).
+/// Si el archivo ya tiene ese contenido no lo toca.
+pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Propio también de cada escritura: dos hilos del mismo proceso no comparten temporal.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    if fs::read(path).is_ok_and(|old| old == contents) {
+        return Ok(());
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    tmp.push(format!(".{}-{n}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let written = (|| -> Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        if let Some(m) = mode {
+            f.set_permissions(fs::Permissions::from_mode(m))?;
+        }
+        f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("no pude escribir {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +282,21 @@ mod tests {
         assert_eq!(a.name, "opencode");
         assert_eq!(s.find_agent("web-2").unwrap().id, "a2");
         assert!(s.find_agent("nadie").is_err());
+    }
+
+    /// Un agente llamado como el id de otro no lo tapa.
+    #[test]
+    fn un_nombre_no_tapa_un_id() {
+        let mut s = State::default();
+        let a = s.add_agent(Kind::Claude, PathBuf::from("/home/yo/a2"), None);
+        assert_eq!(a.name, "a2-agente");
+        let a = s.add_agent(Kind::Claude, PathBuf::from("/"), Some("a1".into()));
+        assert_eq!((a.id.as_str(), a.name.as_str()), ("a2", "a1-agente"));
+        // Aunque venga de un state.json viejo, el id gana.
+        s.agents[0].name = "a2".into();
+        assert_eq!(s.find_agent("a2").unwrap().id, "a2");
+        assert_eq!(s.find_agent("a1").unwrap().id, "a1");
+        assert!(!looks_like_id("a") && !looks_like_id("ab1") && looks_like_id("a10"));
     }
 
     #[test]
