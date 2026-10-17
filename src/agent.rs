@@ -212,9 +212,12 @@ mod tests {
 
     #[test]
     fn el_prompt_no_se_toma_como_opcion() {
-        let cmd = Kind::Codex.launch_command(Some("-v revisa")).unwrap();
+        let mut cmd = vec!["codex".to_string()];
+        push_prompt(&mut cmd, Some("-v revisa"));
         assert_eq!(cmd, ["codex", "--", "-v revisa"]);
-        assert_eq!(Kind::Codex.launch_command(None).unwrap(), ["codex"]);
+        let mut cmd = vec!["codex".to_string()];
+        push_prompt(&mut cmd, None);
+        assert_eq!(cmd, ["codex"]);
     }
 
     fn obs(screen: &str) -> Observation<'_> {
