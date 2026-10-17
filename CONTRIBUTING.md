@@ -41,11 +41,11 @@ tmux -L prueba kill-server
 
 ```sh
 cargo fmt
-cargo clippy     # no debe haber advertencias
-cargo build
+cargo clippy --all-targets   # no debe haber advertencias
+cargo test
 ```
 
-Y prueba a mano lo que cambiaste con al menos un agente real.
+La CI corre lo mismo en Linux y macOS en cada pull request. Aun así, prueba a mano lo que cambiaste con al menos un agente real.
 
 ## Estilo
 

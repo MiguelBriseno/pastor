@@ -19,8 +19,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, BarGroup, Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
-    TableState, Tabs, Wrap,
+    Bar, BarChart, BarGroup, Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph,
+    Row, Table, TableState, Tabs, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 
@@ -658,10 +658,10 @@ impl App {
             format!(" 3 {}Dashboard ", pad(ic.dashboard)),
             format!(" 4 {}Historial ", pad(ic.history)),
         ])
-            .select(idx)
-            .style(Style::default().fg(Color::DarkGray))
-            .highlight_style(Style::default().fg(Color::White).bold())
-            .divider("│");
+        .select(idx)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(Style::default().fg(Color::White).bold())
+        .divider("│");
         f.render_widget(t, tabs);
 
         let mut spans = Vec::new();
@@ -683,7 +683,11 @@ impl App {
     fn draw_agents(&mut self, f: &mut Frame, area: Rect) {
         let list_w = self.list_width.min(area.width.saturating_sub(20)).max(20);
         let ic = icons::get();
-        let kind_w = Kind::ALL.iter().map(|k| pad(ic.kind(*k)).chars().count()).max().unwrap_or(0);
+        let kind_w = Kind::ALL
+            .iter()
+            .map(|k| pad(ic.kind(*k)).chars().count())
+            .max()
+            .unwrap_or(0);
         let name_w = (list_w as usize).saturating_sub(28 + kind_w).max(6);
         let [left, right] =
             Layout::horizontal([Constraint::Length(list_w), Constraint::Min(0)]).areas(area);
@@ -709,7 +713,10 @@ impl App {
                         .and_then(|s| s.term.as_ref())
                         .is_some_and(|t| !t.dead);
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!(" {} ", ic.status(st)), Style::default().fg(st.color())),
+                        Span::styled(
+                            format!(" {} ", ic.status(st)),
+                            Style::default().fg(st.color()),
+                        ),
                         Span::styled(
                             format!("{:<name_w$}", truncate(&a.name, name_w)),
                             Style::default().bold(),
@@ -777,7 +784,10 @@ impl App {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(st.color()))
             .title(Line::from(vec![
-                Span::styled(format!(" {} ", ic.status(st)), Style::default().fg(st.color())),
+                Span::styled(
+                    format!(" {} ", ic.status(st)),
+                    Style::default().fg(st.color()),
+                ),
                 Span::styled(a.name.clone(), Style::default().bold()),
                 Span::raw(" · "),
                 Span::styled(
@@ -943,7 +953,13 @@ impl App {
             let name = named(ic.task_status(st), st.label());
             stat(f, area, &name, tcount(st).to_string(), task_color(st));
         }
-        stat(f, e, &named(ic.done, "completado"), format!("{pct}%"), ACCENT);
+        stat(
+            f,
+            e,
+            &named(ic.done, "completado"),
+            format!("{pct}%"),
+            ACCENT,
+        );
 
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(r3);
@@ -1021,13 +1037,29 @@ impl App {
 
         let since = s.since.map_or_else(
             || "—".to_string(),
-            |d| d.with_timezone(&chrono::Local).format("%d/%m/%Y").to_string(),
+            |d| {
+                d.with_timezone(&chrono::Local)
+                    .format("%d/%m/%Y")
+                    .to_string()
+            },
         );
         let days = s.since.map_or(0, |d| (chrono::Utc::now() - d).num_days());
         let [a, b, c, d, e, g] = Layout::horizontal([Constraint::Ratio(1, 6); 6]).areas(r1);
         stat(f, a, &format!("desde (hace {days} días)"), since, ACCENT);
-        stat(f, b, &named(ic.agents, "sesiones"), s.sessions.to_string(), Color::White);
-        stat(f, c, &named(ic.tasks, "tareas creadas"), s.tasks_created.to_string(), Color::White);
+        stat(
+            f,
+            b,
+            &named(ic.agents, "sesiones"),
+            s.sessions.to_string(),
+            Color::White,
+        );
+        stat(
+            f,
+            c,
+            &named(ic.tasks, "tareas creadas"),
+            s.tasks_created.to_string(),
+            Color::White,
+        );
         stat(
             f,
             d,
@@ -1035,15 +1067,45 @@ impl App {
             s.tasks_done.to_string(),
             Color::Green,
         );
-        stat(f, e, "mensajes enviados", s.messages.to_string(), Color::Cyan);
-        stat(f, g, "turnos de Claude", s.turns.to_string(), kind_color(Kind::Claude));
+        stat(
+            f,
+            e,
+            "mensajes enviados",
+            s.messages.to_string(),
+            Color::Cyan,
+        );
+        stat(
+            f,
+            g,
+            "turnos de Claude",
+            s.turns.to_string(),
+            kind_color(Kind::Claude),
+        );
 
         let dash = |v: Option<i64>| v.map_or_else(|| "—".to_string(), history::human);
         let per_day = format!("{:.1}", s.sessions as f64 / days.max(1) as f64);
         let [a, b, c, d] = Layout::horizontal([Constraint::Ratio(1, 4); 4]).areas(r2);
-        stat(f, a, "duración media de sesión", dash(s.avg_session_secs), Color::White);
-        stat(f, b, "tiempo medio por tarea", dash(s.avg_task_secs), Color::White);
-        stat(f, c, "tiempo total de agentes", history::human(s.agent_secs), Color::White);
+        stat(
+            f,
+            a,
+            "duración media de sesión",
+            dash(s.avg_session_secs),
+            Color::White,
+        );
+        stat(
+            f,
+            b,
+            "tiempo medio por tarea",
+            dash(s.avg_task_secs),
+            Color::White,
+        );
+        stat(
+            f,
+            c,
+            "tiempo total de agentes",
+            history::human(s.agent_secs),
+            Color::White,
+        );
         stat(f, d, "sesiones por día", per_day, Color::White);
 
         let [left, right] =
@@ -1061,7 +1123,9 @@ impl App {
             .collect();
         // Que las barras llenen el ancho disponible.
         let n = s.daily.len().max(1) as u16;
-        let bar_w = (left.width.saturating_sub(2) / n).saturating_sub(1).clamp(2, 8);
+        let bar_w = (left.width.saturating_sub(2) / n)
+            .saturating_sub(1)
+            .clamp(2, 8);
         f.render_widget(
             BarChart::default()
                 .block(
@@ -1121,7 +1185,9 @@ impl App {
             })
             .collect();
         if items.is_empty() {
-            items.push(ListItem::new(" Aún no hay sesiones registradas".dark_gray()));
+            items.push(ListItem::new(
+                " Aún no hay sesiones registradas".dark_gray(),
+            ));
         }
         f.render_widget(
             List::new(items).block(
