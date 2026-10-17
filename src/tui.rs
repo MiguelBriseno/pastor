@@ -38,9 +38,27 @@ const SELECTED: Color = Color::Rgb(45, 45, 60);
 const ACCENT: Color = Color::Magenta;
 /// Columnas de la etiqueta de un campo (`" {name:>11}: "`).
 const LABEL_W: usize = 14;
+/// Nombre del hilo que observa los paneles.
+const OBSERVER: &str = "observador";
+/// Último pánico del observador, para mostrarlo al reiniciarlo.
+static OBSERVER_PANIC: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
+    // El hook de ratatui restaura la terminal ante cualquier pánico, también
+    // uno del observador, y la TUI seguiría dibujando sobre una terminal
+    // normal. Ese hilo se reinicia solo: su pánico no toca la terminal.
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some(OBSERVER) {
+            *OBSERVER_PANIC
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Some(info.to_string().replace('\n', " "));
+        } else {
+            restore(info);
+        }
+    }));
     // Con bracketed paste, un texto pegado llega entero en vez de tecla por
     // tecla, y sus saltos de línea no confirman el formulario.
     let _ = execute!(io::stdout(), EnableBracketedPaste);
@@ -153,9 +171,14 @@ impl App {
                 self.reload();
             }
             if self.observer.died() {
-                // El pánico se imprimió encima de la pantalla.
-                term.clear()?;
-                self.set_flash("El observador de paneles falló; se reinició".to_string());
+                let why = OBSERVER_PANIC
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                    .unwrap_or_default();
+                self.set_flash(format!(
+                    "El observador de paneles falló; se reinició. {why}"
+                ));
                 self.observer = Observer::spawn();
             }
             term.draw(|f| self.draw(f))?;
@@ -179,8 +202,7 @@ impl App {
         self.observer.wake();
     }
 
-    /// Toma lo que vio el observador y avisa de los cambios de estado. `state`
-    /// es con el que se calcularon las capturas, para que agente y tarea casen.
+    /// Toma lo que vio el observador y avisa de los cambios de estado.
     fn apply(&mut self, state: &State, snaps: HashMap<String, Snapshot>) {
         let mut events = Vec::new();
         for a in &state.agents {
@@ -192,27 +214,21 @@ impl App {
                     events.push((format!("{} necesita tu atención", a.name), None));
                 }
                 (Status::Working, Status::Idle | Status::Dead) => {
-                    events.push((format!("{} terminó", a.name), a.task.clone()));
+                    // Sin tarea no hay nada que pasar a revisión.
+                    let id = a.task.is_some().then(|| a.id.clone());
+                    events.push((format!("{} terminó", a.name), id));
                 }
                 _ => {}
             }
         }
         self.snaps = snaps;
 
-        for (msg, task) in events {
+        for (msg, finished) in events {
             notify(&msg);
-            if let Some(t) = task {
-                let in_progress = self
-                    .state
-                    .find_task(&t)
-                    .is_ok_and(|t| t.status == TaskStatus::InProgress);
-                if in_progress && ops::set_task_status(&t, TaskStatus::Review).is_ok() {
-                    if let Ok(task) = self.state.find_task_mut(&t) {
-                        task.status = TaskStatus::Review;
-                    }
-                }
-            }
             self.set_flash(msg);
+            if let Some(Err(e)) = finished.map(|id| ops::finish_turn(&id)) {
+                self.set_flash(format!("Error: {e:#}"));
+            }
         }
     }
 
@@ -1402,16 +1418,20 @@ impl Observer {
         let latest = Arc::new(Mutex::new(look(&mut tracker)));
         let (wake, wakes) = mpsc::channel();
         let slot = Arc::clone(&latest);
-        let thread = std::thread::spawn(move || loop {
-            match wakes.recv_timeout(REFRESH) {
-                Ok(()) => while wakes.try_recv().is_ok() {},
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            if let Some(seen) = look(&mut tracker) {
-                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(seen);
-            }
-        });
+        let thread = std::thread::Builder::new()
+            .name(OBSERVER.into())
+            .spawn(move || loop {
+                match wakes.recv_timeout(REFRESH) {
+                    Ok(()) => while wakes.try_recv().is_ok() {},
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+                if let Some(seen) = look(&mut tracker) {
+                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(seen);
+                }
+            })
+            // Lo mismo que haría `thread::spawn`.
+            .expect("no pude lanzar el observador");
         Self {
             wake,
             latest,
