@@ -49,9 +49,9 @@ impl Kind {
                 // Los hooks nos avisan del estado real de Claude Code.
                 cmd.push("--settings".into());
                 cmd.push(hooks::claude_settings()?.to_string_lossy().into_owned());
-                cmd.extend(prompt.map(String::from));
+                push_prompt(&mut cmd, prompt);
             }
-            Kind::Codex => cmd.extend(prompt.map(String::from)),
+            Kind::Codex => push_prompt(&mut cmd, prompt),
             Kind::Opencode => {
                 if let Some(p) = prompt {
                     cmd.push("--prompt".into());
@@ -60,6 +60,14 @@ impl Kind {
             }
         }
         Ok(cmd)
+    }
+}
+
+/// El prompt va tras `--`: si empieza por `-`, que no se tome como opción.
+fn push_prompt(cmd: &mut Vec<String>, prompt: Option<&str>) {
+    if let Some(p) = prompt {
+        cmd.push("--".into());
+        cmd.push(p.into());
     }
 }
 
@@ -201,6 +209,16 @@ fn tail_lower(screen: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn el_prompt_no_se_toma_como_opcion() {
+        let mut cmd = vec!["codex".to_string()];
+        push_prompt(&mut cmd, Some("-v revisa"));
+        assert_eq!(cmd, ["codex", "--", "-v revisa"]);
+        let mut cmd = vec!["codex".to_string()];
+        push_prompt(&mut cmd, None);
+        assert_eq!(cmd, ["codex"]);
+    }
 
     fn obs(screen: &str) -> Observation<'_> {
         Observation {

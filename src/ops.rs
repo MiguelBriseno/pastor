@@ -42,6 +42,8 @@ pub fn new_agent(
         )
     });
     if let Err(e) = started {
+        // La sesión pudo crearse antes de fallar: que no quede un agente huérfano.
+        let _ = tmux::kill_session(&agent.id);
         let _ = State::update(|s| {
             s.agents.retain(|a| a.id != agent.id);
             Ok(())

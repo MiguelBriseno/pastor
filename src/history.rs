@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
@@ -87,11 +87,39 @@ pub fn ensure_baseline() -> Result<()> {
         .chain(dir_created)
         .min()
         .unwrap_or_else(Utc::now);
-    write(&Event::Baseline {
-        since,
-        agents,
-        tasks,
-    })
+    ensure_dirs()?;
+    create_with(
+        &path(),
+        &line(&Event::Baseline {
+            since,
+            agents,
+            tasks,
+        })?,
+    )?;
+    Ok(())
+}
+
+/// Crea `path` con `line` solo si no existe. Si dos procesos llegan a la vez
+/// (dos hooks tras actualizar), solo uno escribe la línea base.
+fn create_with(path: &Path, line: &str) -> Result<bool> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => {
+            f.write_all(line.as_bytes())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn line(event: &Event) -> Result<String> {
+    let entry = Entry {
+        ts: Utc::now(),
+        event: event.clone(),
+    };
+    let mut line = serde_json::to_string(&entry)?;
+    line.push('\n');
+    Ok(line)
 }
 
 /// Anota un evento. El historial es un extra: si falla, no interrumpe nada.
@@ -101,12 +129,7 @@ pub fn record(event: Event) {
 
 fn write(event: &Event) -> Result<()> {
     ensure_dirs()?;
-    let entry = Entry {
-        ts: Utc::now(),
-        event: event.clone(),
-    };
-    let mut line = serde_json::to_string(&entry)?;
-    line.push('\n');
+    let line = line(event)?;
     // Una sola escritura en modo append: la CLI, la TUI y los hooks pueden
     // anotar a la vez sin mezclar líneas.
     OpenOptions::new()
@@ -231,5 +254,31 @@ pub fn human(secs: i64) -> String {
         _ if h > 0 => format!("{h}h {m}m"),
         _ if m > 0 => format!("{m}m"),
         _ => format!("{secs}s"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn la_linea_base_se_escribe_una_sola_vez() {
+        let dir = std::env::temp_dir().join(format!("pastor-historial-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let _ = fs::remove_file(&path);
+        let created: Vec<bool> = std::thread::scope(|s| {
+            let hilos: Vec<_> = (0..8)
+                .map(|i| {
+                    let path = &path;
+                    s.spawn(move || create_with(path, &format!("{i}\n")).unwrap())
+                })
+                .collect();
+            hilos.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let lines = fs::read_to_string(&path).unwrap().lines().count();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(created.iter().filter(|c| **c).count(), 1);
+        assert_eq!(lines, 1);
     }
 }
