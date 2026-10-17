@@ -1,6 +1,7 @@
 //! Hooks de Claude Code: `pastor hook <evento>` escribe el estado del agente
 //! en ~/.local/share/pastor/status/<id>.json.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,80 @@ fn prune_status_in(dir: &Path, state: &store::State) {
     }
 }
 
+/// Si este proceso desciende de un panel del agente. Un servicio que arrancó
+/// desde él y se desligó (p. ej. un worker que lanza sus propios `claude`)
+/// hereda `PASTOR_AGENT` pero ya no cuelga de su panel, y su `Stop` mandaría
+/// la tarea del agente a revisar. Si no se puede saber, se da por bueno.
+fn from_agent(id: &str) -> bool {
+    let panes = match tmux::pane_pids(id) {
+        Ok(p) if !p.is_empty() => p,
+        _ => return true,
+    };
+    let me = std::process::id();
+    // En Linux se sube por /proc solo por la cadena de padres; si no, una
+    // foto de `ps`.
+    let verdict = if Path::new("/proc/self/stat").exists() {
+        descends_from(proc_parent, me, &panes)
+    } else {
+        let out = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid="])
+            .output();
+        let Some(out) = out.ok().filter(|o| o.status.success()) else {
+            return true;
+        };
+        let parents = parse_parents(&String::from_utf8_lossy(&out.stdout));
+        descends_from(|p| parents.get(&p).copied(), me, &panes)
+    };
+    verdict != Some(false)
+}
+
+/// Padre de `pid` según `/proc/<pid>/stat` (`pid (nombre) estado ppid …`;
+/// el nombre puede llevar espacios y paréntesis).
+fn proc_parent(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Lee la salida de `ps -o pid=,ppid=`.
+fn parse_parents(out: &str) -> HashMap<u32, u32> {
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Si `pid` desciende de alguno de `ancestors`. `None` si no se puede saber:
+/// no se ve el propio proceso ni ningún panel (p. ej. otro espacio de PID),
+/// la cadena se corta a medias o no se acaba (un ciclo por pids reutilizados).
+fn descends_from(
+    parent: impl Fn(u32) -> Option<u32>,
+    mut pid: u32,
+    ancestors: &[u32],
+) -> Option<bool> {
+    if !ancestors.iter().any(|&a| parent(a).is_some()) {
+        return None;
+    }
+    for _ in 0..64 {
+        if ancestors.contains(&pid) {
+            return Some(true);
+        }
+        match parent(pid)? {
+            // Llegó arriba del todo sin pasar por un panel.
+            0 => return Some(false),
+            ppid if ppid == pid => return None,
+            ppid => pid = ppid,
+        }
+    }
+    None
+}
+
 /// Llamado por Claude Code. Nunca debe fallar ruidosamente.
 pub fn handle(event: &str) -> Result<()> {
     let Ok(id) = std::env::var("PASTOR_AGENT") else {
@@ -125,8 +200,13 @@ pub fn handle(event: &str) -> Result<()> {
     if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
         return Ok(());
     }
+    // `settle` lo lanza un hook que ya pasó el filtro de abajo, y al salir
+    // ese hook queda colgando de init.
     if event == "settle" {
         return settle(&id);
+    }
+    if !from_agent(&id) {
+        return Ok(());
     }
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
@@ -422,6 +502,32 @@ mod tests {
             .collect();
         quedan.sort();
         assert_eq!(quedan, ["a1.json", "a1.json.9-1.tmp", "a1.lock"]);
+    }
+
+    #[test]
+    fn solo_cuentan_los_procesos_del_panel() {
+        // 100: panel; 101 claude, 102 hook. 200: worker desligado (padre 1).
+        let parents = parse_parents("  1 0\n100 1\n101 100\n102 101\n200 1\n201 200\n202 201\n");
+        let de = |pid, panes: &[u32]| descends_from(|p| parents.get(&p).copied(), pid, panes);
+        assert_eq!(de(102, &[100]), Some(true));
+        assert_eq!(de(202, &[100]), Some(false));
+        // Si no se ve el propio proceso o ningún panel, no se sabe.
+        assert_eq!(de(999, &[100]), None);
+        assert_eq!(de(102, &[555]), None);
+        // Un ciclo no lo cuelga ni lo descarta.
+        let ciclo = parse_parents("5 6\n6 5\n100 1\n");
+        assert_eq!(descends_from(|p| ciclo.get(&p).copied(), 5, &[100]), None);
+    }
+
+    #[test]
+    fn este_proceso_cuelga_de_su_padre_en_proc() {
+        if !Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let me = std::process::id();
+        let padre = proc_parent(me).unwrap();
+        assert_eq!(descends_from(proc_parent, me, &[padre]), Some(true));
+        assert_eq!(descends_from(proc_parent, padre, &[me]), Some(false));
     }
 
     /// HOME temporal que se borra al terminar, aunque falle la prueba.
