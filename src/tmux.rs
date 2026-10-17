@@ -263,9 +263,14 @@ pub fn shell_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{kill_session, new_session, panes, run, shell_quote};
+    use super::{
+        capture, kill_session, new_session, panes, run, send_text, shell_quote, split_right,
+        type_line,
+    };
     use std::path::Path;
     use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
 
     /// Sin tmux se omite, salvo en CI, donde se instala.
     fn have_tmux() -> bool {
@@ -307,6 +312,52 @@ mod tests {
         run(&["new-session", "-d", "-s", &s.0, "sleep", "30"]).unwrap();
         assert!(kill_session(&format!("prueba{pid}-1")).is_err());
         assert!(panes().contains_key(&s.0));
+    }
+
+    /// Espera hasta 5 s a que la pantalla de `pane` cumpla `ok`.
+    fn screen_until(pane: &str, ok: impl Fn(&str) -> bool) -> String {
+        let mut screen = String::new();
+        for _ in 0..50 {
+            screen = capture(pane).unwrap_or_default();
+            if ok(&screen) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        screen
+    }
+
+    #[test]
+    fn el_texto_y_la_terminal_llegan_a_su_panel() {
+        if !have_tmux() {
+            return;
+        }
+        let s = Session(format!("paneles{}", std::process::id()));
+        // `cat` devuelve lo que recibe: hace de agente.
+        new_session(&s.0, Path::new("/"), &[], &["cat".to_string()], "true").unwrap();
+        let agent = panes().remove(&s.0).unwrap().remove(0);
+        assert_eq!(agent.role, "agent");
+
+        let term = split_right(&agent.id, Path::new("/")).unwrap();
+        let mut list = panes().remove(&s.0).unwrap();
+        list.sort_by_key(|p| p.id != agent.id);
+        let roles: Vec<_> = list
+            .iter()
+            .map(|p| (p.id.as_str(), p.role.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            [(agent.id.as_str(), "agent"), (term.as_str(), "term")]
+        );
+
+        // Por su id, el texto va al agente aunque la terminal se abrió después.
+        send_text(&agent.id, "hola «pastor» ñ").unwrap();
+        let screen = screen_until(&agent.id, |sc| sc.matches("hola «pastor» ñ").count() >= 2);
+        assert_eq!(screen.matches("hola «pastor» ñ").count(), 2, "{screen}");
+        type_line(&term, "echo desde-la-terminal").unwrap();
+        let screen = screen_until(&term, |sc| sc.lines().any(|l| l == "desde-la-terminal"));
+        assert!(screen.lines().any(|l| l == "desde-la-terminal"), "{screen}");
+        assert!(!capture(&agent.id).unwrap().contains("desde-la-terminal"));
     }
 
     #[test]

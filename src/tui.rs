@@ -6,7 +6,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -531,7 +531,7 @@ impl App {
                     let cwd = expand(&f.cwd);
                     self.set_flash(format!("Lanzando {kind}…"));
                     self.actions.run(Some(Mode::NewAgent(f)), move || {
-                        let a = ops::new_agent(kind, Some(cwd), name, prompt.as_deref())?;
+                        let a = ops::new_agent(kind, cwd, name, prompt.as_deref())?;
                         Ok(Done::Agent {
                             id: a.id,
                             msg: format!("Agente {} lanzado", a.name),
@@ -1464,10 +1464,7 @@ impl Watch {
             }
         }
         self.status = snaps.iter().map(|(id, s)| (id.clone(), s.status)).collect();
-        let stats = self
-            .history
-            .refresh()
-            .then(|| history::stats(self.history.entries()));
+        let stats = self.history.refresh().then(|| self.history.stats());
         Some(Pass {
             snaps,
             stats,
@@ -1640,14 +1637,27 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("pánico")
 }
 
+/// Muestra un aviso del sistema. Los lanza, de uno en uno, un único hilo que
+/// espera a cada proceso (para que no quede zombi) sin frenar al observador.
 fn notify(msg: &str) {
-    let child = notify_command(msg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    // Esperarlo, para que no quede un proceso zombi por aviso.
-    if let Ok(mut child) = child {
-        std::thread::spawn(move || child.wait());
+    static QUEUE: OnceLock<Option<Sender<String>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("avisos".into())
+            .spawn(move || {
+                for msg in rx {
+                    let _ = notify_command(&msg)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(tx) = queue {
+        let _ = tx.send(msg.to_string());
     }
 }
 
@@ -1848,12 +1858,15 @@ fn tilde(p: &std::path::Path) -> String {
     p.display().to_string()
 }
 
-fn expand(s: &str) -> PathBuf {
+/// La ruta escrita en un formulario, con `~` expandido. Vacía es `None`:
+/// el directorio actual.
+fn expand(s: &str) -> Option<PathBuf> {
     let s = s.trim();
-    match (s.strip_prefix('~'), dirs::home_dir()) {
+    Some(match (s.strip_prefix('~'), dirs::home_dir()) {
+        _ if s.is_empty() => return None,
         (Some(rest), Some(home)) => home.join(rest.trim_start_matches('/')),
         _ => PathBuf::from(s),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1875,6 +1888,32 @@ mod tests {
 
     fn statuses(list: &[(&str, Status)]) -> HashMap<String, Status> {
         list.iter().map(|&(id, s)| (id.to_string(), s)).collect()
+    }
+
+    #[test]
+    fn rutas_de_los_formularios() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand("  "), None);
+        assert_eq!(expand("~"), Some(home.clone()));
+        assert_eq!(expand(" ~/web "), Some(home.join("web")));
+        assert_eq!(expand("/tmp/x"), Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn editar_un_campo() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let mut s = String::from("añ");
+        edit(&mut s, &key(KeyCode::Char('🦀'), KeyModifiers::NONE));
+        edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
+        edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(s, "a");
+        // Ctrl+letra no escribe la letra; Ctrl+U borra todo.
+        edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(s, "a");
+        edit(&mut s, &key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(s, "");
+        edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(s, "");
     }
 
     #[test]

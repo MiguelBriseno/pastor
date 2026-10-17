@@ -97,8 +97,9 @@ sola escritura en modo *append*, así que la CLI, la TUI y los hooks pueden anot
 
 La primera línea es un evento `baseline` que se escribe al arrancar pastor si el archivo no existe.
 Guarda los contadores `next_agent` y `next_task` de `state.json`, que nunca bajan, para contar lo
-que ya había antes de llevar historial. La TUI recalcula las estadísticas solo cuando el archivo
-cambia de tamaño. Las líneas que no entiende se ignoran.
+que ya había antes de llevar historial. La TUI lee solo las líneas nuevas cuando el archivo
+crece y las suma a unos totales, sin guardarlas, así que la memoria no crece con el historial. Las
+líneas que no entiende se ignoran.
 
 ### Cómo se clasifica el estado de un agente
 
