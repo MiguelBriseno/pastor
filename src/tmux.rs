@@ -365,8 +365,8 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg, capture, kill_session, new_session, panes, parse_version, run, send_text, shell_quote,
-        split_right, type_line,
+        arg, capture, kill_session, new_session, pane_pids, panes, parse_version, run, send_text,
+        shell_quote, split_right, type_line,
     };
     use std::path::Path;
     use std::process::Command;
@@ -417,6 +417,29 @@ mod tests {
         run(&["new-session", "-d", "-s", &s.0, "sleep", "30"]).unwrap();
         assert!(kill_session(&format!("prueba{pid}-1")).is_err());
         assert!(panes().contains_key(&s.0));
+    }
+
+    #[test]
+    fn pane_pids_da_los_procesos_de_todos_los_paneles() {
+        let Some(_serial) = have_tmux() else {
+            return;
+        };
+        let s = Session(format!("pids{}", std::process::id()));
+        let cmd = ["sleep".to_string(), "30".to_string()];
+        new_session(&s.0, Path::new("/"), &[], &cmd, "true").unwrap();
+        let agent = panes().remove(&s.0).unwrap().remove(0);
+        split_right(&agent.id, Path::new("/")).unwrap();
+        let mut esperados: Vec<u32> = panes()
+            .remove(&s.0)
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.pid)
+            .collect();
+        let mut pids = pane_pids(&s.0).unwrap();
+        esperados.sort();
+        pids.sort();
+        assert_eq!(pids.len(), 2);
+        assert_eq!(pids, esperados);
     }
 
     /// Espera hasta 5 s a que la pantalla de `pane` cumpla `ok`.
