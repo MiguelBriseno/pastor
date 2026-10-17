@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::agent;
 use crate::history::{self, Event};
 use crate::ops;
 use crate::store::{data_dir, ensure_dirs, State, TaskStatus};
@@ -155,7 +156,11 @@ esac"#,
 }
 
 /// `claude` que llama al de verdad con `--settings`, para que los hooks
-/// sigan funcionando cuando lo vuelves a abrir a mano.
+/// sigan funcionando cuando lo vuelves a abrir a mano. Con headroom pasa
+/// primero por él. headroom busca `claude` en el PATH y vuelve a dar con
+/// este script: `PASTOR_VIA_HEADROOM` evita el bucle, y `ANTHROPIC_BASE_URL`
+/// (que define headroom) que tu alias `claude='headroom wrap claude'` lo
+/// envuelva dos veces.
 fn write_claude_shim(bin: &PathBuf) -> Result<()> {
     let real = std::env::var_os("PATH").and_then(|p| {
         std::env::split_paths(&p)
@@ -166,8 +171,15 @@ fn write_claude_shim(bin: &PathBuf) -> Result<()> {
     let Some(real) = real else {
         return Ok(());
     };
+    let via_headroom = agent::headroom().map_or(String::new(), |h| {
+        format!(
+            "[ -z \"$PASTOR_VIA_HEADROOM$ANTHROPIC_BASE_URL\" ] && \
+             PASTOR_VIA_HEADROOM=1 exec {} wrap claude -- \"$@\"\n",
+            shell_quote(&h.to_string_lossy())
+        )
+    });
     let script = format!(
-        "#!/bin/sh\nexec {} --settings {} \"$@\"\n",
+        "#!/bin/sh\n{via_headroom}exec {} --settings {} \"$@\"\n",
         shell_quote(&real.to_string_lossy()),
         shell_quote(&claude_settings()?.to_string_lossy()),
     );

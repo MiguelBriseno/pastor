@@ -303,6 +303,12 @@ Entra con `⏎` y escribe `claude`, `codex` u `opencode` en la terminal que qued
 abre otra vez con los hooks de pastor, así que su estado se sigue viendo bien. Mientras el agente
 esté cerrado, pastor no le envía mensajes ni tareas, para que no se ejecuten como comandos.
 
+**Uso [headroom](https://github.com/headroomlabs-ai/headroom). ¿pastor lo usa?**
+Sí. Si `headroom` está en tu `PATH`, pastor lanza Claude Code con `headroom wrap claude`, también
+cuando lo vuelves a abrir a mano con `claude` tras un `/exit`. Un alias como
+`alias claude='headroom wrap claude'` no basta: pastor lanza los agentes sin pasar por tu shell, así
+que el alias no aplica. Para usar Claude Code sin headroom, pon `PASTOR_HEADROOM=0`.
+
 **¿Cómo paso del agente a su terminal?**
 Dentro de la sesión, pulsa `Ctrl-b` y luego la flecha `→` o `←`. También puedes hacer clic en el
 panel.

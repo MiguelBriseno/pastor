@@ -87,9 +87,46 @@ pub fn agent_panes(agent_id: &str) -> AgentPanes {
 fn agent_gone(pane: &tmux::Pane) -> bool {
     match pane.command.as_str() {
         "sh" => pane.exited,
-        // Instalados con npm o bun, los agentes aparecen como su intérprete.
-        cmd => !(Kind::ALL.iter().any(|k| k.bin() == cmd) || cmd == "node" || cmd == "bun"),
+        cmd if is_agent_command(cmd) => false,
+        // Otro programa en primer plano puede estar envolviendo al agente
+        // (headroom, por ejemplo, aparece como `python`).
+        _ => !pane.pid.is_some_and(runs_agent),
     }
+}
+
+/// Si el agente corre en primer plano en el panel que arrancó con `pid`:
+/// algún proceso del grupo que tiene la terminal es un agente. Así se le
+/// encuentra detrás de un envoltorio como headroom, y no cuenta uno que
+/// quedó en segundo plano.
+fn runs_agent(pid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,pgid=,tpgid=,comm="])
+        .output()
+    else {
+        return false;
+    };
+    let procs: Vec<(u32, i64, i64, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let pid = f.next()?.parse().ok()?;
+            let pgid = f.next()?.parse().ok()?;
+            let tpgid = f.next()?.parse().ok()?;
+            // En macOS `comm` es la ruta completa.
+            let comm = f.collect::<Vec<_>>().join(" ");
+            let name = Path::new(&comm).file_name()?.to_string_lossy().into_owned();
+            Some((pid, pgid, tpgid, name))
+        })
+        .collect();
+    let Some(&(_, _, fg, _)) = procs.iter().find(|p| p.0 == pid) else {
+        return false;
+    };
+    fg > 0 && procs.iter().any(|p| p.1 == fg && is_agent_command(&p.3))
+}
+
+/// Instalados con npm o bun, los agentes aparecen como su intérprete.
+fn is_agent_command(cmd: &str) -> bool {
+    Kind::ALL.iter().any(|k| k.bin() == cmd) || cmd == "node" || cmd == "bun"
 }
 
 /// Panel al que hay que hablarle para llegar al agente. Falla si el agente
