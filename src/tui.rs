@@ -555,7 +555,11 @@ impl App {
             Mode::Send { agent, mut input } => {
                 if key.code == KeyCode::Enter {
                     if !input.trim().is_empty() {
-                        ops::send(&agent, &input)?;
+                        // Si falla (el agente salió, por ejemplo), lo escrito no se pierde.
+                        if let Err(e) = ops::send(&agent, &input) {
+                            self.mode = Mode::Send { agent, input };
+                            return Err(e);
+                        }
                         self.set_flash(format!("Mensaje enviado a {}", self.agent_name(&agent)));
                     }
                 } else {
@@ -565,7 +569,10 @@ impl App {
             }
             Mode::Term { agent, mut input } => {
                 if key.code == KeyCode::Enter {
-                    ops::open_term(&agent, Some(&input))?;
+                    if let Err(e) = ops::open_term(&agent, Some(&input)) {
+                        self.mode = Mode::Term { agent, input };
+                        return Err(e);
+                    }
                     self.set_flash(format!(
                         "Terminal abierta junto a {} · ⏎ para entrar",
                         self.agent_name(&agent)
@@ -582,7 +589,13 @@ impl App {
                 mut field,
             } => match key.code {
                 KeyCode::Enter if !title.trim().is_empty() => {
-                    let t = ops::add_task(title.trim().to_string(), desc.trim().to_string())?;
+                    let t = match ops::add_task(title.trim().to_string(), desc.trim().to_string()) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            self.mode = Mode::NewTask { title, desc, field };
+                            return Err(e);
+                        }
+                    };
                     self.refresh();
                     let i = self.state.tasks.iter().position(|x| x.id == t.id);
                     self.task_sel.select(i);

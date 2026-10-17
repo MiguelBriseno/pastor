@@ -76,10 +76,24 @@ pub fn handle(event: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ruta de este binario para los hooks. En Linux, si se reinstaló mientras
+/// corría (`cargo install` lo reemplaza), `current_exe` añade " (deleted)" a
+/// una ruta en la que ya está el binario nuevo.
+fn pastor_exe() -> Result<PathBuf> {
+    Ok(strip_deleted(std::env::current_exe()?))
+}
+
+fn strip_deleted(exe: PathBuf) -> PathBuf {
+    match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) => PathBuf::from(s),
+        None => exe,
+    }
+}
+
 /// Escribe el settings.json que se pasa a `claude --settings`.
 /// Se suma a tu configuración normal de Claude Code, no la reemplaza.
 pub fn claude_settings() -> Result<PathBuf> {
-    let exe = shell_quote(&std::env::current_exe()?.to_string_lossy());
+    let exe = shell_quote(&pastor_exe()?.to_string_lossy());
     let hook = |ev: &str| json!([{ "hooks": [{ "type": "command", "command": format!("{exe} hook {ev}") }] }]);
     let tool_hook = |ev: &str| json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": format!("{exe} hook {ev}") }] }]);
     let settings = json!({
@@ -174,4 +188,16 @@ fn write_claude_shim(bin: &PathBuf) -> Result<()> {
     fs::write(&path, script)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quita_el_sufijo_de_binario_reemplazado() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(strip_deleted(p("/bin/pastor (deleted)")), p("/bin/pastor"));
+        assert_eq!(strip_deleted(p("/bin/pastor")), p("/bin/pastor"));
+    }
 }
