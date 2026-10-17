@@ -47,15 +47,25 @@ pub fn screen_hash(screen: &str) -> u64 {
 /// pie, donde Claude Code pone y quita pistas solo (`/effort`, el modo…).
 const FOOTER: usize = 5;
 
+/// Viñeta de una herramienta pendiente, que parpadea mientras espera
+/// permiso: `●`, o `⏺` en macOS.
+const BLINK: [char; 2] = ['●', '⏺'];
+
+/// `screen` sin el parpadeo de la viñeta, que no es actividad del agente.
+fn normalize_blink(screen: &str) -> String {
+    screen.replace(BLINK, " ")
+}
+
+/// Hash de la pantalla para el observador.
+pub fn activity_hash(screen: &str) -> u64 {
+    screen_hash(&normalize_blink(screen))
+}
+
 /// Huella de la pantalla para saber si un hook sigue valiendo. Responder un
-/// diálogo o interrumpir el turno cambia lo que hay encima del pie. El `●`
-/// de una herramienta pendiente parpadea mientras espera permiso: no cuenta.
+/// diálogo o interrumpir el turno cambia lo que hay encima del pie.
 pub fn fingerprint(screen: &str) -> u64 {
-    let lines: Vec<String> = screen
-        .trim_end()
-        .lines()
-        .map(|l| l.trim_end().replace('●', " "))
-        .collect();
+    let screen = normalize_blink(screen);
+    let lines: Vec<&str> = screen.trim_end().lines().map(str::trim_end).collect();
     screen_hash(&lines[..lines.len().saturating_sub(FOOTER)].join("\n"))
 }
 
@@ -77,11 +87,44 @@ pub fn clear_status(id: &str) {
     let _ = fs::remove_file(data_dir().join("status").join(format!("{id}.lock")));
 }
 
+/// Borra los estados de hook de agentes que ya no existen. Con el candado de
+/// `state.json`: un agente entra ahí antes de lanzarse, así que uno recién
+/// creado no pierde su estado.
+pub fn prune_status() {
+    let _ = store::State::with_lock(|s| prune_status_in(&data_dir().join("status"), s));
+}
+
+fn prune_status_in(dir: &Path, state: &store::State) {
+    let Ok(dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        // Solo `<id>.json` y `<id>.lock`: los temporales de una escritura en
+        // curso (`<id>.json.<sufijo>.tmp`) son de su hook.
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".json").or_else(|| n.strip_suffix(".lock")))
+        else {
+            continue;
+        };
+        if !state.agents.iter().any(|a| a.id == id) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Llamado por Claude Code. Nunca debe fallar ruidosamente.
 pub fn handle(event: &str) -> Result<()> {
     let Ok(id) = std::env::var("PASTOR_AGENT") else {
         return Ok(());
     };
+    // Un proceso que heredó `PASTOR_AGENT` de un agente ya cerrado (p. ej. un
+    // servicio que arrancó desde él y lanza sus propios `claude`) no debe
+    // revivir su estado. Si no se puede leer el estado, mejor seguir.
+    if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
+        return Ok(());
+    }
     if event == "settle" {
         return settle(&id);
     }
@@ -351,6 +394,34 @@ mod tests {
         let p = |s: &str| PathBuf::from(s);
         assert_eq!(strip_deleted(p("/bin/pastor (deleted)")), p("/bin/pastor"));
         assert_eq!(strip_deleted(p("/bin/pastor")), p("/bin/pastor"));
+    }
+
+    #[test]
+    fn borra_los_estados_de_agentes_que_ya_no_existen() {
+        let dir = TempHome(std::env::temp_dir().join(format!(
+            "pastor-prune-{}-{}",
+            std::process::id(),
+            store::unique_suffix()
+        )));
+        fs::create_dir_all(&dir.0).unwrap();
+        for f in [
+            "a1.json",
+            "a1.lock",
+            "a2.json",
+            "a2.lock",
+            "a1.json.9-1.tmp",
+        ] {
+            fs::write(dir.0.join(f), "{}").unwrap();
+        }
+        let mut state = store::State::default();
+        state.add_agent(agent::Kind::Claude, PathBuf::from("/tmp"), None);
+        prune_status_in(&dir.0, &state);
+        let mut quedan: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        quedan.sort();
+        assert_eq!(quedan, ["a1.json", "a1.json.9-1.tmp", "a1.lock"]);
     }
 
     /// HOME temporal que se borra al terminar, aunque falle la prueba.

@@ -125,7 +125,7 @@ Un estado de hook se considera viejo cuando la pantalla cambió después de él;
   espera a que la pantalla deje de cambiar (tres capturas iguales seguidas) y guarda su huella en
   `status/<id>.json`: hash FNV-1a y tamaño del panel. La huella no incluye las últimas 5 líneas
   (la caja del prompt y el pie, donde Claude Code pone y quita pistas solo) y trata como espacio el
-  `●` que parpadea mientras una herramienta espera permiso. Si la pantalla actual es otra, el hook es viejo aunque nadie la viera
+  `●` (o `⏺` en macOS) que parpadea mientras una herramienta espera permiso. Si la pantalla actual es otra, el hook es viejo aunque nadie la viera
   cambiar, como en `pastor ls` o una TUI recién abierta. Con otro tamaño de panel no se compara.
 
   El compromiso: cualquier otro cambio encima del pie con el mismo tamaño descarta el hook, también
@@ -140,6 +140,12 @@ Al lanzar Claude Code se le pasa `--settings ~/.local/share/pastor/claude-settin
 variable `PASTOR_AGENT=<id>`. Los hooks llaman a `pastor hook <evento>`, que escribe
 `status/<id>.json`. Con el evento `Stop`, además, la tarea del agente pasa a *por revisar* aunque
 la TUI esté cerrada.
+
+Un proceso que se arrancó desde un agente hereda su `PASTOR_AGENT`; si lanza sus propios `claude`
+(p. ej. un servicio en segundo plano), sus hooks llegan con ese id. Si el agente ya no está en
+`state.json`, el hook no escribe nada. La TUI y `pastor ls` borran al arrancar los estados de
+agentes que ya no existen, con el candado de `state.json` tomado para no llevarse los de un agente
+recién creado.
 
 ### Envío de mensajes
 
