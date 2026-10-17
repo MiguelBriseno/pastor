@@ -215,13 +215,14 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
         .spawn()
         .context("no pude ejecutar tmux")?;
     // Cerrar la entrada y esperarlo aunque la escritura falle, para que no
-    // quede un proceso zombi.
+    // quede un proceso zombi. Si tmux salió antes de leerla, su error explica
+    // más que el «Broken pipe» de la escritura.
     let written = child.stdin.take().unwrap().write_all(text.as_bytes());
     let status = child.wait()?;
-    written?;
     if !status.success() {
-        bail!("tmux load-buffer falló");
+        bail!("tmux load-buffer falló ({status})");
     }
+    written.context("no pude pasarle el texto a tmux load-buffer")?;
     run(&["paste-buffer", "-p", "-d", "-b", &buf, "-t", name])?;
     thread::sleep(Duration::from_millis(200));
     run(&["send-keys", "-t", name, "Enter"])?;

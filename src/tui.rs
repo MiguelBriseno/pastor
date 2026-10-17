@@ -1718,21 +1718,18 @@ fn field_lines(name: &str, value: &str, active: bool, w: u16) -> Vec<Line<'stati
     let avail = (w as usize).saturating_sub(LABEL_W + 3).max(1);
     let mut chunks: Vec<String> = Vec::new();
     for line in value.split('\n') {
-        let mut rest: &[char] = &line.chars().collect::<Vec<_>>();
+        let mut rest = line;
         loop {
             let fits = text::fit(rest, avail);
             if fits == rest.len() {
                 break;
             }
             // Corta después del último espacio que quepa; si no hay, a media palabra.
-            let cut = rest[..fits]
-                .iter()
-                .rposition(|c| *c == ' ')
-                .map_or(fits, |i| i + 1);
-            chunks.push(rest[..cut].iter().collect());
+            let cut = rest[..fits].rfind(' ').map_or(fits, |i| i + 1);
+            chunks.push(rest[..cut].to_string());
             rest = &rest[cut..];
         }
-        chunks.push(rest.iter().collect());
+        chunks.push(rest.to_string());
     }
     let n = chunks.len();
     chunks
@@ -1853,6 +1850,17 @@ mod tests {
 
     fn statuses(list: &[(&str, Status)]) -> HashMap<String, Status> {
         list.iter().map(|&(id, s)| (id.to_string(), s)).collect()
+    }
+
+    #[test]
+    fn los_campos_caben_en_el_modal_con_emoji() {
+        let value = "✔️ hecho ".repeat(20) + &"👨‍👩‍👧".repeat(20);
+        let lines = field_lines("Mensaje", &value, false, 40);
+        assert!(lines.len() > 1);
+        // Lo que mide ratatui al pintar, sin el borde ni el hueco del cursor.
+        assert!(lines.iter().all(|l| l.width() <= 40 - 3));
+        let joined: String = lines.iter().map(|l| l.spans[1].content.as_ref()).collect();
+        assert_eq!(joined, value);
     }
 
     #[test]
