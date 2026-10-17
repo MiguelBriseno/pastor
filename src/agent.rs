@@ -166,6 +166,11 @@ const BLOCKED: &[&str] = &[
 /// Textos que muestran los tres agentes mientras trabajan.
 const WORKING: &[&str] = &["esc to interrupt", "esc interrupt"];
 
+/// Lo que deja Claude Code al interrumpir un turno (p. ej. al rechazar un
+/// permiso con Esc). No lanza `Stop`, así que su último hook puede ser un
+/// `blocked` que ya no vale.
+const INTERRUPTED: &[&str] = &["what should claude do instead"];
+
 pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     if obs.dead || obs.gone {
         return Status::Dead;
@@ -186,8 +191,9 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
         obs.last_change
             .is_none_or(|c| h.at + Duration::seconds(2) >= c)
     });
+    let interrupted = INTERRUPTED.iter().any(|p| tail.contains(p));
     match hook.map(|h| h.state.as_str()) {
-        Some("blocked") => return Status::Blocked,
+        Some("blocked") if !interrupted => return Status::Blocked,
         Some("idle") => return Status::Idle,
         Some("working") if changed_recently => return Status::Working,
         _ => {}
@@ -320,6 +326,14 @@ mod tests {
             ..obs("")
         };
         assert_eq!(classify(&o, Some(&hook("blocked", 10))), Status::Working);
+    }
+
+    #[test]
+    fn rechazar_un_permiso_no_deja_esperando() {
+        let o = obs(
+            "❯ curl -s https://example.com\n  ⎿  Interrupted · What should Claude do instead?\n❯ ",
+        );
+        assert_eq!(classify(&o, Some(&hook("blocked", 30))), Status::Idle);
     }
 
     #[test]

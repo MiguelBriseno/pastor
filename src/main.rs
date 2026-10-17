@@ -39,7 +39,7 @@ enum Cmd {
         #[arg(long, value_name = "NOMBRE")]
         name: Option<String>,
         /// Primer mensaje para el agente
-        #[arg(short, long, value_name = "TEXTO")]
+        #[arg(short, long, allow_hyphen_values = true, value_name = "TEXTO")]
         prompt: Option<String>,
     },
     /// Lista los agentes y su estado
@@ -104,7 +104,7 @@ enum TaskCmd {
         #[arg(value_name = "TÍTULO")]
         title: String,
         /// Descripción con los detalles para el agente
-        #[arg(short, long, value_name = "TEXTO")]
+        #[arg(short, long, allow_hyphen_values = true, value_name = "TEXTO")]
         description: Option<String>,
     },
     /// Lista las tareas
@@ -346,5 +346,16 @@ mod tests {
             term_command(&args(&["echo", "it's"])).as_deref(),
             Some(r"echo 'it'\''s'")
         );
+    }
+
+    #[test]
+    fn textos_que_empiezan_por_guion() {
+        let cli = Cli::try_parse_from(["pastor", "new", "codex", "-p", "-v revisa"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::New { prompt: Some(p), .. }) if p == "-v revisa"));
+        let cli = Cli::try_parse_from(["pastor", "task", "add", "t", "-d", "--sin tests"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Task(TaskCmd::Add { description: Some(d), .. })) if d == "--sin tests"
+        ));
     }
 }
