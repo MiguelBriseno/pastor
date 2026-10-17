@@ -29,6 +29,9 @@ pub fn new_agent(
     let cwd = cwd
         .canonicalize()
         .with_context(|| format!("el directorio {} no existe", cwd.display()))?;
+    if !cwd.is_dir() {
+        bail!("{} no es un directorio", cwd.display());
+    }
     let cmd = kind.launch_command(prompt)?;
     let agent = State::update(|s| Ok(s.add_agent(kind, cwd, name)))?;
     hooks::clear_status(&agent.id);
@@ -257,34 +260,46 @@ pub fn suggest_term_cmd(agent: &Agent) -> String {
 }
 
 pub fn kill_agent(agent_key: &str) -> Result<()> {
-    let agent = State::load()?.find_agent(agent_key)?.clone();
-    let id = agent.id.clone();
     // Primero fuera del estado y después la sesión: si la TUI lo mirara entre
-    // medias, lo vería muerto y tomaría su tarea por terminada.
-    State::update(|s| {
-        s.agents.retain(|a| a.id != id);
-        for t in s
-            .tasks
-            .iter_mut()
-            .filter(|t| t.agent.as_deref() == Some(&id))
-        {
-            release(t, &mut record_status);
-        }
-        Ok(())
-    })?;
-    let _ = tmux::kill_session(&id);
-    hooks::clear_status(&id);
+    // medias, lo vería muerto y tomaría su tarea por terminada. Se busca dentro
+    // del candado: si dos lo matan a la vez, solo uno lo encuentra, y el fin
+    // de la sesión no queda dos veces en el historial.
+    let agent = State::update(|s| remove_agent(s, agent_key, &mut record_status))?;
+    let _ = tmux::kill_session(&agent.id);
+    hooks::clear_status(&agent.id);
     history::record(Event::AgentEnded {
-        agent: id.clone(),
+        agent: agent.id.clone(),
         kind: agent.kind,
         secs: (Utc::now() - agent.created_at).num_seconds(),
     });
     Ok(())
 }
 
+/// Saca al agente del estado y libera su tarea.
+fn remove_agent(
+    s: &mut State,
+    agent_key: &str,
+    record: &mut impl FnMut(&Task, TaskStatus),
+) -> Result<Agent> {
+    let agent = s.find_agent(agent_key)?.clone();
+    s.agents.retain(|a| a.id != agent.id);
+    for t in s
+        .tasks
+        .iter_mut()
+        .filter(|t| t.agent.as_deref() == Some(&agent.id))
+    {
+        release(t, record);
+    }
+    Ok(agent)
+}
+
 pub enum AssignTarget {
     Existing(String),
-    New { kind: Kind, cwd: PathBuf },
+    /// Sin `cwd`, en el directorio actual.
+    New {
+        kind: Kind,
+        cwd: Option<PathBuf>,
+    },
 }
 
 /// Envía la tarea a un agente (existente o nuevo) y la marca "en curso".
@@ -296,29 +311,54 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
         prompt.push_str("\n\n");
         prompt.push_str(&task.description);
     }
-    let agent = match target {
+    let (agent, created) = match target {
         AssignTarget::Existing(key) => {
             let a = state.find_agent(&key)?.clone();
             tmux::send_text(&agent_target(&a)?, &prompt)?;
-            a
+            (a, false)
         }
-        AssignTarget::New { kind, cwd } => new_agent(kind, Some(cwd), None, Some(&prompt))?,
+        AssignTarget::New { kind, cwd } => (new_agent(kind, cwd, None, Some(&prompt))?, true),
     };
-    State::update(|s| link_task(s, &task.id, &agent.id, &mut record_status))?;
+    // Lo que pasó entre leer la tarea y ahora (otra asignación, la tarea
+    // borrada o cerrada) lo resuelve `link_task` dentro del candado.
+    let linked =
+        State::update(|s| link_task(s, &task.id, &agent.id, task.status, &mut record_status));
+    if let Err(e) = linked {
+        // Un agente lanzado solo para esta tarea no tiene nada que hacer.
+        if created {
+            let _ = kill_agent(&agent.id);
+            bail!("{e:#}; se terminó {}", agent.name);
+        }
+        bail!("{e:#}; {} ya recibió el texto", agent.name);
+    }
     Ok(agent)
 }
 
-/// Deja `task_id` en curso con `agent_id`, y solo con él. `record` anota cada
-/// cambio de estado antes de hacerlo.
+/// Deja `task_id` en curso con `agent_id`, y solo con él. `seen` es el estado
+/// de la tarea cuando se pidió asignarla. `record` anota cada cambio de estado
+/// antes de hacerlo.
 fn link_task(
     s: &mut State,
     task_id: &str,
     agent_id: &str,
+    seen: TaskStatus,
     record: &mut impl FnMut(&Task, TaskStatus),
 ) -> Result<()> {
     // Lo pudieron matar desde otro proceso mientras se le mandaba el prompt.
     if !s.agents.iter().any(|a| a.id == agent_id) {
         bail!("el agente {agent_id} ya no existe");
+    }
+    match s.find_task(task_id) {
+        Err(_) => bail!("la tarea {task_id} se borró mientras se asignaba"),
+        // Alguien la cerró entre medias: eso vale más que reabrirla. Asignar
+        // una tarea que ya estaba cerrada sí la reabre.
+        Ok(t) if t.status != seen && matches!(t.status, TaskStatus::Review | TaskStatus::Done) => {
+            bail!(
+                "la tarea {task_id} pasó a «{}» mientras se asignaba",
+                t.status.label()
+            )
+        }
+        Ok(_) => {}
     }
     let mut previous = None;
     for a in &mut s.agents {
@@ -551,7 +591,8 @@ mod tests {
     }
 
     fn link(s: &mut State, task: &str, agent: &str) {
-        link_task(s, task, agent, &mut |_, _| {}).unwrap();
+        let seen = status(s, task);
+        link_task(s, task, agent, seen, &mut |_, _| {}).unwrap();
     }
 
     fn turn(s: &mut State, agent: &str) -> Option<String> {
@@ -588,7 +629,7 @@ mod tests {
     #[test]
     fn no_asigna_a_un_agente_que_ya_no_existe() {
         let mut s = two_and_two();
-        assert!(link_task(&mut s, "t1", "a9", &mut |_, _| {}).is_err());
+        assert!(link_task(&mut s, "t1", "a9", TaskStatus::Todo, &mut |_, _| {}).is_err());
         assert_eq!(status(&s, "t1"), TaskStatus::Todo);
     }
 
@@ -607,6 +648,59 @@ mod tests {
         s.find_task_mut("t1").unwrap().status = TaskStatus::Done;
         assert_eq!(turn(&mut s, "a1"), None);
         assert_eq!(status(&s, "t1"), TaskStatus::Done);
+    }
+
+    #[test]
+    fn dos_asignaciones_a_la_vez_dejan_la_tarea_con_la_ultima() {
+        // Las dos leyeron el estado antes de que ninguna enlazara: cada
+        // enlace se hace dentro del candado y el último manda.
+        let mut s = two_and_two();
+        link(&mut s, "t2", "a2");
+        link(&mut s, "t1", "a1");
+        link(&mut s, "t1", "a2");
+        assert_eq!(s.find_agent("a1").unwrap().task, None);
+        assert_eq!(s.find_agent("a2").unwrap().task.as_deref(), Some("t1"));
+        assert_eq!(s.find_task("t1").unwrap().agent.as_deref(), Some("a2"));
+        // La que a2 llevaba antes queda libre.
+        let t2 = s.find_task("t2").unwrap();
+        assert_eq!((t2.status, t2.agent.clone()), (TaskStatus::Todo, None));
+    }
+
+    #[test]
+    fn asignar_una_tarea_borrada_entre_medias_no_toca_nada() {
+        let mut s = two_and_two();
+        link(&mut s, "t2", "a1");
+        s.tasks.retain(|t| t.id != "t1");
+        let err = link_task(&mut s, "t1", "a1", TaskStatus::Todo, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("se borró"), "{err}");
+        assert_eq!(s.find_agent("a1").unwrap().task.as_deref(), Some("t2"));
+        assert_eq!(status(&s, "t2"), TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn no_reabre_una_tarea_cerrada_mientras_se_asignaba() {
+        let mut s = two_and_two();
+        s.find_task_mut("t1").unwrap().status = TaskStatus::Done;
+        let err = link_task(&mut s, "t1", "a1", TaskStatus::Todo, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("hecha"), "{err}");
+        assert_eq!(status(&s, "t1"), TaskStatus::Done);
+        assert_eq!(s.find_agent("a1").unwrap().task, None);
+        // Si ya estaba cerrada al pedirlo, asignarla la reabre.
+        link(&mut s, "t1", "a1");
+        assert_eq!(status(&s, "t1"), TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn matar_dos_veces_solo_cuenta_una() {
+        let mut s = two_and_two();
+        link(&mut s, "t1", "a1");
+        let mut changes = Vec::new();
+        let a = remove_agent(&mut s, "a1", &mut |t, to| changes.push((t.id.clone(), to))).unwrap();
+        assert_eq!(a.id, "a1");
+        assert_eq!(changes, [("t1".to_string(), TaskStatus::Todo)]);
+        assert_eq!(s.find_task("t1").unwrap().agent, None);
+        // El segundo ya no lo encuentra: ni sesión que matar ni otro fin anotado.
+        assert!(remove_agent(&mut s, "a1", &mut |_, _| panic!("otro cambio")).is_err());
     }
 
     fn procs(list: &[(u32, i64, i64, &str)]) -> Procs {

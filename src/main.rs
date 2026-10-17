@@ -308,10 +308,7 @@ fn task_cmd(cmd: TaskCmd) -> Result<()> {
         } => {
             let target = match (agent, new) {
                 (Some(a), _) => AssignTarget::Existing(a),
-                (None, Some(kind)) => AssignTarget::New {
-                    kind,
-                    cwd: cwd.unwrap_or(std::env::current_dir()?),
-                },
+                (None, Some(kind)) => AssignTarget::New { kind, cwd },
                 (None, None) => unreachable!("clap exige --agent o --new"),
             };
             let a = ops::assign_task(&task, target)?;

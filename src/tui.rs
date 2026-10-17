@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use chrono::{Local, NaiveDate};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
@@ -528,7 +529,11 @@ impl App {
                     let kind = Kind::ALL[f.kind];
                     let name = Some(f.name.clone()).filter(|s| !s.trim().is_empty());
                     let prompt = Some(f.prompt.clone()).filter(|s| !s.trim().is_empty());
-                    let cwd = expand(&f.cwd);
+                    let Some(cwd) = expand(&f.cwd) else {
+                        self.set_flash(NO_CWD.to_string());
+                        self.mode = Mode::NewAgent(f);
+                        return Ok(());
+                    };
                     self.set_flash(format!("Lanzando {kind}…"));
                     self.actions.run(Some(Mode::NewAgent(f)), move || {
                         let a = ops::new_agent(kind, Some(cwd), name, prompt.as_deref())?;
@@ -638,9 +643,16 @@ impl App {
                 KeyCode::Enter => {
                     let target = match &f.options[f.sel] {
                         AssignOpt::Agent(id, _) => AssignTarget::Existing(id.clone()),
-                        AssignOpt::New(kind) => AssignTarget::New {
-                            kind: *kind,
-                            cwd: expand(&f.cwd),
+                        AssignOpt::New(kind) => match expand(&f.cwd) {
+                            Some(cwd) => AssignTarget::New {
+                                kind: *kind,
+                                cwd: Some(cwd),
+                            },
+                            None => {
+                                self.set_flash(NO_CWD.to_string());
+                                self.mode = Mode::Assign(f);
+                                return Ok(());
+                            }
                         },
                     };
                     let task = f.task.clone();
@@ -1447,6 +1459,8 @@ struct Watch {
     tracker: Tracker,
     status: HashMap<String, Status>,
     history: history::Tail,
+    /// Día de las últimas estadísticas: al cambiar se mueve el gráfico.
+    day: Option<NaiveDate>,
 }
 
 impl Watch {
@@ -1464,10 +1478,10 @@ impl Watch {
             }
         }
         self.status = snaps.iter().map(|(id, s)| (id.clone(), s.status)).collect();
-        let stats = self
-            .history
-            .refresh()
-            .then(|| history::stats(self.history.entries()));
+        let today = Local::now().date_naive();
+        let changed = self.history.refresh() || self.day != Some(today);
+        self.day = Some(today);
+        let stats = changed.then(|| self.history.stats(today));
         Some(Pass {
             snaps,
             stats,
@@ -1640,15 +1654,58 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("pánico")
 }
 
+/// Muestra un aviso del sistema. Los lanza, de uno en uno, un único hilo que
+/// espera a cada proceso (para que no quede zombi) sin frenar al observador.
 fn notify(msg: &str) {
+    static QUEUE: Mutex<Option<Sender<String>>> = Mutex::new(None);
+    let mut queue = QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+    let msg = match queue.as_ref().map(|tx| tx.send(msg.to_string())) {
+        Some(Ok(())) => return,
+        Some(Err(e)) => e.0,
+        None => msg.to_string(),
+    };
+    // Sin hilo todavía, o murió: se lanza otro. Si no se puede, se intentará
+    // con el próximo aviso.
+    let (tx, rx) = mpsc::channel::<String>();
+    let spawned = std::thread::Builder::new()
+        .name("avisos".into())
+        .spawn(move || {
+            for msg in rx {
+                show_notice(&msg);
+            }
+        });
+    if spawned.is_ok() && tx.send(msg).is_ok() {
+        *queue = Some(tx);
+    }
+}
+
+/// Cuánto puede tardar un aviso antes de darlo por colgado (notify-send
+/// espera hasta 25 s si nadie atiende las notificaciones).
+const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn show_notice(msg: &str) {
     let child = notify_command(msg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    // Esperarlo, para que no quede un proceso zombi por aviso.
-    if let Ok(mut child) = child {
-        std::thread::spawn(move || child.wait());
+    if let Ok(child) = child {
+        wait_or_kill(child, NOTICE_TIMEOUT);
     }
+}
+
+/// Espera a `child` hasta `timeout`; si se pasa, lo mata para que no retrase
+/// a los siguientes. `false` si hubo que matarlo.
+fn wait_or_kill(mut child: Child, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while let Ok(None) = child.try_wait() {
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -1848,12 +1905,17 @@ fn tilde(p: &std::path::Path) -> String {
     p.display().to_string()
 }
 
-fn expand(s: &str) -> PathBuf {
+/// Sin directorio no se lanza nada: el de la TUI podría ser otro proyecto.
+const NO_CWD: &str = "Error: falta el directorio";
+
+/// La ruta escrita en un formulario, con `~` expandido; `None` si está vacía.
+fn expand(s: &str) -> Option<PathBuf> {
     let s = s.trim();
-    match (s.strip_prefix('~'), dirs::home_dir()) {
+    Some(match (s.strip_prefix('~'), dirs::home_dir()) {
+        _ if s.is_empty() => return None,
         (Some(rest), Some(home)) => home.join(rest.trim_start_matches('/')),
         _ => PathBuf::from(s),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1875,6 +1937,41 @@ mod tests {
 
     fn statuses(list: &[(&str, Status)]) -> HashMap<String, Status> {
         list.iter().map(|&(id, s)| (id.to_string(), s)).collect()
+    }
+
+    #[test]
+    fn un_aviso_colgado_se_mata() {
+        let spawn = |secs: &str| Command::new("sleep").arg(secs).spawn().unwrap();
+        assert!(wait_or_kill(spawn("0"), Duration::from_secs(5)));
+        let start = Instant::now();
+        assert!(!wait_or_kill(spawn("30"), Duration::from_millis(200)));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rutas_de_los_formularios() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand("  "), None);
+        assert_eq!(expand("~"), Some(home.clone()));
+        assert_eq!(expand(" ~/web "), Some(home.join("web")));
+        assert_eq!(expand("/tmp/x"), Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn editar_un_campo() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let mut s = String::from("añ");
+        edit(&mut s, &key(KeyCode::Char('🦀'), KeyModifiers::NONE));
+        edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
+        edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(s, "a");
+        // Ctrl+letra no escribe la letra; Ctrl+U borra todo.
+        edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(s, "a");
+        edit(&mut s, &key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(s, "");
+        edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(s, "");
     }
 
     #[test]

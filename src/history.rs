@@ -142,11 +142,12 @@ fn write(event: &Event) -> Result<()> {
 }
 
 /// El historial leído hasta ahora. Como solo se le añaden líneas, cada
-/// `refresh` lee lo nuevo en vez del archivo entero. Las líneas que no se
-/// entienden (p. ej. eventos de una versión más nueva) se ignoran.
+/// `refresh` lee lo nuevo en vez del archivo entero, y lo suma a los totales
+/// sin guardar las entradas. Las líneas que no se entienden (p. ej. eventos de
+/// una versión más nueva) se ignoran.
 #[derive(Default)]
 pub struct Tail {
-    entries: Vec<Entry>,
+    totals: Totals,
     /// Bytes ya leídos, hasta el último salto de línea.
     offset: u64,
     /// Inode del archivo leído, para notar que lo borraron y se creó otro.
@@ -179,17 +180,20 @@ impl Tail {
         let Some(end) = read.ok().and(buf.iter().rposition(|b| *b == b'\n')) else {
             return reset;
         };
-        self.entries.extend(
-            String::from_utf8_lossy(&buf[..=end])
-                .lines()
-                .filter_map(|l| serde_json::from_str(l).ok()),
-        );
+        for l in String::from_utf8_lossy(&buf[..=end]).lines() {
+            if let Ok(e) = serde_json::from_str(l) {
+                self.totals.add(&e);
+            }
+        }
+        // Del día a día solo hacen falta los del gráfico; la ventana solo avanza.
+        let first_day = Local::now().date_naive() - Duration::days(DAYS as i64 - 1);
+        self.totals.daily.retain(|d, _| *d >= first_day);
         self.offset += end as u64 + 1;
         true
     }
 
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
+    pub fn stats(&self, today: NaiveDate) -> Stats {
+        self.totals.stats(today)
     }
 }
 
@@ -216,21 +220,28 @@ pub struct Stats {
     pub daily: Vec<(NaiveDate, u64)>,
 }
 
-pub fn stats(entries: &[Entry]) -> Stats {
-    let mut s = Stats {
-        by_kind: vec![0; Kind::ALL.len()],
-        ..Stats::default()
-    };
-    let today = Local::now().date_naive();
-    let first_day = today - Duration::days(DAYS as i64 - 1);
-    let mut daily = vec![0u64; DAYS];
-    let mut projects: HashMap<PathBuf, u64> = HashMap::new();
-    let mut done: HashSet<&str> = HashSet::new();
-    let (mut session_total, mut session_n) = (0i64, 0i64);
-    let (mut task_total, mut task_n) = (0i64, 0i64);
+/// Lo acumulado de las entradas leídas: lo que hace falta para las
+/// estadísticas, que dependen además del día de hoy.
+#[derive(Default)]
+struct Totals {
+    since: Option<DateTime<Utc>>,
+    sessions: u64,
+    tasks_created: u64,
+    messages: u64,
+    turns: u64,
+    by_kind: [u64; Kind::ALL.len()],
+    projects: HashMap<PathBuf, u64>,
+    /// Tareas hechas alguna vez: una tarea puede reabrirse y cerrarse otra
+    /// vez, y cuenta una sola.
+    done: HashSet<String>,
+    session_secs: (i64, i64),
+    task_secs: (i64, i64),
+    /// Eventos por día (hora local), solo de los días del gráfico.
+    daily: HashMap<NaiveDate, u64>,
+}
 
-    for e in entries {
-        let day = e.ts.with_timezone(&Local).date_naive();
+impl Totals {
+    fn add(&mut self, e: &Entry) {
         let mut activity = true;
         match &e.event {
             Event::Baseline {
@@ -238,54 +249,68 @@ pub fn stats(entries: &[Entry]) -> Stats {
                 agents,
                 tasks,
             } => {
-                s.since = Some(s.since.map_or(*since, |d| d.min(*since)));
-                s.sessions += u64::from(*agents);
-                s.tasks_created += u64::from(*tasks);
+                self.since = Some(self.since.map_or(*since, |d| d.min(*since)));
+                self.sessions += u64::from(*agents);
+                self.tasks_created += u64::from(*tasks);
                 activity = false;
             }
             Event::AgentStarted { kind, cwd, .. } => {
-                s.sessions += 1;
+                self.sessions += 1;
                 if let Some(i) = Kind::ALL.iter().position(|k| k == kind) {
-                    s.by_kind[i] += 1;
+                    self.by_kind[i] += 1;
                 }
-                *projects.entry(cwd.clone()).or_default() += 1;
+                *self.projects.entry(cwd.clone()).or_default() += 1;
             }
             Event::AgentEnded { secs, .. } => {
-                session_total += secs;
-                session_n += 1;
+                self.session_secs.0 += secs;
+                self.session_secs.1 += 1;
                 activity = false;
             }
-            Event::TaskCreated { .. } => s.tasks_created += 1,
+            Event::TaskCreated { .. } => self.tasks_created += 1,
             Event::TaskStatus { task, to, secs } => {
-                // Una tarea puede reabrirse y cerrarse otra vez: cuenta una vez.
-                if *to == TaskStatus::Done && done.insert(task) {
-                    s.tasks_done += 1;
-                    task_total += secs;
-                    task_n += 1;
+                if *to == TaskStatus::Done && self.done.insert(task.clone()) {
+                    self.task_secs.0 += secs;
+                    self.task_secs.1 += 1;
                 }
             }
             Event::TaskDeleted { .. } => activity = false,
-            Event::MessageSent { .. } => s.messages += 1,
-            Event::Turn { .. } => s.turns += 1,
+            Event::MessageSent { .. } => self.messages += 1,
+            Event::Turn { .. } => self.turns += 1,
         }
-        s.since = Some(s.since.map_or(e.ts, |d| d.min(e.ts)));
-        if activity && day >= first_day && day <= today {
-            daily[(day - first_day).num_days() as usize] += 1;
+        self.since = Some(self.since.map_or(e.ts, |d| d.min(e.ts)));
+        if activity {
+            *self
+                .daily
+                .entry(e.ts.with_timezone(&Local).date_naive())
+                .or_default() += 1;
         }
     }
 
-    s.agent_secs = session_total;
-    s.avg_session_secs = (session_n > 0).then(|| session_total / session_n);
-    s.avg_task_secs = (task_n > 0).then(|| task_total / task_n);
-    let mut projects: Vec<_> = projects.into_iter().collect();
-    projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    s.projects = projects;
-    s.daily = daily
-        .into_iter()
-        .enumerate()
-        .map(|(i, n)| (first_day + Duration::days(i as i64), n))
-        .collect();
-    s
+    fn stats(&self, today: NaiveDate) -> Stats {
+        let avg = |(total, n): (i64, i64)| (n > 0).then(|| total / n);
+        let mut projects: Vec<_> = self.projects.iter().map(|(p, n)| (p.clone(), *n)).collect();
+        projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let first_day = today - Duration::days(DAYS as i64 - 1);
+        Stats {
+            since: self.since,
+            sessions: self.sessions,
+            tasks_created: self.tasks_created,
+            tasks_done: self.done.len() as u64,
+            messages: self.messages,
+            turns: self.turns,
+            avg_session_secs: avg(self.session_secs),
+            avg_task_secs: avg(self.task_secs),
+            agent_secs: self.session_secs.0,
+            by_kind: self.by_kind.to_vec(),
+            projects,
+            daily: (0..DAYS as i64)
+                .map(|i| {
+                    let day = first_day + Duration::days(i);
+                    (day, self.daily.get(&day).copied().unwrap_or(0))
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Duración corta y legible: "45s", "12m", "3h 20m", "2d 5h".
@@ -334,19 +359,91 @@ mod tests {
             .write_all(rest.as_bytes())
             .unwrap();
         assert!(t.refresh_from(&path));
-        assert_eq!(t.entries().len(), 2);
+        assert_eq!(t.stats(Local::now().date_naive()).turns, 2);
 
         // Rehecho más corto: se vuelve a leer desde el principio.
         fs::write(&path, turn("a3")).unwrap();
         assert!(t.refresh_from(&path));
-        assert_eq!(t.entries().len(), 1);
+        assert_eq!(t.stats(Local::now().date_naive()).turns, 1);
 
         // Borrado y vuelto a crear más largo: otro archivo, desde el principio.
         fs::remove_file(&path).unwrap();
         fs::write(&path, [turn("a4"), turn("a5"), turn("a6")].concat()).unwrap();
         assert!(t.refresh_from(&path));
-        assert_eq!(t.entries().len(), 3);
+        assert_eq!(t.stats(Local::now().date_naive()).turns, 3);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn estadisticas_acumuladas() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+        // Al mediodía local, para que el día no dependa de la zona horaria.
+        let at = |days_ago: i64| {
+            (today - Duration::days(days_ago))
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_local_timezone(Local)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let started = |cwd: &str| Event::AgentStarted {
+            agent: "a".into(),
+            kind: Kind::Codex,
+            cwd: cwd.into(),
+        };
+        let done = |task: &str, secs| Event::TaskStatus {
+            task: task.into(),
+            to: TaskStatus::Done,
+            secs,
+        };
+        let events = [
+            (
+                30,
+                Event::Baseline {
+                    since: at(40),
+                    agents: 2,
+                    tasks: 3,
+                },
+            ),
+            (20, started("/b")),
+            (1, started("/a")),
+            (1, started("/a")),
+            (
+                0,
+                Event::AgentEnded {
+                    agent: "a".into(),
+                    kind: Kind::Codex,
+                    secs: 100,
+                },
+            ),
+            (0, done("t1", 60)),
+            // Reabierta y cerrada otra vez: no cuenta de nuevo.
+            (0, done("t1", 600)),
+            (0, done("t2", 120)),
+        ];
+        let mut t = Totals::default();
+        for (days_ago, event) in events {
+            t.add(&Entry {
+                ts: at(days_ago),
+                event,
+            });
+        }
+        let s = t.stats(today);
+        assert_eq!(s.since, Some(at(40)));
+        assert_eq!((s.sessions, s.tasks_created, s.tasks_done), (5, 3, 2));
+        assert_eq!((s.avg_session_secs, s.avg_task_secs), (Some(100), Some(90)));
+        let codex = Kind::ALL.iter().position(|k| *k == Kind::Codex).unwrap();
+        assert_eq!(s.by_kind[codex], 3);
+        assert_eq!(
+            s.projects,
+            [(PathBuf::from("/a"), 2), (PathBuf::from("/b"), 1)]
+        );
+        // Lo de hace 20 días queda fuera del gráfico; el fin de una sesión
+        // no cuenta como actividad.
+        assert_eq!(s.daily.len(), DAYS);
+        assert_eq!(s.daily[DAYS - 1], (today, 3));
+        assert_eq!(s.daily[DAYS - 2].1, 2);
+        assert_eq!(s.daily.iter().map(|d| d.1).sum::<u64>(), 5);
     }
 
     #[test]
