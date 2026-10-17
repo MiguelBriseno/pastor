@@ -135,23 +135,32 @@ fn shell_files(dir: &Path) -> Result<String> {
     )?;
     let zdot = dir.join("zsh");
     fs::create_dir_all(&zdot)?;
-    // Tu `.zshenv` se lee con tu ZDOTDIR, y si lo cambia (p. ej. a
-    // ~/.config/zsh) lo guardamos para el `.zshrc`: zsh debe seguir leyendo
-    // el `.zshrc` de aquí, o el PATH no se ajusta.
+    // PASTOR_ZDOTDIR trae tu ZDOTDIR (vacío si no tenías). Tu `.zshenv` se
+    // lee con él, y si lo cambia (p. ej. a ~/.config/zsh) lo guardamos para
+    // el `.zshrc`: zsh debe seguir leyendo el `.zshrc` de aquí, o el PATH no
+    // se ajusta.
+    let user_zdotdir = "if [ -n \"$PASTOR_ZDOTDIR\" ]; then ZDOTDIR=\"$PASTOR_ZDOTDIR\"; \
+                        else unset ZDOTDIR; fi\n";
     fs::write(
         zdot.join(".zshenv"),
-        "PASTOR_ZSH=\"$ZDOTDIR\"\n\
-         ZDOTDIR=\"${PASTOR_ZDOTDIR:-$HOME}\"\n\
-         [ -f \"$ZDOTDIR/.zshenv\" ] && . \"$ZDOTDIR/.zshenv\"\n\
-         PASTOR_ZDOTDIR=\"$ZDOTDIR\"\n\
-         ZDOTDIR=\"$PASTOR_ZSH\"\n\
-         unset PASTOR_ZSH\n",
+        format!(
+            "PASTOR_ZSH=\"$ZDOTDIR\"\n{user_zdotdir}\
+             [ -f \"${{ZDOTDIR:-$HOME}}/.zshenv\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshenv\"\n\
+             PASTOR_ZDOTDIR=\"${{ZDOTDIR-}}\"\n\
+             ZDOTDIR=\"$PASTOR_ZSH\"\n\
+             unset PASTOR_ZSH\n"
+        ),
     )?;
+    // El /etc/zshrc de macOS pone HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history
+    // cuando ZDOTDIR todavía es el de aquí: lo devolvemos a tu historial.
     fs::write(
         zdot.join(".zshrc"),
         format!(
-            "ZDOTDIR=\"${{PASTOR_ZDOTDIR:-$HOME}}\"\nunset PASTOR_ZDOTDIR\n\
-             [ -f \"$ZDOTDIR/.zshrc\" ] && . \"$ZDOTDIR/.zshrc\"\n{prepend}"
+            "PASTOR_ZSH=\"$ZDOTDIR\"\n{user_zdotdir}unset PASTOR_ZDOTDIR\n\
+             [ \"$HISTFILE\" = \"$PASTOR_ZSH/.zsh_history\" ] && \
+             HISTFILE=\"${{ZDOTDIR:-$HOME}}/.zsh_history\"\n\
+             unset PASTOR_ZSH\n\
+             [ -f \"${{ZDOTDIR:-$HOME}}/.zshrc\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshrc\"\n{prepend}"
         ),
     )?;
 
@@ -159,7 +168,7 @@ fn shell_files(dir: &Path) -> Result<String> {
         r#"sh_="${{SHELL:-/bin/sh}}"
 case "${{sh_##*/}}" in
   bash) exec "$sh_" --rcfile {bashrc} -i ;;
-  zsh) PASTOR_ZDOTDIR="${{ZDOTDIR:-$HOME}}" ZDOTDIR={zdot} exec "$sh_" -i ;;
+  zsh) PASTOR_ZDOTDIR="${{ZDOTDIR-}}" ZDOTDIR={zdot} exec "$sh_" -i ;;
   fish) exec "$sh_" -i -C {fish} ;;
   *) PATH={bin}:"$PATH" exec "$sh_" -i ;;
 esac"#,
@@ -215,26 +224,46 @@ mod tests {
         assert_eq!(strip_deleted(p("/bin/pastor")), p("/bin/pastor"));
     }
 
+    /// HOME temporal que se borra al terminar, aunque falle la prueba.
+    struct TempHome(PathBuf);
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Abre el shell que queda tras salir el agente, con `home` como HOME, y
-    /// devuelve lo que imprime `cmd`. `None` si ese shell no está instalado.
+    /// devuelve las líneas de `cmd` que empiezan con `pastor:` (la
+    /// configuración del sistema puede imprimir otras). `None` si ese shell
+    /// no está instalado.
     fn relaunch(shell: &str, home: &Path, cmd: &str) -> Option<String> {
         use std::io::Write;
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
         let sh = agent::find_in_path(shell)?;
         let dir = home.join("pastor");
         fs::create_dir_all(dir.join("bin")).unwrap();
         let script = shell_files(&dir).unwrap();
-        let mut child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .args(["-c", &script])
             .env("HOME", home)
             .env("SHELL", sh)
             .env_remove("ZDOTDIR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        // Sin terminal de control: un shell interactivo podría escribir en
+        // la tuya o quitársela a cargo.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
         child
             .stdin
             .take()
@@ -242,26 +271,34 @@ mod tests {
             .write_all(cmd.as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let out = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<_> = out.lines().filter(|l| l.starts_with("pastor:")).collect();
+        Some(lines.join("\n"))
     }
 
     #[test]
     fn el_shell_lee_tu_configuracion_y_antepone_el_claude_de_pastor() {
-        let home = std::env::temp_dir().join(format!("pastor-shell-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&home);
+        let home = TempHome(std::env::temp_dir().join(format!(
+            "pastor-shell-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        let home = home.0.as_path();
         fs::create_dir_all(home.join(".config/zsh")).unwrap();
         let bin = home.join("pastor/bin");
-        let expected = format!("rc=si path={}", bin.display());
-        let cmd = "echo \"rc=$DESDE_RC path=${PATH%%:*}\"\n";
+        let expected =
+            |zdotdir: &str| format!("pastor: rc=si path={} zdotdir={zdotdir}", bin.display());
+        let cmd = "echo \"pastor: rc=$DESDE_RC path=${PATH%%:*} zdotdir=${ZDOTDIR-no}\"\n";
 
         fs::write(home.join(".bashrc"), "DESDE_RC=si\n").unwrap();
-        if let Some(out) = relaunch("bash", &home, cmd) {
-            assert_eq!(out, expected, "bash");
+        if let Some(out) = relaunch("bash", home, cmd) {
+            assert_eq!(out, expected("no"), "bash");
         }
 
         fs::write(home.join(".zshrc"), "DESDE_RC=si\n").unwrap();
-        if let Some(out) = relaunch("zsh", &home, cmd) {
-            assert_eq!(out, expected, "zsh");
+        if let Some(out) = relaunch("zsh", home, cmd) {
+            // Sin ZDOTDIR antes, sin ZDOTDIR después.
+            assert_eq!(out, expected("no"), "zsh");
             // Un `.zshenv` que mueve ZDOTDIR no debe saltarse nuestro `.zshrc`.
             fs::remove_file(home.join(".zshrc")).unwrap();
             fs::write(
@@ -270,15 +307,9 @@ mod tests {
             )
             .unwrap();
             fs::write(home.join(".config/zsh/.zshrc"), "DESDE_RC=si\n").unwrap();
-            let cmd = format!("echo \"$ZDOTDIR\"\n{cmd}");
-            let out = relaunch("zsh", &home, &cmd).unwrap();
             let zdotdir = home.join(".config/zsh");
-            assert_eq!(
-                out,
-                format!("{}\n{expected}", zdotdir.display()),
-                "zsh con ZDOTDIR"
-            );
+            let out = relaunch("zsh", home, cmd).unwrap();
+            assert_eq!(out, expected(&zdotdir.to_string_lossy()), "zsh con ZDOTDIR");
         }
-        fs::remove_dir_all(&home).unwrap();
     }
 }

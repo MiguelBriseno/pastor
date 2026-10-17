@@ -1673,7 +1673,7 @@ fn notify_command(msg: &str) -> Command {
 #[cfg(not(target_os = "macos"))]
 fn notify_command(msg: &str) -> Command {
     let mut cmd = Command::new("notify-send");
-    cmd.args(["-a", "pastor", "pastor", msg]);
+    cmd.args(["-a", "pastor", "--", "pastor", msg]);
     cmd
 }
 
