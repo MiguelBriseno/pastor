@@ -204,6 +204,7 @@ Todo lo que hace la interfaz también se puede hacer desde la línea de comandos
 pastor new claude                                   # en el directorio actual
 pastor new codex --cwd ~/proyectos/web --name web   # con directorio y nombre
 pastor new claude -p "arregla los tests que fallan" # con un primer mensaje
+pastor new codex --prompt="-v revisa el diff"       # si el texto empieza por "-", con "="
 
 pastor ls                     # lista agentes y su estado
 pastor attach web             # entra a su terminal (salir con Ctrl-b d)
