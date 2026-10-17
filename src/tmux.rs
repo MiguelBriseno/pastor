@@ -96,9 +96,10 @@ pub fn new_session(
     set_role(&pane, "agent")?;
 
     // Si hasta el shell termina, dejamos el panel visible para poder leer su salida.
-    let target = session(name);
-    let window = format!("{target}:");
-    run(&["set-option", "-w", "-t", &window, "remain-on-exit", "on"])?;
+    // `set-option -t` espera un panel: `=a1` solo, tmux lo busca como panel
+    // y no lo encuentra; con `:` es la ventana actual de esa sesión.
+    let target = format!("{}:", session(name));
+    run(&["set-option", "-w", "-t", &target, "remain-on-exit", "on"])?;
     run(&["set-option", "-g", "focus-events", "on"])?;
     for (opt, val) in [
         ("mouse", "on"),
@@ -257,23 +258,43 @@ pub fn shell_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{kill_session, panes, run, shell_quote};
+    use super::{kill_session, new_session, panes, run, shell_quote};
+    use std::path::Path;
     use std::process::Command;
+
+    /// Sin tmux se omite, salvo en CI, donde se instala.
+    fn have_tmux() -> bool {
+        if Command::new("tmux").arg("-V").output().is_ok() {
+            return true;
+        }
+        assert!(std::env::var_os("CI").is_none(), "falta tmux");
+        eprintln!("sin tmux; se omite");
+        false
+    }
+
+    /// Se mata aunque la prueba falle.
+    struct Session(String);
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let _ = kill_session(&self.0);
+        }
+    }
+
+    #[test]
+    fn crea_y_configura_una_sesion() {
+        if !have_tmux() {
+            return;
+        }
+        let s = Session(format!("nueva{}", std::process::id()));
+        let cmd = ["sleep".to_string(), "30".to_string()];
+        new_session(&s.0, Path::new("/"), &[], &cmd, "true").unwrap();
+        assert!(panes().contains_key(&s.0));
+    }
 
     #[test]
     fn matar_una_sesion_no_toca_otra_que_empieza_igual() {
-        if Command::new("tmux").arg("-V").output().is_err() {
-            // En CI tmux se instala: ahí no vale omitirla.
-            assert!(std::env::var_os("CI").is_none(), "falta tmux");
-            eprintln!("sin tmux; se omite");
+        if !have_tmux() {
             return;
-        }
-        // Se mata aunque la prueba falle.
-        struct Session(String);
-        impl Drop for Session {
-            fn drop(&mut self) {
-                let _ = kill_session(&self.0);
-            }
         }
         // Con el pid, una ejecución anterior interrumpida no estorba.
         let pid = std::process::id();
