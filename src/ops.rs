@@ -1,5 +1,6 @@
 //! Operaciones compartidas entre la CLI y la TUI.
 
+use std::cell::OnceCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -84,29 +85,60 @@ pub fn agent_panes(agent_id: &str) -> AgentPanes {
 /// primer plano. Mientras corre el primer agente es el `sh` que lo lanzó, porque
 /// comparte grupo de procesos con él, hasta que ese `sh` marca la salida. Lo que
 /// se abre después desde el shell interactivo sí queda en primer plano.
-fn agent_gone(pane: &tmux::Pane) -> bool {
+fn agent_gone(pane: &tmux::Pane, procs: &Procs) -> bool {
     match pane.command.as_str() {
         "sh" => pane.exited,
         cmd if is_agent_command(cmd) => false,
         // Otro programa en primer plano puede estar envolviendo al agente
         // (headroom, por ejemplo, aparece como `python`).
-        _ => !pane.pid.is_some_and(runs_agent),
+        _ => !pane.pid.is_some_and(|pid| procs.runs_agent(pid)),
     }
 }
 
-/// Si el agente corre en primer plano en el panel que arrancó con `pid`:
-/// algún proceso del grupo que tiene la terminal es un agente. Así se le
-/// encuentra detrás de un envoltorio como headroom, y no cuenta uno que
-/// quedó en segundo plano.
-fn runs_agent(pid: u32) -> bool {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,pgid=,tpgid=,comm="])
-        .output()
-    else {
-        return false;
-    };
-    let procs: Vec<(u32, i64, i64, String)> = String::from_utf8_lossy(&out.stdout)
-        .lines()
+/// Tabla de procesos del sistema. Se pide a `ps` una sola vez, y solo si algún
+/// panel la necesita, para no lanzarlo por cada agente en cada refresco.
+#[derive(Default)]
+struct Procs(OnceCell<Vec<Proc>>);
+
+struct Proc {
+    pid: u32,
+    pgid: i64,
+    tpgid: i64,
+    name: String,
+}
+
+impl Procs {
+    fn list(&self) -> &[Proc] {
+        self.0.get_or_init(|| {
+            std::process::Command::new("ps")
+                .args(["-A", "-o", "pid=,pgid=,tpgid=,comm="])
+                .output()
+                .map_or_else(
+                    |_| Vec::new(),
+                    |o| parse_ps(&String::from_utf8_lossy(&o.stdout)),
+                )
+        })
+    }
+
+    /// Si el agente corre en primer plano en el panel que arrancó con `pid`:
+    /// algún proceso del grupo que tiene la terminal es un agente. Así se le
+    /// encuentra detrás de un envoltorio como headroom, y no cuenta uno que
+    /// quedó en segundo plano.
+    fn runs_agent(&self, pid: u32) -> bool {
+        let procs = self.list();
+        let Some(fg) = procs.iter().find(|p| p.pid == pid).map(|p| p.tpgid) else {
+            return false;
+        };
+        fg > 0
+            && procs
+                .iter()
+                .any(|p| p.pgid == fg && is_agent_command(&p.name))
+    }
+}
+
+/// Lee la salida de `ps -o pid=,pgid=,tpgid=,comm=`.
+fn parse_ps(out: &str) -> Vec<Proc> {
+    out.lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
             let pid = f.next()?.parse().ok()?;
@@ -115,13 +147,14 @@ fn runs_agent(pid: u32) -> bool {
             // En macOS `comm` es la ruta completa.
             let comm = f.collect::<Vec<_>>().join(" ");
             let name = Path::new(&comm).file_name()?.to_string_lossy().into_owned();
-            Some((pid, pgid, tpgid, name))
+            Some(Proc {
+                pid,
+                pgid,
+                tpgid,
+                name,
+            })
         })
-        .collect();
-    let Some(&(_, _, fg, _)) = procs.iter().find(|p| p.0 == pid) else {
-        return false;
-    };
-    fg > 0 && procs.iter().any(|p| p.1 == fg && is_agent_command(&p.3))
+        .collect()
 }
 
 /// Instalados con npm o bun, los agentes aparecen como su intérprete.
@@ -133,7 +166,7 @@ fn is_agent_command(cmd: &str) -> bool {
 /// no está corriendo: el texto llegaría al shell y se ejecutaría como comando.
 fn agent_target(agent: &Agent) -> Result<String> {
     match agent_panes(&agent.id).agent {
-        Some(p) if !p.dead && !agent_gone(&p) => Ok(p.id),
+        Some(p) if !p.dead && !agent_gone(&p, &Procs::default()) => Ok(p.id),
         _ => bail!(
             "el agente {} no está corriendo; entra a su terminal y vuelve a abrirlo",
             agent.name
@@ -387,11 +420,24 @@ pub struct TermSnapshot {
 
 pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot> {
     let mut all = tmux::panes();
-    state
+    let procs = Procs::default();
+    // Primero si cada agente sigue en su panel, antes de las capturas, para que
+    // `ps` vea lo mismo que acaba de reportar tmux.
+    let panes: Vec<_> = state
         .agents
         .iter()
         .map(|a| {
             let panes = split_panes(all.remove(&a.id).unwrap_or_default());
+            let gone = panes
+                .agent
+                .as_ref()
+                .is_some_and(|p| !p.dead && agent_gone(p, &procs));
+            (a, panes, gone)
+        })
+        .collect();
+    panes
+        .into_iter()
+        .map(|(a, panes, gone)| {
             let pane = panes.agent.as_ref();
             let screen = match pane {
                 Some(p) => tmux::capture(&p.id).unwrap_or_default(),
@@ -403,7 +449,7 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
             });
             let obs = Observation {
                 dead: pane.is_none_or(|p| p.dead),
-                gone: pane.is_some_and(agent_gone),
+                gone,
                 screen: &screen,
                 last_change: tracker.observe(&a.id, &screen, pane.map_or("", |p| p.size.as_str())),
                 age_secs: (Utc::now() - a.created_at).num_seconds(),
@@ -423,4 +469,73 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn procs(list: &[(u32, i64, i64, &str)]) -> Procs {
+        let list: Vec<_> = list
+            .iter()
+            .map(|&(pid, pgid, tpgid, name)| Proc {
+                pid,
+                pgid,
+                tpgid,
+                name: name.to_string(),
+            })
+            .collect();
+        Procs(OnceCell::from(list))
+    }
+
+    #[test]
+    fn agente_detras_de_envoltorio_en_primer_plano() {
+        // zsh (10) cede la terminal al grupo 20: headroom y claude.
+        let p = procs(&[
+            (10, 10, 20, "zsh"),
+            (20, 20, 20, "python"),
+            (21, 20, 20, "claude"),
+        ]);
+        assert!(p.runs_agent(10));
+    }
+
+    #[test]
+    fn agente_en_segundo_plano_no_cuenta() {
+        // claude quedó en el grupo 20, pero la terminal la tiene vim (30).
+        let p = procs(&[
+            (10, 10, 30, "zsh"),
+            (20, 20, 30, "claude"),
+            (30, 30, 30, "vim"),
+        ]);
+        assert!(!p.runs_agent(10));
+    }
+
+    #[test]
+    fn lee_ps_de_linux_y_macos() {
+        let out = "    1     1    -1 systemd\n\
+                   4242  4242  4250 zsh\n\
+                   4250  4250  4250 /Users/yo/.local/bin/claude\n\
+                   4251  4250  4250 Google Chrome Helper\n\
+                   basura\n";
+        let procs = parse_ps(out);
+        let got: Vec<_> = procs
+            .iter()
+            .map(|p| (p.pid, p.pgid, p.tpgid, p.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, 1, -1, "systemd"),
+                (4242, 4242, 4250, "zsh"),
+                (4250, 4250, 4250, "claude"),
+                (4251, 4250, 4250, "Google Chrome Helper"),
+            ]
+        );
+        assert!(Procs(OnceCell::from(procs)).runs_agent(4242));
+    }
+
+    #[test]
+    fn panel_desconocido() {
+        assert!(!procs(&[]).runs_agent(10));
+    }
 }
