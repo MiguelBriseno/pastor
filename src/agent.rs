@@ -197,3 +197,117 @@ fn tail_lower(screen: &str, n: usize) -> String {
         .join("\n")
         .to_lowercase()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obs(screen: &str) -> Observation<'_> {
+        Observation {
+            dead: false,
+            gone: false,
+            screen,
+            last_change: None,
+            age_secs: 60,
+        }
+    }
+
+    fn hook(state: &str, secs_ago: i64) -> HookStatus {
+        HookStatus {
+            state: state.into(),
+            at: Utc::now() - Duration::seconds(secs_ago),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn muerto_o_salido_gana_a_todo() {
+        let o = Observation {
+            dead: true,
+            ..obs("Do you want to proceed?")
+        };
+        assert_eq!(classify(&o, None), Status::Dead);
+        let o = Observation {
+            gone: true,
+            ..obs("esc to interrupt")
+        };
+        assert_eq!(classify(&o, Some(&hook("working", 0))), Status::Dead);
+    }
+
+    #[test]
+    fn textos_de_pantalla() {
+        assert_eq!(
+            classify(&obs("Do you want to make this edit?\n❯ 1. Yes"), None),
+            Status::Blocked
+        );
+        assert_eq!(
+            classify(&obs("✻ Pensando… (esc to interrupt)"), None),
+            Status::Working
+        );
+        // Pedir permiso pesa más que estar trabajando.
+        assert_eq!(
+            classify(&obs("esc to interrupt\nAllow once"), None),
+            Status::Blocked
+        );
+    }
+
+    #[test]
+    fn solo_cuenta_el_final_de_la_pantalla() {
+        let mut screen = String::from("Do you want to proceed?\n");
+        for i in 0..20 {
+            screen.push_str(&format!("línea {i}\n\n"));
+        }
+        assert_eq!(classify(&obs(&screen), None), Status::Idle);
+    }
+
+    #[test]
+    fn sin_textos_decide_el_tiempo() {
+        let nuevo = Observation {
+            age_secs: 2,
+            ..obs("")
+        };
+        assert_eq!(classify(&nuevo, None), Status::Starting);
+        assert_eq!(classify(&obs(""), None), Status::Idle);
+        let activo = Observation {
+            last_change: Some(Utc::now()),
+            ..obs("")
+        };
+        assert_eq!(classify(&activo, None), Status::Working);
+        let quieto = Observation {
+            last_change: Some(Utc::now() - Duration::seconds(10)),
+            ..obs("")
+        };
+        assert_eq!(classify(&quieto, None), Status::Idle);
+    }
+
+    #[test]
+    fn hooks() {
+        assert_eq!(
+            classify(&obs(""), Some(&hook("blocked", 30))),
+            Status::Blocked
+        );
+        let activo = Observation {
+            last_change: Some(Utc::now()),
+            ..obs("")
+        };
+        assert_eq!(classify(&activo, Some(&hook("idle", 0))), Status::Idle);
+        // "working" sin cambios en pantalla no basta.
+        assert_eq!(classify(&obs(""), Some(&hook("working", 30))), Status::Idle);
+    }
+
+    #[test]
+    fn hook_viejo_no_cuenta_si_la_pantalla_cambio_despues() {
+        let o = Observation {
+            last_change: Some(Utc::now()),
+            ..obs("")
+        };
+        assert_eq!(classify(&o, Some(&hook("blocked", 10))), Status::Working);
+    }
+
+    #[test]
+    fn tail_lower_ignora_lineas_vacias() {
+        assert_eq!(tail_lower("A\n\n  \nB\nC\n", 2), "b\nc");
+        assert_eq!(tail_lower("Uno", 5), "uno");
+        assert_eq!(tail_lower("", 3), "");
+    }
+}

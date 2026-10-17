@@ -245,3 +245,45 @@ pub fn shell_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+    use std::process::Command;
+
+    #[test]
+    fn deja_igual_lo_seguro() {
+        assert_eq!(shell_quote("/usr/bin/claude"), "/usr/bin/claude");
+        assert_eq!(shell_quote("--settings=a.json"), "--settings=a.json");
+    }
+
+    #[test]
+    fn entrecomilla_lo_demas() {
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("mi carpeta"), "'mi carpeta'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
+    }
+
+    /// Lo que entra sale idéntico al pasar por `sh`, sin ejecutar nada.
+    #[test]
+    fn sh_recupera_el_texto_original() {
+        for s in [
+            "",
+            "a b",
+            "it's",
+            "'",
+            "''",
+            "$HOME `id` $(id) ; | & > < * ? ~ \\ \"",
+            "línea\nnueva\ttab",
+            "ñandú 🦀",
+        ] {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", shell_quote(s)))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), s);
+        }
+    }
+}
