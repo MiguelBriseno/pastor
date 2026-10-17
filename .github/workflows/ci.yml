@@ -38,10 +38,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Para la prueba que levanta su propio servidor de tmux.
-      - name: Instalar tmux
+      # Para la prueba que levanta su propio servidor de tmux, y zsh para la del
+      # shell que queda al salir el agente (macOS ya lo trae).
+      - name: Instalar tmux y zsh
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then brew install tmux; else sudo apt-get update && sudo apt-get install -y tmux; fi
+          if [ "$RUNNER_OS" = macOS ]; then brew install tmux; else sudo apt-get update && sudo apt-get install -y tmux zsh; fi
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 

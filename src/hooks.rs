@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -120,8 +120,14 @@ pub fn relaunch_shell() -> Result<String> {
     let bin = dir.join("bin");
     fs::create_dir_all(&bin)?;
     write_claude_shim(&bin)?;
+    shell_files(&dir)
+}
 
-    let q = |p: &PathBuf| shell_quote(&p.to_string_lossy());
+/// Escribe en `dir` la configuración de bash y zsh que antepone `dir/bin`
+/// al PATH, y devuelve el código de `sh` que abre el shell con ella.
+fn shell_files(dir: &Path) -> Result<String> {
+    let bin = dir.join("bin");
+    let q = |p: &Path| shell_quote(&p.to_string_lossy());
     let prepend = format!("PATH={}:\"$PATH\"\n", q(&bin));
     fs::write(
         dir.join("bashrc"),
@@ -129,9 +135,17 @@ pub fn relaunch_shell() -> Result<String> {
     )?;
     let zdot = dir.join("zsh");
     fs::create_dir_all(&zdot)?;
+    // Tu `.zshenv` se lee con tu ZDOTDIR, y si lo cambia (p. ej. a
+    // ~/.config/zsh) lo guardamos para el `.zshrc`: zsh debe seguir leyendo
+    // el `.zshrc` de aquí, o el PATH no se ajusta.
     fs::write(
         zdot.join(".zshenv"),
-        "[ -f \"${PASTOR_ZDOTDIR:-$HOME}/.zshenv\" ] && . \"${PASTOR_ZDOTDIR:-$HOME}/.zshenv\"\n",
+        "PASTOR_ZSH=\"$ZDOTDIR\"\n\
+         ZDOTDIR=\"${PASTOR_ZDOTDIR:-$HOME}\"\n\
+         [ -f \"$ZDOTDIR/.zshenv\" ] && . \"$ZDOTDIR/.zshenv\"\n\
+         PASTOR_ZDOTDIR=\"$ZDOTDIR\"\n\
+         ZDOTDIR=\"$PASTOR_ZSH\"\n\
+         unset PASTOR_ZSH\n",
     )?;
     fs::write(
         zdot.join(".zshrc"),
@@ -199,5 +213,72 @@ mod tests {
         let p = |s: &str| PathBuf::from(s);
         assert_eq!(strip_deleted(p("/bin/pastor (deleted)")), p("/bin/pastor"));
         assert_eq!(strip_deleted(p("/bin/pastor")), p("/bin/pastor"));
+    }
+
+    /// Abre el shell que queda tras salir el agente, con `home` como HOME, y
+    /// devuelve lo que imprime `cmd`. `None` si ese shell no está instalado.
+    fn relaunch(shell: &str, home: &Path, cmd: &str) -> Option<String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let sh = agent::find_in_path(shell)?;
+        let dir = home.join("pastor");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let script = shell_files(&dir).unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", &script])
+            .env("HOME", home)
+            .env("SHELL", sh)
+            .env_remove("ZDOTDIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(cmd.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn el_shell_lee_tu_configuracion_y_antepone_el_claude_de_pastor() {
+        let home = std::env::temp_dir().join(format!("pastor-shell-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".config/zsh")).unwrap();
+        let bin = home.join("pastor/bin");
+        let expected = format!("rc=si path={}", bin.display());
+        let cmd = "echo \"rc=$DESDE_RC path=${PATH%%:*}\"\n";
+
+        fs::write(home.join(".bashrc"), "DESDE_RC=si\n").unwrap();
+        if let Some(out) = relaunch("bash", &home, cmd) {
+            assert_eq!(out, expected, "bash");
+        }
+
+        fs::write(home.join(".zshrc"), "DESDE_RC=si\n").unwrap();
+        if let Some(out) = relaunch("zsh", &home, cmd) {
+            assert_eq!(out, expected, "zsh");
+            // Un `.zshenv` que mueve ZDOTDIR no debe saltarse nuestro `.zshrc`.
+            fs::remove_file(home.join(".zshrc")).unwrap();
+            fs::write(
+                home.join(".zshenv"),
+                "export ZDOTDIR=\"$HOME/.config/zsh\"\n",
+            )
+            .unwrap();
+            fs::write(home.join(".config/zsh/.zshrc"), "DESDE_RC=si\n").unwrap();
+            let cmd = format!("echo \"$ZDOTDIR\"\n{cmd}");
+            let out = relaunch("zsh", &home, &cmd).unwrap();
+            let zdotdir = home.join(".config/zsh");
+            assert_eq!(
+                out,
+                format!("{}\n{expected}", zdotdir.display()),
+                "zsh con ZDOTDIR"
+            );
+        }
+        fs::remove_dir_all(&home).unwrap();
     }
 }
