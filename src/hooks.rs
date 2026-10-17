@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::agent;
 use crate::history::{self, Event};
 use crate::ops;
-use crate::store::{data_dir, ensure_dirs, write_atomic, write_atomic_mode, write_volatile};
+use crate::store::{self, data_dir, ensure_dirs, write_atomic, write_atomic_mode, write_volatile};
 use crate::tmux::{self, shell_quote};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -43,8 +43,29 @@ pub fn screen_hash(screen: &str) -> u64 {
     })
 }
 
+/// Líneas del final que no cuentan para la huella: la caja del prompt y el
+/// pie, donde Claude Code pone y quita pistas solo (`/effort`, el modo…).
+const FOOTER: usize = 5;
+
+/// Huella de la pantalla para saber si un hook sigue valiendo. Responder un
+/// diálogo o interrumpir el turno cambia lo que hay encima del pie. El `●`
+/// de una herramienta pendiente parpadea mientras espera permiso: no cuenta.
+pub fn fingerprint(screen: &str) -> u64 {
+    let lines: Vec<String> = screen
+        .trim_end()
+        .lines()
+        .map(|l| l.trim_end().replace('●', " "))
+        .collect();
+    screen_hash(&lines[..lines.len().saturating_sub(FOOTER)].join("\n"))
+}
+
 fn status_path(id: &str) -> PathBuf {
     data_dir().join("status").join(format!("{id}.json"))
+}
+
+/// El hook y `settle` escriben el mismo estado: que no se pisen.
+fn lock_status(id: &str) -> Result<fs::File> {
+    store::lock(&data_dir().join("status").join(format!("{id}.lock")))
 }
 
 pub fn read_status(id: &str) -> Option<HookStatus> {
@@ -53,6 +74,7 @@ pub fn read_status(id: &str) -> Option<HookStatus> {
 
 pub fn clear_status(id: &str) {
     let _ = fs::remove_file(status_path(id));
+    let _ = fs::remove_file(data_dir().join("status").join(format!("{id}.lock")));
 }
 
 /// Llamado por Claude Code. Nunca debe fallar ruidosamente.
@@ -88,10 +110,13 @@ pub fn handle(event: &str) -> Result<()> {
         message,
         screen: None,
     };
-    write_volatile(
-        &status_path(&id),
-        serde_json::to_string(&status)?.as_bytes(),
-    )?;
+    {
+        let _lock = lock_status(&id)?;
+        write_volatile(
+            &status_path(&id),
+            serde_json::to_string(&status)?.as_bytes(),
+        )?;
+    }
     if state != "working" {
         spawn_settle();
     }
@@ -121,7 +146,8 @@ fn spawn_settle() {
 }
 
 /// Espera a que la pantalla del agente deje de cambiar y guarda su huella en
-/// el estado del hook, si mientras tanto no llegó otro.
+/// el estado del hook, si mientras tanto no llegó otro. Si el panel ya no
+/// existe (el agente salió), no hay nada que guardar ni que anotar.
 fn settle(id: &str) -> Result<()> {
     let Ok(pane) = std::env::var("TMUX_PANE") else {
         return Ok(());
@@ -129,25 +155,36 @@ fn settle(id: &str) -> Result<()> {
     let Some(at) = read_status(id).map(|s| s.at) else {
         return Ok(());
     };
-    let mut last = None;
-    let mut seen = None;
-    for _ in 0..10 {
+    let Ok(size) = tmux::pane_size(&pane) else {
+        return Ok(());
+    };
+    // Tres capturas iguales seguidas: una pausa breve antes del dibujo final
+    // no basta para darla por quieta.
+    let (mut last, mut same) = (None, 0);
+    let mut hash = None;
+    for _ in 0..12 {
         std::thread::sleep(std::time::Duration::from_millis(400));
-        let now = Screen {
-            hash: screen_hash(&tmux::capture(&pane)?),
-            size: tmux::pane_size(&pane)?,
+        let Ok(screen) = tmux::capture(&pane) else {
+            return Ok(());
         };
-        if last.as_ref() == Some(&now) {
-            seen = Some(now);
+        let now = fingerprint(&screen);
+        same = if last == Some(now) { same + 1 } else { 0 };
+        last = Some(now);
+        if same == 2 {
+            hash = Some(now);
             break;
         }
-        last = Some(now);
     }
-    // Si no se quedó quieta, mejor sin huella que con una que no es.
-    let Some(screen) = seen else { return Ok(()) };
+    // Si no se quedó quieta o cambió de tamaño, mejor sin huella que con una
+    // que no es.
+    let Some(hash) = hash else { return Ok(()) };
+    if tmux::pane_size(&pane).ok().as_ref() != Some(&size) {
+        return Ok(());
+    }
+    let _lock = lock_status(id)?;
     match read_status(id) {
         Some(mut s) if s.at == at => {
-            s.screen = Some(screen);
+            s.screen = Some(Screen { hash, size });
             write_volatile(&status_path(id), serde_json::to_string(&s)?.as_bytes())
         }
         _ => Ok(()),

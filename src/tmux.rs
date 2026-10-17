@@ -185,11 +185,15 @@ pub struct Pane {
     pub cmd: String,
 }
 
+/// Formato del tamaño de un panel (`Pane::size`), p. ej. `80x24`.
+const SIZE: &str = "#{pane_width}x#{pane_height}";
+
 /// Paneles de cada sesión. Vacío si el servidor no está corriendo.
 pub fn panes() -> HashMap<String, Vec<Pane>> {
-    let format =
-        "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{@pastor_exited}\t#{@pastor_role}\t#{pane_pid}\t#{@pastor_cmd}";
-    let Ok(out) = run(&["list-panes", "-a", "-F", format]) else {
+    let format = format!(
+        "#{{session_name}}\t#{{pane_id}}\t#{{pane_dead}}\t{SIZE}\t#{{pane_current_command}}\t#{{@pastor_exited}}\t#{{@pastor_role}}\t#{{pane_pid}}\t#{{@pastor_cmd}}"
+    );
+    let Ok(out) = run(&["list-panes", "-a", "-F", &format]) else {
         return HashMap::new();
     };
     let mut map: HashMap<String, Vec<Pane>> = HashMap::new();
@@ -258,15 +262,9 @@ pub fn capture(target: &str) -> Result<String> {
 
 /// Tamaño del panel con el mismo formato que `Pane::size`.
 pub fn pane_size(target: &str) -> Result<String> {
-    Ok(run(&[
-        "display-message",
-        "-p",
-        "-t",
-        target,
-        "#{pane_width}x#{pane_height}",
-    ])?
-    .trim()
-    .to_string())
+    Ok(run(&["display-message", "-p", "-t", target, SIZE])?
+        .trim()
+        .to_string())
 }
 
 /// Pega `text` en el agente (bracketed paste) y pulsa Enter.

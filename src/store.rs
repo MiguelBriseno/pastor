@@ -132,19 +132,7 @@ impl State {
         f: impl FnOnce(&mut State) -> Result<T>,
         saved: impl FnOnce(&mut T),
     ) -> Result<T> {
-        let lock_path = dir.join("state.lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("no pude abrir {}", lock_path.display()))?;
-        match lock.lock() {
-            // Algunos montajes (NFS, FUSE) no tienen candados: mejor seguir
-            // como antes que dejar de funcionar.
-            Err(e) if e.kind() == ErrorKind::Unsupported => {}
-            r => r.with_context(|| format!("no pude bloquear {}", lock_path.display()))?,
-        }
+        let _lock = lock(&dir.join("state.lock"))?;
         let mut s = Self::load_in(dir)?;
         let mut out = f(&mut s)?;
         write_atomic(
@@ -236,6 +224,23 @@ impl State {
 }
 
 /// Si `s` tiene la forma de un id de agente (`a1`, `a27`…).
+/// Candado exclusivo sobre `path`, que dura lo que el `File` devuelto.
+pub fn lock(path: &Path) -> Result<fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("no pude abrir {}", path.display()))?;
+    match file.lock() {
+        // Algunos montajes (NFS, FUSE) no tienen candados: mejor seguir
+        // como antes que dejar de funcionar.
+        Err(e) if e.kind() == ErrorKind::Unsupported => {}
+        r => r.with_context(|| format!("no pude bloquear {}", path.display()))?,
+    }
+    Ok(file)
+}
+
 pub fn looks_like_id(s: &str) -> bool {
     s.strip_prefix('a')
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))

@@ -1,9 +1,7 @@
 //! Operaciones compartidas entre la CLI y la TUI.
 
 use std::cell::OnceCell;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -506,10 +504,7 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    fn observe(&mut self, id: &str, screen: &str, size: &str) -> Option<DateTime<Utc>> {
-        let mut h = DefaultHasher::new();
-        screen.hash(&mut h);
-        let hash = h.finish();
+    fn observe(&mut self, id: &str, hash: u64, size: &str) -> Option<DateTime<Utc>> {
         match self.seen.get_mut(id) {
             // Si el panel cambió de tamaño (p. ej. al abrir la terminal), el
             // agente se redibuja: eso no cuenta como actividad.
@@ -581,12 +576,16 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
                 dead: t.dead,
                 cmd: Some(t.cmd).filter(|c| !c.is_empty()),
             });
+            let size = pane.map_or("", |p| p.size.as_str());
+            let hash = hooks::screen_hash(&screen);
+            let fingerprint = hooks::fingerprint(&screen);
             let obs = Observation {
                 dead: pane.is_none_or(|p| p.dead),
                 gone,
                 screen: &screen,
-                size: pane.map_or("", |p| p.size.as_str()),
-                last_change: tracker.observe(&a.id, &screen, pane.map_or("", |p| p.size.as_str())),
+                fingerprint,
+                size,
+                last_change: tracker.observe(&a.id, hash, size),
                 age_secs: (Utc::now() - a.created_at).num_seconds(),
             };
             // Si lo vuelven a abrir a mano, que no herede el estado de la vez anterior.

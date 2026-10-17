@@ -143,6 +143,8 @@ pub struct Observation<'a> {
     /// El agente salió y en su panel quedó el shell (u otro programa).
     pub gone: bool,
     pub screen: &'a str,
+    /// `hooks::fingerprint` de `screen`.
+    pub fingerprint: u64,
     /// Ancho y alto del panel (`80x24`).
     pub size: &'a str,
     /// Última vez que vimos cambiar la pantalla (None = no ha cambiado desde que miramos).
@@ -197,7 +199,7 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
             .is_none_or(|c| h.at + Duration::seconds(2) >= c)
             && h.screen
                 .as_ref()
-                .is_none_or(|s| s.size != obs.size || s.hash == hooks::screen_hash(obs.screen))
+                .is_none_or(|s| s.size != obs.size || s.hash == obs.fingerprint)
     });
     let last = tail_lower(obs.screen, 8);
     let interrupted = INTERRUPTED.iter().any(|p| last.contains(p));
@@ -240,6 +242,7 @@ mod tests {
             dead: false,
             gone: false,
             screen,
+            fingerprint: hooks::fingerprint(screen),
             size: "80x24",
             last_change: None,
             age_secs: 60,
@@ -369,21 +372,44 @@ mod tests {
     fn hook_con_huella_de_otra_pantalla_es_viejo() {
         let con_huella = |pantalla: &str, size: &str| HookStatus {
             screen: Some(hooks::Screen {
-                hash: hooks::screen_hash(pantalla),
+                hash: hooks::fingerprint(pantalla),
                 size: size.into(),
             }),
             ..hook("blocked", 30)
         };
-        let o = obs("Elige una opción\n❯ 1. Sí");
+        let o = obs("Elige una opción\n❯ 1. Sí\n───\n❯ \n───\n  ⏸ manual mode on\n  esc to cancel");
         // La misma pantalla: el hook vale aunque el texto no diga nada.
         let h = con_huella(o.screen, "80x24");
         assert_eq!(classify(&o, Some(&h)), Status::Blocked);
         // Otra pantalla: se respondió por otra vía.
-        let h = con_huella("Elige una opción\n❯ 2. No", "80x24");
+        let h = con_huella(
+            "Elige una opción\n❯ 2. No\n───\n❯ \n───\n  ⏸ manual mode on\n  esc to cancel",
+            "80x24",
+        );
         assert_eq!(classify(&o, Some(&h)), Status::Idle);
         // Otro tamaño: no se puede comparar y vale el hook.
-        let h = con_huella("Elige una opción\n❯ 2. No", "120x40");
+        let h = con_huella(
+            "Elige una opción\n❯ 2. No\n───\n❯ \n───\n  ⏸ manual mode on\n  esc to cancel",
+            "120x40",
+        );
         assert_eq!(classify(&o, Some(&h)), Status::Blocked);
+    }
+
+    #[test]
+    fn la_huella_ignora_el_pie() {
+        let pantalla =
+            |cuerpo: &str, pie: &str| format!("❯ hola\n● {cuerpo}\n\n───\n❯ \n───\n  {pie}\n\n\n");
+        let base = hooks::fingerprint(&pantalla("ok", "⏵⏵ auto mode on · ← for agents"));
+        assert_eq!(base, hooks::fingerprint(&pantalla("ok", "⏵⏵ auto mode on")));
+        assert_ne!(
+            base,
+            hooks::fingerprint(&pantalla("otra cosa", "⏵⏵ auto mode on"))
+        );
+        // El `●` que parpadea mientras espera permiso.
+        assert_eq!(
+            base,
+            hooks::fingerprint(&pantalla("ok", "⏵⏵ auto mode on").replacen('●', " ", 1))
+        );
     }
 
     #[test]
