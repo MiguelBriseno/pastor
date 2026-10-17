@@ -1641,8 +1641,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 fn notify(msg: &str) {
-    let child = Command::new("notify-send")
-        .args(["-a", "pastor", "pastor", msg])
+    let child = notify_command(msg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -1650,6 +1649,32 @@ fn notify(msg: &str) {
     if let Ok(mut child) = child {
         std::thread::spawn(move || child.wait());
     }
+}
+
+#[cfg(target_os = "macos")]
+fn notify_command(msg: &str) -> Command {
+    // El mensaje va como argumento y no dentro del AppleScript, para no
+    // tener que escaparlo. El título va antes: si el mensaje empieza con `-`
+    // (el nombre del agente), osascript ya no lo toma por una opción.
+    let mut cmd = Command::new("osascript");
+    cmd.args([
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 2 of argv) with title (item 1 of argv)",
+        "-e",
+        "end run",
+        "pastor",
+        msg,
+    ]);
+    cmd
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notify_command(msg: &str) -> Command {
+    let mut cmd = Command::new("notify-send");
+    cmd.args(["-a", "pastor", "--", "pastor", msg]);
+    cmd
 }
 
 fn popup(f: &mut Frame, title: &str, w: u16, h: u16) -> Rect {

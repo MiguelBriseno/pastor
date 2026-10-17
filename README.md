@@ -43,7 +43,7 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
 | [tmux](https://github.com/tmux/tmux) 3.1 o superior | Mantiene vivas las terminales de los agentes |
 | [Rust](https://rustup.rs) 1.89 o superior | Para compilar pastor |
 | Al menos un agente: `claude`, `codex` u `opencode` | Los agentes que vas a manejar; deben estar en tu `PATH` |
-| `notify-send` (opcional) | Notificaciones de escritorio en Linux |
+| `notify-send` (opcional) | Notificaciones de escritorio en Linux; en macOS se usan las del sistema |
 | Una [Nerd Font](https://www.nerdfonts.com) (recomendada) | Iconos en la interfaz; sin ella usa `PASTOR_ICONS=simple` (ver [Iconos y fuente](#iconos-y-fuente)) |
 
 ### Instalar los requisitos
@@ -62,7 +62,9 @@ brew install tmux rustup
 rustup-init
 ```
 
-> En macOS las notificaciones de escritorio todavía no funcionan (usan `notify-send`).
+> En macOS pastor envía las notificaciones con `osascript`, así que suelen aparecer como de
+> **Script Editor**. Si no ves ninguna, revisa que estén activadas para esa app en *Ajustes del
+> Sistema → Notificaciones*.
 
 ## Instalación
 
@@ -327,7 +329,8 @@ En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` e
 ```sh
 tmux -L pastor kill-server      # termina todos los agentes
 cargo uninstall pastor
-rm -rf ~/.local/share/pastor
+rm -rf ~/.local/share/pastor                     # Linux
+rm -rf ~/Library/Application\ Support/pastor    # macOS
 ```
 
 ## Plan

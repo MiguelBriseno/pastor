@@ -89,7 +89,7 @@ fn in_path(bin: &str) -> bool {
     find_in_path(bin).is_some()
 }
 
-fn find_in_path(bin: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|p| {
         std::env::split_paths(&p)
             .map(|d| d.join(bin))

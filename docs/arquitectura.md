@@ -3,6 +3,9 @@
 pastor no tiene un servidor propio: **tmux es el servidor**. Cada agente es una sesión de tmux y
 pastor es un cliente que lanza sesiones, lee sus pantallas y guarda su propio estado en disco.
 
+Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
+`~/Library/Application Support/pastor`.
+
 ```
           ┌─────────────┐   ┌─────────────┐
           │ pastor (TUI)│   │ pastor (CLI)│
@@ -70,6 +73,10 @@ Ese shell lleva al inicio del PATH `~/.local/share/pastor/shell/bin`, donde hay 
 llama al real con `--settings`. Así, si lo vuelves a abrir a mano, los hooks siguen funcionando. El
 PATH se ajusta después de leer la configuración del usuario (`--rcfile` en bash, `ZDOTDIR` en zsh,
 `-C` en fish), porque el `.bashrc` suele anteponer sus propios directorios.
+
+En zsh, el `.zshenv` de pastor lee el tuyo con tu `ZDOTDIR` de verdad. Si tu `.zshenv` lo cambia
+(por ejemplo a `~/.config/zsh`), pastor recuerda el nuevo valor y vuelve a poner el suyo, para que
+zsh siga leyendo su `.zshrc`; ese `.zshrc` restaura tu `ZDOTDIR` y carga el tuyo.
 
 Además, cada sesión se crea con `remain-on-exit on`: si hasta el shell termina, el panel sigue
 visible para leer lo último que escribió, y tmux lo marca como `pane_dead`. La terminal
