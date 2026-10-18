@@ -4,17 +4,18 @@
 //! Llama a `ops` igual que la CLI. Controlar un agente equivale a ejecutar
 //! comandos en esta máquina, así que todo pide el token.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, Request, State as Shared};
+use axum::extract::{FromRequest, Path, Request, State as Shared};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -30,16 +31,17 @@ struct App {
     tracker: Mutex<Tracker>,
 }
 
-pub fn run(bind: SocketAddr, token: Option<String>) -> Result<()> {
-    let token = token.or_else(|| std::env::var("PASTOR_TOKEN").ok());
-    let token = match token.filter(|t| !t.is_empty()) {
-        Some(t) => t,
-        None => saved_token()?,
+/// El token sale de `PASTOR_TOKEN` o del archivo, nunca de un argumento:
+/// los argumentos se ven en `ps`.
+pub fn run(bind: SocketAddr) -> Result<()> {
+    let (token, from) = match std::env::var("PASTOR_TOKEN").ok().filter(|t| !t.is_empty()) {
+        Some(t) => (t, "PASTOR_TOKEN".to_string()),
+        None => (saved_token()?, token_path().display().to_string()),
     };
-    if bind.ip().is_unspecified() {
+    if !private(bind.ip()) {
         eprintln!(
-            "Aviso: escuchando en todas las interfaces ({bind}). Cualquiera en esas redes puede \
-             intentar conectarse; mejor la IP de Tailscale o 127.0.0.1."
+            "Aviso: escuchando en {bind} sin cifrar. Cualquiera en esa red puede ver el token; \
+             mejor 127.0.0.1 o la IP de Tailscale."
         );
     }
     let app = Arc::new(App {
@@ -53,14 +55,9 @@ pub fn run(bind: SocketAddr, token: Option<String>) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .with_context(|| format!("no pude escuchar en {bind}"))?;
-            println!(
-                "pastor serve en http://{bind} · token en {}",
-                token_path().display()
-            );
+            println!("pastor serve en http://{bind} · token en {from}");
             axum::serve(listener, router(app))
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
+                .with_graceful_shutdown(shutdown())
                 .await?;
             Ok(())
         })
@@ -75,8 +72,43 @@ fn router(app: Arc<App>) -> Router {
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
         .route("/tasks/{id}/done", post(task_done))
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "no existe esa ruta") })
         .layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new().nest("/api", api).with_state(app)
+}
+
+/// Ctrl-C o SIGTERM (`kill`, systemd): termina lo que está en curso, para no
+/// dejar una asignación a medias.
+async fn shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let term = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = term => {}
+    }
+}
+
+/// Si en `ip` el tráfico no sale de la máquina o va por Tailscale, que ya lo
+/// cifra (100.64.0.0/10 y fd7a:115c:a1e0::/48).
+fn private(ip: IpAddr) -> bool {
+    match ip {
+        _ if ip.is_loopback() => true,
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..128).contains(&b)
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
 }
 
 // ---------- token ----------
@@ -85,8 +117,8 @@ fn token_path() -> PathBuf {
     store::data_dir().join("serve-token")
 }
 
-/// El token guardado, o uno nuevo si no hay. `PASTOR_TOKEN` o `--token` lo
-/// reemplazan sin tocar el archivo.
+/// El token guardado, o uno nuevo si no hay. `PASTOR_TOKEN` lo reemplaza sin
+/// tocar el archivo.
 fn saved_token() -> Result<String> {
     let path = token_path();
     if let Ok(t) = std::fs::read_to_string(&path) {
@@ -134,6 +166,32 @@ fn error(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(json!({ "error": msg.into() }))).into_response()
 }
 
+/// Como `Json`, pero un cuerpo que no se entiende también responde con
+/// `{"error": ...}`.
+struct Body<T>(T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Response> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(Body(v)),
+            Err(e) => Err(error(e.status(), e.body_text())),
+        }
+    }
+}
+
+/// `cwd` llega del celular: relativo o con `~` se resolvería contra el
+/// directorio desde el que se lanzó el servidor.
+fn not_absolute(cwd: &std::path::Path) -> Option<Response> {
+    (!cwd.is_absolute()).then(|| {
+        error(
+            StatusCode::BAD_REQUEST,
+            format!("`cwd` debe ser una ruta absoluta: {}", cwd.display()),
+        )
+    })
+}
+
 /// Ejecuta `f` (que toca tmux y el disco) fuera del hilo de tokio. Un error
 /// de `ops` es casi siempre del pedido (agente que no existe, texto vacío…).
 async fn blocking<T: Serialize + Send + 'static>(
@@ -141,7 +199,16 @@ async fn blocking<T: Serialize + Send + 'static>(
 ) -> Response {
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Ok(Err(e)) => {
+            let msg = format!("{e:#}");
+            // Los de `find_agent` y `find_task`.
+            let code = if msg.starts_with("no existe") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            error(code, msg)
+        }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -205,7 +272,10 @@ struct NewAgent {
     prompt: Option<String>,
 }
 
-async fn new_agent(Json(req): Json<NewAgent>) -> Response {
+async fn new_agent(Body(req): Body<NewAgent>) -> Response {
+    if let Some(r) = not_absolute(&req.cwd) {
+        return r;
+    }
     blocking(move || ops::new_agent(req.kind, Some(req.cwd), req.name, req.prompt.as_deref())).await
 }
 
@@ -214,7 +284,7 @@ struct Message {
     text: String,
 }
 
-async fn send(Path(id): Path<String>, Json(req): Json<Message>) -> Response {
+async fn send(Path(id): Path<String>, Body(req): Body<Message>) -> Response {
     blocking(move || ops::send(&id, &req.text).map(|()| ok())).await
 }
 
@@ -235,7 +305,7 @@ struct NewTask {
     description: String,
 }
 
-async fn add_task(Json(req): Json<NewTask>) -> Response {
+async fn add_task(Body(req): Body<NewTask>) -> Response {
     blocking(move || ops::add_task(req.title, req.description)).await
 }
 
@@ -247,7 +317,7 @@ struct Assign {
     cwd: Option<PathBuf>,
 }
 
-async fn assign_task(Path(id): Path<String>, Json(req): Json<Assign>) -> Response {
+async fn assign_task(Path(id): Path<String>, Body(req): Body<Assign>) -> Response {
     let target = match req {
         Assign {
             agent: Some(a),
@@ -258,10 +328,15 @@ async fn assign_task(Path(id): Path<String>, Json(req): Json<Assign>) -> Respons
             agent: None,
             kind: Some(kind),
             cwd: Some(cwd),
-        } => AssignTarget::New {
-            kind,
-            cwd: Some(cwd),
-        },
+        } => {
+            if let Some(r) = not_absolute(&cwd) {
+                return r;
+            }
+            AssignTarget::New {
+                kind,
+                cwd: Some(cwd),
+            }
+        }
         _ => {
             return error(
                 StatusCode::BAD_REQUEST,
@@ -291,6 +366,18 @@ mod tests {
         assert!(!same(b"abc", b"abd"));
         assert!(!same(b"abc", b"abcd"));
         assert!(!same(b"", b"a"));
+    }
+
+    #[test]
+    fn redes_sin_aviso() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(private(ip("127.0.0.1")));
+        assert!(private(ip("::1")));
+        assert!(private(ip("100.101.102.103")));
+        assert!(private(ip("fd7a:115c:a1e0::1")));
+        assert!(!private(ip("0.0.0.0")));
+        assert!(!private(ip("192.168.1.20")));
+        assert!(!private(ip("100.128.0.1")));
     }
 
     #[test]
@@ -332,5 +419,10 @@ mod tests {
         assert!(get("/api/agents", Some("secreto")).starts_with("HTTP/1.1 401"));
         // Lo que no es de la API no existe (todavía).
         assert!(get("/", None).starts_with("HTTP/1.1 404"));
+        let r = get("/api/nada", Some("Bearer secreto"));
+        assert!(
+            r.starts_with("HTTP/1.1 404") && r.contains(r#"{"error":"#),
+            "{r}"
+        );
     }
 }

@@ -99,10 +99,6 @@ enum Cmd {
         /// Dirección y puerto (p. ej. la IP de Tailscale)
         #[arg(long, default_value = server::DEFAULT_BIND, value_name = "IP:PUERTO")]
         bind: std::net::SocketAddr,
-        /// Token para los clientes (o `PASTOR_TOKEN`; por defecto uno guardado en el
-        /// directorio de datos)
-        #[arg(long, value_name = "TOKEN")]
-        token: Option<String>,
     },
     /// Uso interno: lo llaman los hooks de Claude Code
     #[command(hide = true)]
@@ -263,7 +259,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Attach { agent }) => ops::attach(&agent),
         #[cfg(feature = "serve")]
-        Some(Cmd::Serve { bind, token }) => server::run(bind, token),
+        Some(Cmd::Serve { bind }) => server::run(bind),
         Some(Cmd::Term {
             agent, close: true, ..
         }) => ops::close_term(&agent),

@@ -293,7 +293,16 @@ fn replace(path: &Path, contents: &[u8], mode: Option<u32>, durable: bool) -> Re
     tmp.push(format!(".{}.tmp", unique_suffix()));
     let tmp = PathBuf::from(tmp);
     let written = (|| -> Result<()> {
-        let mut f = fs::File::create(&tmp)?;
+        // Con el modo desde que se crea: un secreto no pasa por 0644 ni un
+        // instante.
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode.unwrap_or(0o666))
+                .open(&tmp)?
+        };
         f.write_all(contents)?;
         if let Some(m) = mode {
             f.set_permissions(fs::Permissions::from_mode(m))?;

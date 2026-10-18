@@ -176,7 +176,8 @@ El servidor trae `axum` y `tokio`, que pesan más que todo lo demás junto, así
 feature `serve` y quien no lo usa no los compila. Llama a `ops` como la CLI (no lanza `pastor`),
 cada operación en un hilo de `spawn_blocking` porque tocan tmux y el disco. Guarda un `Tracker`
 entre consultas, así un cliente que pregunta cada pocos segundos ve *trabajando* como la TUI.
-El token se compara sin cortar en el primer byte distinto.
+El token se compara sin cortar en el primer byte distinto, y su archivo se crea ya con permisos
+0600 (`write_atomic_mode` crea el temporal con el modo, no lo cambia después).
 
 ## Cómo agregar un nuevo tipo de agente
 

@@ -242,10 +242,11 @@ pastor serve                          # en 127.0.0.1:7433
 pastor serve --bind 100.101.102.103:7433   # en la IP de Tailscale, para el celular
 ```
 
-Todo pide un token (`Authorization: Bearer <token>`). Si no pasas `--token` ni `PASTOR_TOKEN`,
-pastor genera uno y lo guarda en `~/.local/share/pastor/serve-token`. Controlar un agente equivale a
-ejecutar comandos en tu máquina: no lo expongas a internet y prefiere una red privada como
-Tailscale. Si escuchas en `0.0.0.0`, pastor te avisa.
+Todo pide un token (`Authorization: Bearer <token>`). Si no defines `PASTOR_TOKEN`, pastor genera
+uno y lo guarda en `~/.local/share/pastor/serve-token`; no se pasa como argumento porque se vería
+en `ps`. Controlar un agente equivale a ejecutar comandos en tu máquina: no lo expongas a internet.
+El tráfico va sin cifrar, así que pastor te avisa si escuchas en algo que no sea `127.0.0.1` o una
+IP de Tailscale (que ya cifra).
 
 | Método | Ruta | Cuerpo |
 |---|---|---|
@@ -263,7 +264,8 @@ Tailscale. Si escuchas en `0.0.0.0`, pastor te avisa.
 curl -H "Authorization: Bearer $(cat ~/.local/share/pastor/serve-token)" localhost:7433/api/agents
 ```
 
-Los errores llegan como `{"error": "..."}`.
+`cwd` tiene que ser una ruta absoluta. Los errores llegan como `{"error": "..."}`: 401 sin token,
+404 si el agente o la tarea no existen y 400 para lo demás.
 
 ## Iconos y fuente
 
