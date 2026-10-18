@@ -157,6 +157,13 @@ impl State {
         (self.next_agent, self.next_task)
     }
 
+    /// Que el próximo id de agente no sea uno que `taken` da por ocupado.
+    pub fn skip_ids(&mut self, taken: impl Fn(&str) -> bool) {
+        while taken(&format!("a{}", self.next_agent + 1)) {
+            self.next_agent += 1;
+        }
+    }
+
     pub fn add_agent(&mut self, kind: Kind, cwd: PathBuf, name: Option<String>) -> Agent {
         self.next_agent += 1;
         let base = name
@@ -322,6 +329,16 @@ fn replace(path: &Path, contents: &[u8], mode: Option<u32>, durable: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_reusa_el_id_de_una_sesion_viva() {
+        let mut s = State::default();
+        s.skip_ids(|id| id == "a1" || id == "a2");
+        assert_eq!(
+            s.add_agent(Kind::Claude, PathBuf::from("/x"), None).id,
+            "a3"
+        );
+    }
 
     #[test]
     fn nombres_de_agente() {

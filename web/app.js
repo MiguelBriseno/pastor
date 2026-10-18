@@ -109,6 +109,10 @@ function once(fn) {
   };
 }
 
+const API_TIMEOUT = 10000;
+// Una tecla o un mensaje que esperan más que esto su turno se descartan.
+const STALE_INPUT = 5000;
+
 // Relativa: funciona aunque pastor se sirva bajo una subruta.
 async function api(method, path, body) {
   const res = await fetch("api" + path, {
@@ -118,6 +122,15 @@ async function api(method, path, body) {
       ...(body ? { "Content-Type": "application/json" } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
+    // Sin límite, al perder la red una petición puede quedar colgada minutos.
+    signal: AbortSignal.timeout?.(API_TIMEOUT),
+  }).catch((e) => {
+    // Cortada a medias, una orden pudo hacerse igual: repetirla sin mirar
+    // lanzaría un segundo agente.
+    if (e.name === "TimeoutError" && method !== "GET") {
+      throw new Error("pastor no respondió a tiempo; revisa si se hizo antes de repetirlo");
+    }
+    throw e;
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) throw new Unauthorized(data.error || "token no válido");
@@ -126,7 +139,10 @@ async function api(method, path, body) {
 }
 
 // `fetch` rechaza con TypeError si no hay red, con otro texto en cada navegador.
-const errorText = (e) => (e instanceof TypeError ? "Sin conexión con pastor" : e.message);
+const errorText = (e) =>
+  e instanceof TypeError ? "Sin conexión con pastor"
+  : e.name === "TimeoutError" ? "pastor no responde"
+  : e.message;
 
 /** Corre `fn` y avisa si falla; sin token, vuelve a pedirlo. */
 async function attempt(fn) {
@@ -585,6 +601,11 @@ function agentView(id) {
 
   let first = true;
   let sentSize = "";
+  // Mientras no mirabas, la TUI u otro celular pudieron cambiar el tamaño:
+  // al volver se manda de nuevo.
+  const resend = () => { if (!document.hidden) sentSize = ""; };
+  document.addEventListener("visibilitychange", resend);
+  cleanup.push(() => document.removeEventListener("visibilitychange", resend));
   // Con la conversación a la vista, la pantalla no se pide.
   let screenVisible = true;
   const pollScreen = every(1500, async () => {
@@ -627,12 +648,23 @@ function agentView(id) {
 
   // En fila: dos toques seguidos irían en paralelo y tmux podría recibirlos
   // al revés, o Escape y la siguiente tecla como una sola (Alt+tecla).
+  // Lo que esperó demasiado en la fila no se manda: al volver la red, un «y»
+  // o un Enter viejos caerían en otra pantalla del agente.
   let queue = Promise.resolve();
-  const post = (path, body) => (queue = queue.then(() => attempt(async () => {
-    await api("POST", `/agents/${encodeURIComponent(id)}${path}`, body);
-    setTimeout(screenVisible ? pollScreen : chat.refresh, 300);
-    return true;
-  })));
+  const post = (path, body) => {
+    const queued = Date.now();
+    return (queue = queue.then(() => {
+      if (Date.now() - queued > STALE_INPUT) {
+        toast("No se mandó: pastor tardó en responder", true);
+        return false;
+      }
+      return attempt(async () => {
+        await api("POST", `/agents/${encodeURIComponent(id)}${path}`, body);
+        setTimeout(screenVisible ? pollScreen : chat.refresh, 300);
+        return true;
+      });
+    }));
+  };
 
   const keys = h("div", { class: "keys", role: "toolbar", "aria-label": "Teclas" }, KEYS.map(([key, label]) => h("button", {
     type: "button",
@@ -658,10 +690,12 @@ function agentView(id) {
   const form = h("form", {
     class: "composer-row",
     onsubmit: once(async () => {
-      if (!text.value.trim()) return;
-      if (await post("/send", { text: text.value })) {
-        text.value = "";
-        store.set(draftKey, "");
+      const sent = text.value;
+      if (!sent.trim()) return;
+      if (await post("/send", { text: sent })) {
+        // Lo que se escribió mientras se enviaba se queda.
+        text.value = text.value.startsWith(sent) ? text.value.slice(sent.length).trimStart() : text.value;
+        store.set(draftKey, text.value);
         grow();
       }
     }),

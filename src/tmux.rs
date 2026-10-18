@@ -78,6 +78,12 @@ fn arg(s: &str) -> String {
     }
 }
 
+/// Directorio para `-c`: tmux expande formatos en él, así que un `#` de la
+/// ruta (`~/C#/api`) la cambiaría y uno con `#(cmd)` ejecutaría `cmd`.
+fn dir_arg(cwd: &Path) -> String {
+    cwd.to_string_lossy().replace('#', "##")
+}
+
 /// Crea una sesión desacoplada que ejecuta `cmd` en `cwd`. Cuando `cmd`
 /// termina, se ejecuta `then` (código de `sh`), que deja abierto un shell
 /// para poder volver a lanzar el agente.
@@ -88,7 +94,7 @@ pub fn new_session(
     cmd: &[String],
     then: &str,
 ) -> Result<()> {
-    let cwd = cwd.to_string_lossy();
+    let cwd = dir_arg(cwd);
     let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let agent_cmd = cmd
         .iter()
@@ -124,10 +130,27 @@ pub fn new_session(
         args.extend(["-e", e.as_str()]);
     }
     args.extend(["-P", "-F", "#{pane_id}"]);
+    // tmux rechaza los comandos de más de unos 16 KB («command too long»):
+    // con un prompt largo, el script va en un archivo que se borra al leerlo.
+    let file = (script.len() > MAX_INLINE_SCRIPT)
+        .then(|| launch_file(name, &script))
+        .transpose()?;
+    let file_arg = file.as_ref().map(|f| f.to_string_lossy().into_owned());
     // Varios argumentos: tmux ejecuta `sh` directamente, sin pasar por el
     // shell del usuario (que podría ser fish).
-    args.extend(["sh", "-c", &script, "pastor"]);
-    let pane = run(&args)?.trim().to_string();
+    match &file_arg {
+        Some(f) => args.extend(["sh", f.as_str()]),
+        None => args.extend(["sh", "-c", &script, "pastor"]),
+    }
+    let pane = match run(&args) {
+        Ok(out) => out.trim().to_string(),
+        Err(e) => {
+            if let Some(f) = &file {
+                let _ = std::fs::remove_file(f);
+            }
+            return Err(e);
+        }
+    };
     set_role(&pane, "agent")?;
 
     // Si hasta el shell termina, dejamos el panel visible para poder leer su salida.
@@ -147,6 +170,24 @@ pub fn new_session(
         run(&["set-option", "-t", &target, opt, val])?;
     }
     Ok(())
+}
+
+/// Hasta este tamaño el script va como argumento; con lo que suman el resto
+/// de argumentos queda lejos del límite de tmux.
+const MAX_INLINE_SCRIPT: usize = 8 * 1024;
+
+/// Guarda `script` para `sh` en un archivo solo legible por el usuario (puede
+/// llevar el prompt), que el propio script borra al empezar.
+fn launch_file(name: &str, script: &str) -> Result<std::path::PathBuf> {
+    let dir = crate::store::data_dir().join("launch");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(format!("{name}-{}.sh", unique_suffix()));
+    let contents = format!(
+        "rm -f -- {}\n{script}",
+        shell_quote(&file.to_string_lossy())
+    );
+    crate::store::write_atomic_mode(&file, contents.as_bytes(), Some(0o600))?;
+    Ok(file)
 }
 
 /// Ayuda de la barra de estado, con el prefijo real (puede que lo hayas
@@ -227,6 +268,11 @@ pub fn panes() -> Result<HashMap<String, Vec<Pane>>> {
     Ok(map)
 }
 
+/// Si el error de tmux es que la sesión ya no existe (o ni el servidor).
+pub fn session_gone(e: &anyhow::Error) -> bool {
+    no_server(e) || e.to_string().contains("can't find session")
+}
+
 /// Si el error de tmux es que no hay servidor (sin socket, o uno que quedó
 /// de un servidor que ya no está).
 fn no_server(e: &anyhow::Error) -> bool {
@@ -239,7 +285,7 @@ fn no_server(e: &anyhow::Error) -> bool {
 
 /// Abre una terminal a la derecha de `pane` (sin quitarle el foco) y devuelve su id.
 pub fn split_right(pane: &str, cwd: &Path) -> Result<String> {
-    let cwd = cwd.to_string_lossy();
+    let cwd = dir_arg(cwd);
     let args = [
         "split-window",
         "-h",
@@ -575,6 +621,52 @@ mod tests {
         let cmd = ["sleep".to_string(), "30".to_string()];
         new_session(&s.0, Path::new("/"), &[], &cmd, "true").unwrap();
         assert!(panes().unwrap().contains_key(&s.0));
+    }
+
+    #[test]
+    fn un_numeral_en_el_directorio_no_se_expande() {
+        let Some(_serial) = have_tmux() else {
+            return;
+        };
+        let base = std::env::temp_dir().join(format!("pastor-numeral{}", std::process::id()));
+        let dir = base.join("C#S #(touch pwned)");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Como lo hace `ops`: en macOS el temporal es un enlace a /private/var.
+        let dir = dir.canonicalize().unwrap();
+        let s = Session(format!("numeral{}", std::process::id()));
+        let cmd = ["sleep".to_string(), "30".to_string()];
+        new_session(&s.0, &dir, &[], &cmd, "true").unwrap();
+        let path = run(&[
+            "display",
+            "-p",
+            "-t",
+            &format!("={}:", s.0),
+            "#{pane_current_path}",
+        ]);
+        let term = split_right(&format!("={}:", s.0), &dir);
+        let pwned = Path::new("pwned").exists();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(path.unwrap().trim(), dir.to_str().unwrap());
+        assert!(term.is_ok());
+        assert!(!pwned);
+    }
+
+    #[test]
+    fn lanza_con_un_prompt_largo() {
+        let Some(_serial) = have_tmux() else {
+            return;
+        };
+        let s = Session(format!("largo{}", std::process::id()));
+        let prompt = format!("{}fin", "palabra ".repeat(4000));
+        let cmd = ["printf".to_string(), "%s\\n".to_string(), prompt];
+        new_session(&s.0, Path::new("/"), &[], &cmd, "sleep 30").unwrap();
+        let screen = screen_until(&format!("={}:", s.0), |t| t.contains("fin"));
+        assert!(screen.contains("palabra fin"), "{screen}");
+        let left = std::fs::read_dir(crate::store::data_dir().join("launch"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(&s.0));
+        assert!(!left, "el archivo del script no se borró");
     }
 
     #[test]

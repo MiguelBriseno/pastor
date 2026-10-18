@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
-use axum::extract::{FromRequest, Path, Query, Request, State as Shared};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State as Shared};
+use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -258,6 +259,21 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     }
 }
 
+/// Como `Query`, con el mismo `{"error": ...}` que `Body` si no se entiende
+/// (`?cols=-1`).
+struct Params<T>(T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for Params<T> {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Response> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(v)) => Ok(Params(v)),
+            Err(e) => Err(error(e.status(), e.body_text())),
+        }
+    }
+}
+
 /// `cwd` llega del celular: relativo o con `~` se resolvería contra el
 /// directorio desde el que se lanzó el servidor.
 fn not_absolute(cwd: &std::path::Path) -> Option<Response> {
@@ -270,7 +286,8 @@ fn not_absolute(cwd: &std::path::Path) -> Option<Response> {
 }
 
 /// Ejecuta `f` (que toca tmux y el disco) fuera del hilo de tokio. Un error
-/// de `ops` es casi siempre del pedido (agente que no existe, texto vacío…).
+/// de `ops` es casi siempre del pedido (agente que no existe, texto vacío…);
+/// uno de disco o un `state.json` ilegible es nuestro.
 async fn blocking<T: Serialize + Send + 'static>(
     f: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Response {
@@ -281,6 +298,8 @@ async fn blocking<T: Serialize + Send + 'static>(
             // Los de `find_agent` y `find_task`.
             let code = if msg.starts_with("no existe") {
                 StatusCode::NOT_FOUND
+            } else if internal(&e) {
+                StatusCode::INTERNAL_SERVER_ERROR
             } else {
                 StatusCode::BAD_REQUEST
             };
@@ -288,6 +307,17 @@ async fn blocking<T: Serialize + Send + 'static>(
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// Un fallo de disco o un JSON nuestro que no se entiende. Un `cwd` que no
+/// existe, no es un directorio o no se puede abrir es del pedido.
+fn internal(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::{NotADirectory, NotFound, PermissionDenied};
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| !matches!(io.kind(), NotFound | NotADirectory | PermissionDenied))
+            || c.is::<serde_json::Error>()
+    })
 }
 
 fn ok() -> Value {
@@ -383,7 +413,7 @@ struct Size {
 
 /// Con `?cols=…&rows=…`, antes ajusta el agente a ese tamaño para que dibuje
 /// líneas que quepan en el celular.
-async fn screen(Path(id): Path<String>, Query(size): Query<Size>) -> Response {
+async fn screen(Path(id): Path<String>, Params(size): Params<Size>) -> Response {
     blocking(move || {
         if let Size {
             cols: Some(cols),
@@ -420,7 +450,7 @@ const PAGE: usize = 300;
 async fn conversation(
     Shared(app): Shared<Arc<App>>,
     Path(id): Path<String>,
-    Query(since): Query<Since>,
+    Params(since): Params<Since>,
 ) -> Response {
     blocking(move || {
         let state = State::load()?;
@@ -675,5 +705,36 @@ mod tests {
             r.starts_with("HTTP/1.1 404") && r.contains(r#"{"error":"#),
             "{r}"
         );
+    }
+
+    #[test]
+    fn una_consulta_mal_formada_responde_con_json() {
+        let r = get(
+            "/api/agents/a1/screen?cols=-1&rows=x",
+            Some("Bearer secreto"),
+        );
+        assert!(
+            r.starts_with("HTTP/1.1 400") && r.contains(r#"{"error":"#),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn distingue_errores_internos_de_los_del_pedido() {
+        let io = |kind| anyhow::Error::from(std::io::Error::from(kind));
+        assert!(internal(
+            &io(std::io::ErrorKind::StorageFull).context("no pude guardar state.json")
+        ));
+        assert!(!internal(
+            &io(std::io::ErrorKind::PermissionDenied).context("el directorio /root/x no existe")
+        ));
+        assert!(!internal(
+            &io(std::io::ErrorKind::NotFound).context("el directorio /x no existe")
+        ));
+        let bad_json = serde_json::from_str::<Value>("{").unwrap_err();
+        assert!(internal(
+            &anyhow::Error::from(bad_json).context("state.json está corrupto")
+        ));
+        assert!(!internal(&anyhow::anyhow!("el mensaje está vacío")));
     }
 }

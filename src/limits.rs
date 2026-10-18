@@ -26,6 +26,8 @@ use crate::agent::Kind;
 pub const TTL: Duration = Duration::from_secs(60);
 /// Desde cuándo un dato se considera viejo y se dice de cuándo es.
 const STALE: Duration = Duration::from_secs(5 * 60);
+/// Hasta cuándo un fallo deja ver el último dato bueno en vez del error.
+const KEEP: Duration = Duration::from_secs(60 * 60);
 /// Lo que se lee del final de una sesión de Codex buscando el último evento.
 const TAIL: u64 = 1 << 20;
 /// Cuántas sesiones de Codex, de la más reciente hacia atrás, se miran: sin
@@ -100,7 +102,7 @@ impl Cache {
         if self.fresh() {
             return false;
         }
-        self.usage = fetch();
+        self.usage = keep_last_good(&self.usage, fetch(), Utc::now());
         self.at = Some(Instant::now());
         true
     }
@@ -127,7 +129,7 @@ impl Cache {
     #[cfg(any(feature = "serve", test))]
     pub fn set(&mut self, at: Instant, usage: Vec<Usage>) {
         if self.at == Some(at) {
-            self.usage = usage;
+            self.usage = keep_last_good(&self.usage, usage, Utc::now());
         }
     }
 
@@ -143,6 +145,37 @@ impl Cache {
         &self.usage
     }
 }
+
+/// Un fallo pasajero (un 429, un timeout) no borra lo último que se supo:
+/// se sigue mostrando, y pasado `STALE` se dice de cuándo es. Si el fallo
+/// dura más de `KEEP`, ya se muestra.
+fn keep_last_good(old: &[Usage], new: Vec<Usage>, now: DateTime<Utc>) -> Vec<Usage> {
+    let age = |o: &Usage| o.updated_at.map(|t| (now - t).to_std().unwrap_or_default());
+    new.into_iter()
+        .map(|u| match old.iter().find(|o| o.kind == u.kind) {
+            Some(o)
+                if u.error.as_deref().is_some_and(transient)
+                    && o.error.is_none()
+                    && !o.windows.is_empty()
+                    && age(o).is_some_and(|a| a < KEEP) =>
+            {
+                Usage {
+                    stale: age(o).is_some_and(|a| a >= STALE),
+                    ..o.clone()
+                }
+            }
+            _ => u,
+        })
+        .collect()
+}
+
+/// Si el error es de la consulta y puede pasar solo (sin red, un 429, un
+/// 5xx). Uno que pide hacer algo (la sesión venció, un 401) se muestra ya.
+fn transient(error: &str) -> bool {
+    error.starts_with(FETCH_FAILED) && !error.contains(" 401") && !error.contains(" 403")
+}
+
+const FETCH_FAILED: &str = "no pude consultar el uso";
 
 pub fn fetch() -> Vec<Usage> {
     let home = dirs::home_dir().unwrap_or_default();
@@ -178,6 +211,12 @@ fn claude(home: &Path) -> Result<Usage> {
 }
 
 fn get_usage(token: &str) -> Result<Value> {
+    // Antes de lanzar curl, para no dejarlo sin esperar. Además va entre
+    // comillas: un token con `"` o un salto de línea (un
+    // archivo dañado) no debe poder añadir opciones a curl.
+    if token.chars().any(char::is_control) {
+        bail!("el token de Claude tiene caracteres no válidos");
+    }
     let mut child = Command::new("curl")
         // La configuración por la entrada: así el token no se ve en `ps`.
         .args(["-fsS", "-m", "5", "-K", "-"])
@@ -188,8 +227,9 @@ fn get_usage(token: &str) -> Result<Value> {
         .context("no pude ejecutar curl")?;
     let config = format!(
         "url = \"https://api.anthropic.com/api/oauth/usage\"\n\
-         header = \"Authorization: Bearer {token}\"\n\
-         header = \"anthropic-beta: oauth-2025-04-20\"\n"
+         header = {}\n\
+         header = \"anthropic-beta: oauth-2025-04-20\"\n",
+        crate::ntfy::quote(&format!("Authorization: Bearer {token}"))
     );
     // Si curl murió antes de leerla, su stderr explica más que el "broken pipe".
     if let Some(mut stdin) = child.stdin.take() {
@@ -198,7 +238,7 @@ fn get_usage(token: &str) -> Result<Value> {
     let out = child.wait_with_output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        bail!("no pude consultar el uso: {}", err.trim());
+        bail!("{FETCH_FAILED}: {}", err.trim());
     }
     serde_json::from_slice(&out.stdout).context("respuesta de uso inesperada")
 }
@@ -345,6 +385,50 @@ fn window_name(minutes: Option<i64>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn un_fallo_pasajero_no_borra_el_ultimo_dato() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).unwrap();
+        let good = |mins: i64| Usage {
+            kind: Kind::Claude,
+            windows: vec![Window {
+                name: "5 h".into(),
+                used_pct: 40.0,
+                resets_at: None,
+            }],
+            plan: None,
+            updated_at: Some(now - chrono::Duration::minutes(mins)),
+            stale: false,
+            error: None,
+        };
+        let failed = || {
+            vec![Usage::from(
+                Kind::Claude,
+                Err(anyhow!(
+                    "{FETCH_FAILED}: The requested URL returned error: 429"
+                )),
+            )]
+        };
+        // Recién leído: se queda tal cual.
+        assert_eq!(keep_last_good(&[good(1)], failed(), now), [good(1)]);
+        // De hace un rato: se queda, pero se dice de cuándo es.
+        let kept = keep_last_good(&[good(10)], failed(), now);
+        assert!(kept[0].stale && kept[0].error.is_none());
+        // Tras una hora fallando, se muestra el error.
+        assert!(keep_last_good(&[good(61)], failed(), now)[0]
+            .error
+            .is_some());
+        // Sin dato bueno antes, el error.
+        assert!(keep_last_good(&[], failed(), now)[0].error.is_some());
+        // Lo que pide hacer algo se ve enseguida.
+        for e in [
+            "la sesión venció; abre Claude Code para renovarla",
+            "no pude consultar el uso: The requested URL returned error: 401",
+        ] {
+            let u = vec![Usage::from(Kind::Claude, Err(anyhow!("{e}")))];
+            assert!(keep_last_good(&[good(1)], u, now)[0].error.is_some(), "{e}");
+        }
+    }
 
     #[test]
     fn lee_el_uso_de_claude() {

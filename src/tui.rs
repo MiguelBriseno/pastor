@@ -159,6 +159,11 @@ struct App {
     state: State,
     snaps: HashMap<String, Snapshot>,
     observer: Observer,
+    /// Pánicos seguidos del observador, cuándo toca reiniciarlo y desde
+    /// cuándo corre el de ahora.
+    observer_fails: u32,
+    observer_retry: Option<Instant>,
+    observer_since: Instant,
     actions: Actions,
     agent_sel: ListState,
     task_sel: TableState,
@@ -188,6 +193,9 @@ impl App {
             state: State::default(),
             snaps: HashMap::new(),
             observer: Observer::spawn(HashMap::new(), true),
+            observer_fails: 0,
+            observer_retry: None,
+            observer_since: Instant::now(),
             actions: Actions::spawn(),
             agent_sel: ListState::default(),
             task_sel: TableState::default(),
@@ -210,11 +218,44 @@ impl App {
         // Que una acción a medias (lanzar un agente, por ejemplo) termine,
         // también si el bucle salió por un error de la terminal.
         if self.actions.pending > 0 {
-            self.set_flash("Esperando a que termine la acción en curso…".to_string());
+            self.set_flash(
+                "Esperando a que termine la acción en curso… (q otra vez: salir sin esperar)"
+                    .to_string(),
+            );
             let _ = term.draw(|f| self.draw(f));
         }
-        self.actions.wait();
+        self.actions.wait(abandon);
         result
+    }
+
+    /// Si el pánico se repite en cada pasada, reiniciarlo enseguida sería
+    /// un bucle: cada vez espera el doble, hasta un minuto.
+    fn restart_observer(&mut self) {
+        match self.observer_retry {
+            None => {
+                // Si llevaba un rato bien, este pánico no es seguido del anterior.
+                if self.observer_since.elapsed() > Duration::from_secs(5 * 60) {
+                    self.observer_fails = 0;
+                }
+                let wait = Duration::from_secs(1 << self.observer_fails.min(6))
+                    .min(Duration::from_secs(60));
+                self.observer_fails += 1;
+                self.observer_retry = Some(Instant::now() + wait);
+                self.set_flash(format!(
+                    "El observador de paneles falló; se reinicia en {} s. {}",
+                    wait.as_secs(),
+                    last_panic()
+                ));
+            }
+            Some(at) if Instant::now() >= at => {
+                self.observer_retry = None;
+                self.observer_since = Instant::now();
+                // Con los estados que ya se veían, para no perder un aviso.
+                let seen = self.snaps.iter().map(|(id, s)| (id.clone(), s.status));
+                self.observer = Observer::spawn(seen.collect(), false);
+            }
+            Some(_) => {}
+        }
     }
 
     fn event_loop(&mut self, term: &mut DefaultTerminal) -> Result<()> {
@@ -241,13 +282,7 @@ impl App {
                 self.finish(result, retry);
             }
             if self.observer.died() {
-                self.set_flash(format!(
-                    "El observador de paneles falló; se reinició. {}",
-                    last_panic()
-                ));
-                // Con los estados que ya se veían, para no perder un aviso.
-                let seen = self.snaps.iter().map(|(id, s)| (id.clone(), s.status));
-                self.observer = Observer::spawn(seen.collect(), false);
+                self.restart_observer();
             }
             let before = self.want_fit.clone();
             term.draw(|f| self.draw(f))?;
@@ -429,6 +464,13 @@ impl App {
     }
 
     fn on_normal(&mut self, key: KeyEvent, term: &mut DefaultTerminal) -> Result<()> {
+        // Los atajos son teclas solas: Ctrl-x o Alt-x no deben terminar un agente.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Ok(());
+        }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('1') => self.tab = Tab::Agents,
@@ -1900,13 +1942,35 @@ impl Actions {
         }
     }
 
-    /// Espera a que terminen las acciones pendientes.
-    fn wait(&mut self) {
+    /// Espera a que terminen las acciones pendientes, salvo que `abandon`
+    /// diga que ya no: si tmux se colgara, la espera no tendría fin.
+    fn wait(&mut self, mut abandon: impl FnMut() -> bool) {
         self.jobs = None;
+        while self.pending > 0 {
+            match self.results.recv_timeout(Duration::from_millis(100)) {
+                Ok(_) => self.pending -= 1,
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) if abandon() => return,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
+}
+
+/// Si se pulsó q, Esc o Ctrl-C (para dejar de esperar al salir).
+fn abandon() -> bool {
+    if !event::poll(Duration::ZERO).unwrap_or(false) {
+        return false;
+    }
+    let Ok(Event::Key(key)) = event::read() else {
+        return false;
+    };
+    key.kind == KeyEventKind::Press
+        && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
 }
 
 /// El mensaje de un pánico, si es texto.
@@ -2121,9 +2185,10 @@ fn keep_tail(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
 
 fn edit(s: &mut String, key: &KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Char('u') if ctrl => s.clear(),
-        KeyCode::Char(c) if !ctrl => s.push(c),
+        KeyCode::Char(c) if !ctrl && !alt => s.push(c),
         KeyCode::Backspace => {
             s.pop();
         }
@@ -2258,8 +2323,9 @@ mod tests {
         edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
         edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(s, "a");
-        // Ctrl+letra no escribe la letra; Ctrl+U borra todo.
+        // Ctrl+letra y Alt+letra no escriben la letra; Ctrl+U borra todo.
         edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        edit(&mut s, &key(KeyCode::Char('x'), KeyModifiers::ALT));
         assert_eq!(s, "a");
         edit(&mut s, &key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(s, "");
