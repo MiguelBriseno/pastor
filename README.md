@@ -280,21 +280,58 @@ viniera después llegaría al shell.
 
 ### La app del celular
 
-`pastor serve` también sirve una app web en `/`: la lista de agentes con su estado, la pantalla de
-cada uno en vivo con una caja para escribirle y botones para las teclas (⏎, Esc, flechas, `1`/`2`/`3`,
-`y`/`n`, ^C), y las tareas. La primera vez pide el token y lo guarda solo en ese dispositivo.
+`pastor serve` también sirve una app web en `/`, pensada para el celular: los agentes agrupados por
+estado (los que te esperan, primero), la pantalla de cada uno en vivo con una caja para escribirle y
+botones para las teclas (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C), y las tareas. La
+primera vez pide el token y lo guarda solo en ese dispositivo.
 
 Para instalarla como app (PWA) el navegador exige HTTPS. Con Tailscale basta con publicar el puerto
-dentro de tu tailnet, sin abrir nada a internet:
+dentro de tu tailnet, sin abrir nada a internet. En la consola de Tailscale (*DNS*) tienen que estar
+activados *MagicDNS* y *HTTPS Certificates*; luego, una sola vez:
 
 ```sh
-pastor serve                              # en 127.0.0.1:7433
 sudo tailscale serve --bg 7433            # https://<máquina>.<tailnet>.ts.net → 127.0.0.1:7433
 tailscale serve status                    # la URL exacta
 ```
 
-Abre esa URL en el celular (Chrome en Android) y elige *Instalar app* en el menú. Así el tráfico va
-cifrado y `pastor serve` sigue escuchando solo en `127.0.0.1`. Para quitarlo: `sudo tailscale serve --https=443 off`.
+Tailscale guarda esa configuración y la mantiene después de reiniciar. Abre la URL en el celular
+(Chrome en Android), pega el token y elige *Instalar app* en el menú. El tráfico va cifrado y
+`pastor serve` sigue escuchando solo en `127.0.0.1`. Para quitarlo: `sudo tailscale serve --https=443 off`.
+
+### Que `pastor serve` arranque con la computadora
+
+Como servicio de systemd del usuario, el servidor no depende de tener pastor abierto, arranca al
+encender la computadora y se reinicia si falla. Crea `~/.config/systemd/user/pastor-serve.service`:
+
+```ini
+[Unit]
+Description=pastor serve: API y app del celular
+
+[Service]
+# Los agentes que se lanzan desde el celular heredan este PATH: tiene que
+# encontrar claude, codex u opencode (y node, si lo usan).
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h
+ExecStart=%h/.cargo/bin/pastor serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+Ajusta `PATH` a donde tengas los agentes (`command -v claude codex opencode`). systemd no lee tu
+`.bashrc`, y si es el servidor el que arranca el tmux de pastor, los agentes heredan este entorno.
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now pastor-serve
+loginctl enable-linger "$USER"            # que arranque al encender, sin iniciar sesión
+
+systemctl --user status pastor-serve      # si está corriendo
+journalctl --user -u pastor-serve -f      # su registro
+systemctl --user restart pastor-serve     # después de reinstalar pastor
+```
 
 ### Avisos en el celular con ntfy
 
