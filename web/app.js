@@ -484,8 +484,27 @@ function newAgentSheet() {
 function termPrefs(el) {
   const size = Math.min(18, Math.max(9, Number(store.get("pastor-font")) || 12));
   el.style.fontSize = size + "px";
-  el.classList.toggle("wrap", store.get("pastor-wrap") === "1");
+  // Por defecto ajusta: el agente ya dibuja a este ancho, y así una línea que
+  // aún venga ancha (otra vista lo cambió) tampoco obliga a moverse de lado.
+  el.classList.toggle("wrap", store.get("pastor-wrap") !== "0");
   return size;
+}
+
+/** Columnas y filas que caben en `el` con su letra actual. */
+function termSize(el) {
+  const probe = h("span", { text: "M".repeat(50), style: "position:absolute;visibility:hidden;white-space:pre" });
+  probe.style.font = getComputedStyle(el).font;
+  el.after(probe);
+  const { width, height } = probe.getBoundingClientRect();
+  probe.remove();
+  const cs = getComputedStyle(el);
+  const px = (p) => parseFloat(cs[p]) || 0;
+  const w = el.clientWidth - px("paddingLeft") - px("paddingRight");
+  const h_ = el.clientHeight - px("paddingTop") - px("paddingBottom");
+  if (!width || !height || w <= 0 || h_ <= 0) return null;
+  // Una columna de margen: si se redondea hacia arriba, el separador de
+  // ancho completo de Claude pasaría a dos líneas.
+  return { cols: Math.floor(w / (width / 50)) - 1, rows: Math.floor(h_ / height) };
 }
 
 function agentView(id) {
@@ -528,7 +547,11 @@ function agentView(id) {
   let first = true;
   const pollScreen = every(1500, async () => {
     try {
-      const { text } = await api("GET", `/agents/${encodeURIComponent(id)}/screen`);
+      // El tamaño va en cada consulta: el agente redibuja a este ancho y sus
+      // líneas caben sin moverse de lado (el servidor no hace nada si ya es ese).
+      const size = termSize(screen);
+      const query = size ? `?cols=${size.cols}&rows=${size.rows}` : "";
+      const { text } = await api("GET", `/agents/${encodeURIComponent(id)}/screen${query}`);
       note.hidden = true;
       if (!first && screen.textContent === text) return;
       // Solo baja si ya estaba abajo: si subiste a leer, no te mueve.
@@ -545,6 +568,12 @@ function agentView(id) {
       note.hidden = false;
     }
   });
+
+  // Al girar el celular (o al abrirse el teclado) cambia lo que cabe.
+  let resizeTimer;
+  const onResize = () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(pollScreen, 300); };
+  window.addEventListener("resize", onResize);
+  cleanup.push(() => { clearTimeout(resizeTimer); window.removeEventListener("resize", onResize); });
 
   // En fila: dos toques seguidos irían en paralelo y tmux podría recibirlos
   // al revés, o Escape y la siguiente tecla como una sola (Alt+tecla).
@@ -597,8 +626,10 @@ function agentView(id) {
     const step = (delta) => {
       store.set("pastor-font", String(Number(size.textContent) + delta));
       size.textContent = String(termPrefs(screen));
+      // Con otra letra caben otras columnas: que el agente se ajuste ya.
+      pollScreen();
     };
-    const wrapped = store.get("pastor-wrap") === "1";
+    const wrapped = store.get("pastor-wrap") !== "0";
     const d = sheet(agent?.name || id,
       agent && h("dl", { class: "info" },
         row("Tipo", KIND[agent.kind]?.label || agent.kind),
@@ -609,7 +640,7 @@ function agentView(id) {
       ),
       h("div", { class: "menu" },
         menuItem("wrap", wrapped ? "Sin ajustar líneas" : "Ajustar líneas al ancho", () => {
-          store.set("pastor-wrap", wrapped ? "" : "1");
+          store.set("pastor-wrap", wrapped ? "0" : "1");
           termPrefs(screen);
           d.close();
         }),

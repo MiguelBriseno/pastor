@@ -324,6 +324,32 @@ pub fn send_keys(pane: &str, keys: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Ajusta la ventana de la sesión `name` a `cols`×`rows`, para que el agente
+/// dibuje al ancho de quien lo mira. Devuelve si cambió de tamaño. Con alguien
+/// dentro (`pastor attach`) no hace nada: manda su terminal, y forzarla haría
+/// que el agente se redibujara una y otra vez.
+pub fn fit(name: &str, cols: u16, rows: u16) -> Result<bool> {
+    let target = format!("{}:", session(name));
+    let now = run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &target,
+        "#{session_attached} #{window_width}x#{window_height}",
+    ])?;
+    let (attached, size) = now.trim().split_once(' ').unwrap_or(("0", ""));
+    if attached != "0" || size == format!("{cols}x{rows}") {
+        return Ok(false);
+    }
+    let (x, y) = (cols.to_string(), rows.to_string());
+    run(&["resize-window", "-t", &target, "-x", &x, "-y", &y])?;
+    // `resize-window` deja la ventana en `window-size manual`: sin quitarlo,
+    // al entrar con `pastor attach` ya no tomaría el tamaño de tu terminal.
+    // Sin nadie dentro, la ventana conserva el tamaño nuevo.
+    run(&["set-option", "-w", "-u", "-t", &target, "window-size"])?;
+    Ok(true)
+}
+
 /// Texto visible del panel.
 pub fn capture(target: &str) -> Result<String> {
     run(&["capture-pane", "-p", "-J", "-t", target])
@@ -458,9 +484,9 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg, capture, check_keys, kill_session, new_session, no_server, pane_pids, panes,
-        parse_version, paste_safe, run, send_keys, send_text, shell_quote, split_right, type_line,
-        valid_key,
+        arg, capture, check_keys, fit, kill_session, new_session, no_server, pane_pids, panes,
+        parse_version, paste_safe, run, send_keys, send_text, session, shell_quote, split_right,
+        type_line, valid_key,
     };
     use std::path::Path;
     use std::process::Command;
@@ -549,6 +575,36 @@ mod tests {
         run(&["new-session", "-d", "-s", &s.0, "sleep", "30"]).unwrap();
         assert!(kill_session(&format!("prueba{pid}-1")).is_err());
         assert!(panes().unwrap().contains_key(&s.0));
+    }
+
+    #[test]
+    fn ajusta_la_ventana_y_sigue_tomando_el_tamano_al_entrar() {
+        let Some(_serial) = have_tmux() else {
+            return;
+        };
+        let s = Session(format!("ancho{}", std::process::id()));
+        let cmd = ["sleep".to_string(), "30".to_string()];
+        new_session(&s.0, Path::new("/"), &[], &cmd, "true").unwrap();
+        let target = format!("{}:", session(&s.0));
+        let size = || {
+            run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &target,
+                "#{window_width}x#{window_height}",
+            ])
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        assert!(fit(&s.0, 48, 30).unwrap());
+        assert_eq!(size(), "48x30");
+        // Mismo tamaño: no toca nada.
+        assert!(!fit(&s.0, 48, 30).unwrap());
+        // `window-size` vuelve al global, no queda en `manual`.
+        let local = run(&["show-options", "-w", "-t", &target, "window-size"]).unwrap();
+        assert!(local.trim().is_empty(), "{local}");
     }
 
     #[test]

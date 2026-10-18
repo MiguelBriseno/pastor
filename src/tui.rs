@@ -167,6 +167,10 @@ struct App {
     desc_height: u16,
     flash: Option<(String, Instant)>,
     stats: Stats,
+    /// Tamaño al que debe dibujar el agente que se ve (id, columnas, filas),
+    /// y el último que se le pidió: solo se le pide otra vez si cambia.
+    want_fit: Option<(String, u16, u16)>,
+    fitted: Option<(String, u16, u16)>,
     quit: bool,
 }
 
@@ -186,6 +190,8 @@ impl App {
             desc_height: 7,
             flash: None,
             stats: Stats::default(),
+            want_fit: None,
+            fitted: None,
             quit: false,
         }
     }
@@ -232,6 +238,13 @@ impl App {
                 self.observer = Observer::spawn(seen.collect(), false);
             }
             term.draw(|f| self.draw(f))?;
+            if self.want_fit != self.fitted {
+                if let Some((id, cols, rows)) = &self.want_fit {
+                    // Si falla (el agente ya salió), solo se ve cortado.
+                    let _ = ops::fit(id, *cols, *rows);
+                }
+                self.fitted = self.want_fit.clone();
+            }
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key, term),
@@ -432,6 +445,8 @@ impl App {
             KeyCode::Enter | KeyCode::Char('a') => {
                 if let Some((id, _)) = selected {
                     let result = suspend(term, || ops::attach(&id));
+                    // Dentro tomó el tamaño de tu terminal: hay que volver a ajustarlo.
+                    self.fitted = None;
                     self.refresh();
                     result?;
                 }
@@ -732,6 +747,7 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(f.area());
+        self.want_fit = None;
         self.draw_header(f, header);
         match self.tab {
             Tab::Agents => self.draw_agents(f, body),
@@ -808,6 +824,18 @@ impl App {
         let name_w = (list_w as usize).saturating_sub(28 + kind_w).max(6);
         let [left, right] =
             Layout::horizontal([Constraint::Length(list_w), Constraint::Min(0)]).areas(area);
+        // Que el agente dibuje al tamaño de su vista, sin los bordes: así sus
+        // líneas no se cortan. Con terminal abierta, la ventana de tmux lleva
+        // los dos paneles y el separador entre ellos.
+        self.want_fit = self.selected_agent().map(|a| {
+            let term = self.snaps.get(&a.id).is_some_and(|s| s.term.is_some());
+            let borders = if term { 3 } else { 2 };
+            (
+                a.id.clone(),
+                right.width.saturating_sub(borders),
+                right.height.saturating_sub(2),
+            )
+        });
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .title(format!(" {}Agentes ", pad(ic.agents)));

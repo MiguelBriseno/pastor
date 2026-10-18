@@ -257,7 +257,7 @@ IP de Tailscale (que ya cifra).
 | `POST` | `/api/agents` | `{"kind": "claude", "cwd": "/ruta", "name"?, "prompt"?}` |
 | `POST` | `/api/agents/{id}/send` | `{"text": "..."}` (lo pega y pulsa Enter) |
 | `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
-| `GET` | `/api/agents/{id}/screen` | — (responde `{"text": "..."}`, lo que se ve en su panel) |
+| `GET` | `/api/agents/{id}/screen` | — (responde `{"text": "..."}`, lo que se ve en su panel; con `?cols=48&rows=30` antes lo ajusta a ese tamaño) |
 | `DELETE` | `/api/agents/{id}` | — |
 | `GET` | `/api/tasks` | — |
 | `POST` | `/api/tasks` | `{"title": "...", "description"?}` |

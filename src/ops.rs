@@ -233,6 +233,15 @@ pub fn screen(agent_key: &str) -> Result<String> {
     }
 }
 
+/// Ajusta la ventana del agente al tamaño de quien lo mira (la TUI o el
+/// celular): el agente redibuja a ese ancho y sus líneas no se salen de la
+/// pantalla. Devuelve si cambió de tamaño.
+pub fn fit(agent_key: &str, cols: u16, rows: u16) -> Result<bool> {
+    let state = State::load()?;
+    let agent = state.find_agent(agent_key)?;
+    tmux::fit(&agent.id, cols.clamp(20, 500), rows.clamp(5, 200))
+}
+
 /// Entra a la sesión del agente con el foco en el agente.
 pub fn attach(agent_key: &str) -> Result<()> {
     let id = State::load()?.find_agent(agent_key)?.id.clone();
