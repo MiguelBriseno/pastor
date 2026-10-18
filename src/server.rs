@@ -375,7 +375,8 @@ async fn screen(Path(id): Path<String>, Query(size): Query<Size>) -> Response {
         } = size
         {
             // Si cambió, una pausa para que el agente alcance a redibujarse.
-            if ops::fit(&id, cols, rows)? {
+            // Si falla (el agente ya salió), `screen` da el error claro.
+            if matches!(ops::fit(&id, cols, rows), Ok(true)) {
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
         }

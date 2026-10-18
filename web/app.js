@@ -490,21 +490,35 @@ function termPrefs(el) {
   return size;
 }
 
-/** Columnas y filas que caben en `el` con su letra actual. */
+/** Ancho de un carácter y alto de una línea con la letra de `el`; se mide
+ * una vez por tipo de letra. */
+const glyphs = new Map();
+function glyph(el) {
+  const font = getComputedStyle(el).font;
+  if (!glyphs.has(font)) {
+    const probe = h("span", { text: "M".repeat(50), style: "position:absolute;visibility:hidden;white-space:pre" });
+    probe.style.font = font;
+    el.after(probe);
+    const { width, height } = probe.getBoundingClientRect();
+    probe.remove();
+    if (!width || !height) return null;
+    glyphs.set(font, { w: width / 50, h: height });
+  }
+  return glyphs.get(font);
+}
+
+/** Columnas y filas que caben en `el` con su letra actual, o `null` si aún
+ * no tiene tamaño. */
 function termSize(el) {
-  const probe = h("span", { text: "M".repeat(50), style: "position:absolute;visibility:hidden;white-space:pre" });
-  probe.style.font = getComputedStyle(el).font;
-  el.after(probe);
-  const { width, height } = probe.getBoundingClientRect();
-  probe.remove();
+  const g = glyph(el);
+  if (!g) return null;
   const cs = getComputedStyle(el);
   const px = (p) => parseFloat(cs[p]) || 0;
-  const w = el.clientWidth - px("paddingLeft") - px("paddingRight");
-  const h_ = el.clientHeight - px("paddingTop") - px("paddingBottom");
-  if (!width || !height || w <= 0 || h_ <= 0) return null;
   // Una columna de margen: si se redondea hacia arriba, el separador de
   // ancho completo de Claude pasaría a dos líneas.
-  return { cols: Math.floor(w / (width / 50)) - 1, rows: Math.floor(h_ / height) };
+  const cols = Math.floor((el.clientWidth - px("paddingLeft") - px("paddingRight")) / g.w) - 1;
+  const rows = Math.floor((el.clientHeight - px("paddingTop") - px("paddingBottom")) / g.h);
+  return cols > 0 && rows > 0 ? { cols, rows } : null;
 }
 
 function agentView(id) {
@@ -545,13 +559,17 @@ function agentView(id) {
   });
 
   let first = true;
+  let sentSize = "";
   const pollScreen = every(1500, async () => {
     try {
-      // El tamaño va en cada consulta: el agente redibuja a este ancho y sus
-      // líneas caben sin moverse de lado (el servidor no hace nada si ya es ese).
+      // El tamaño solo va cuando cambia (o al abrir): el agente redibuja a este
+      // ancho y sus líneas caben sin moverse de lado. Mandarlo siempre haría
+      // que dos pantallas abiertas en el mismo agente se lo quitaran sin parar.
       const size = termSize(screen);
-      const query = size ? `?cols=${size.cols}&rows=${size.rows}` : "";
+      const key = size && `?cols=${size.cols}&rows=${size.rows}`;
+      const query = key && key !== sentSize ? key : "";
       const { text } = await api("GET", `/agents/${encodeURIComponent(id)}/screen${query}`);
+      if (query) sentSize = query;
       note.hidden = true;
       if (!first && screen.textContent === text) return;
       // Solo baja si ya estaba abajo: si subiste a leer, no te mueve.
@@ -569,11 +587,15 @@ function agentView(id) {
     }
   });
 
-  // Al girar el celular (o al abrirse el teclado) cambia lo que cabe.
+  // Al girar el celular, abrirse el teclado o cambiar la letra cambia lo que
+  // cabe: que el agente se ajuste ya, sin esperar a la siguiente vuelta.
   let resizeTimer;
-  const onResize = () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(pollScreen, 300); };
-  window.addEventListener("resize", onResize);
-  cleanup.push(() => { clearTimeout(resizeTimer); window.removeEventListener("resize", onResize); });
+  const resized = new ResizeObserver(() => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(pollScreen, 300);
+  });
+  resized.observe(screen);
+  cleanup.push(() => { clearTimeout(resizeTimer); resized.disconnect(); });
 
   // En fila: dos toques seguidos irían en paralelo y tmux podría recibirlos
   // al revés, o Escape y la siguiente tecla como una sola (Alt+tecla).
@@ -627,7 +649,7 @@ function agentView(id) {
       store.set("pastor-font", String(Number(size.textContent) + delta));
       size.textContent = String(termPrefs(screen));
       // Con otra letra caben otras columnas: que el agente se ajuste ya.
-      pollScreen();
+      setTimeout(pollScreen, 300);
     };
     const wrapped = store.get("pastor-wrap") !== "0";
     const d = sheet(agent?.name || id,
