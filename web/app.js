@@ -187,76 +187,6 @@ function rememberCwd(cwd) {
   store.set("pastor-cwds", JSON.stringify([cwd, ...recentCwds().filter((c) => c !== cwd)].slice(0, 8)));
 }
 
-// ---------- sonido ----------
-
-/** Suena cuando un agente te espera o termina, los mismos cambios que mandan
- * aviso, pero solo con la app a la vista: en segundo plano avisa ntfy. El
- * navegador no deja sonar nada hasta que tocas la página, y puede volver a
- * suspender el audio al salir: cada toque lo reanuda. */
-let audio = null;
-const wakeAudio = () => {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) return;
-  try {
-    audio ||= new Ctx();
-    if (audio.state !== "running") audio.resume().catch(() => {});
-  } catch {}
-};
-document.addEventListener("pointerdown", wakeAudio);
-document.addEventListener("keydown", wakeAudio);
-
-/** Las notas de cada aviso: sube si te espera, baja si terminó. */
-const CHIME = { blocked: [660, 990], finished: [880, 660] };
-
-function chime(notes) {
-  if (!audio) return;
-  // Al volver de segundo plano el audio puede seguir suspendido; si el
-  // navegador no deja reanudarlo sin un toque, no suena.
-  if (audio.state !== "running") {
-    // Si tarda (espera un toque), el tono ya llegaría tarde: no se guarda.
-    const asked = Date.now();
-    audio.resume().then(() => Date.now() - asked < 500 && audio.state === "running" && chime(notes)).catch(() => {});
-    return;
-  }
-  let t = audio.currentTime;
-  for (const freq of notes) {
-    const osc = audio.createOscillator();
-    const gain = audio.createGain();
-    osc.frequency.value = freq;
-    gain.gain.setValueAtTime(0.0001, t);
-    gain.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
-    osc.connect(gain).connect(audio.destination);
-    osc.start(t);
-    osc.stop(t + 0.3);
-    t += 0.15;
-  }
-}
-
-/** El estado de cada agente en la última lista vista con la app a la vista.
- * Se olvida al ocultarla: al volver no suena por lo que pasó mientras tanto.
- * `hides` cuenta las veces que se ocultó, para no tomar como vista una
- * consulta que salió antes (el celular la congela y responde al volver). */
-let seen = null, hides = 0;
-document.addEventListener("visibilitychange", () => { if (document.hidden) { seen = null; hides++; } });
-
-function chimeChanges(list, fresh) {
-  const ok = fresh && !document.hidden;
-  const was = ok ? seen : null;
-  seen = ok ? new Map(list.map((a) => [a.id, a.status])) : null;
-  if (!was) return;
-  let blocked = false, finished = false;
-  for (const a of list) {
-    const old = was.get(a.id);
-    if (!old) continue;
-    if (a.status === "blocked" && old !== "blocked") blocked = true;
-    else if (old === "working" && (a.status === "idle" || a.status === "dead")) finished = true;
-  }
-  // Varios a la vez suenan una sola vez; si alguno te espera, gana ese.
-  if (blocked) chime(CHIME.blocked);
-  else if (finished) chime(CHIME.finished);
-}
-
 // ---------- piezas ----------
 
 const pill = (status, label) => h("span", { class: "pill " + status }, h("i"), label);
@@ -408,11 +338,8 @@ function watchAgents(fn) {
   if (feed.agents) fn(feed.agents);
 }
 
-function setAgents(list, fresh = true) {
+function setAgents(list) {
   // Redibujar sin cambios cambia las tarjetas bajo el dedo y se pierde el toque.
-  // Antes de comparar: tras volver a la app hay que recordar lo que se ve,
-  // aunque no haya cambiado nada.
-  chimeChanges(list, fresh);
   const json = JSON.stringify(list);
   if (json === feed.json) return;
   feed.json = json;
@@ -1306,10 +1233,10 @@ function historyView() {
 
 const agentsLoop = loop(4000, async () => {
   if (!store.get("pastor-token")) return;
-  const version = feed.version, hidden = hides;
+  const version = feed.version;
   const list = await attempt(() => api("GET", "/agents"));
   if (!list || version !== feed.version) return;
-  setAgents(list, hidden === hides);
+  setAgents(list);
   pruneDrafts(list);
 });
 
