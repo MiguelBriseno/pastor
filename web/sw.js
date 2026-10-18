@@ -1,6 +1,6 @@
 // Guarda la página para que abra sin red; la API nunca se guarda.
 // Primero la red: así una versión nueva de pastor se ve al recargar.
-const CACHE = "pastor-v1";
+const CACHE = "pastor-v2";
 const API = new URL("api/", self.registration.scope).pathname;
 const SHELL = ["./", "app.js", "style.css", "manifest.webmanifest", "icon-192.png", "icon-512.png"];
 
