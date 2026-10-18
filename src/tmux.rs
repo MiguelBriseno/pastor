@@ -273,6 +273,39 @@ pub fn kill_pane(pane: &str) -> Result<()> {
     run(&["kill-pane", "-t", pane]).map(|_| ())
 }
 
+/// Teclas que se pueden mandar sueltas con `send_keys`: las que piden los
+/// menús y diálogos de los agentes. Cualquier otro nombre de tmux queda fuera.
+const KEYS: &[&str] = &[
+    "Enter", "Escape", "Tab", "BTab", "Space", "BSpace", "Up", "Down", "Left", "Right", "Home",
+    "End", "PageUp", "PageDown",
+];
+
+/// Una de `KEYS`, Ctrl con una letra (`C-c`) o una letra o cifra suelta, para
+/// elegir una opción por su número o contestar `y`/`n`.
+fn valid_key(key: &str) -> bool {
+    let one_char = |s: &str, ok: fn(&u8) -> bool| s.len() == 1 && s.as_bytes().iter().all(ok);
+    KEYS.contains(&key)
+        || key
+            .strip_prefix("C-")
+            .is_some_and(|c| one_char(c, u8::is_ascii_lowercase))
+        || one_char(key, u8::is_ascii_alphanumeric)
+}
+
+/// Pulsa `keys` en el panel, en orden.
+pub fn send_keys(pane: &str, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        bail!("no hay teclas que enviar");
+    }
+    if let Some(k) = keys.iter().find(|k| !valid_key(k)) {
+        bail!("tecla desconocida: {k:?}");
+    }
+    // Como en `send_text`: en copy-mode las teclas se las quedaría el modo.
+    run(&["copy-mode", "-q", "-t", pane])?;
+    let mut args = vec!["send-keys", "-t", pane];
+    args.extend(keys.iter().map(String::as_str));
+    run(&args).map(|_| ())
+}
+
 /// Texto visible del panel.
 pub fn capture(target: &str) -> Result<String> {
     run(&["capture-pane", "-p", "-J", "-t", target])
@@ -408,7 +441,7 @@ pub fn shell_quote(s: &str) -> String {
 mod tests {
     use super::{
         arg, capture, kill_session, new_session, no_server, pane_pids, panes, parse_version,
-        paste_safe, run, send_text, shell_quote, split_right, type_line,
+        paste_safe, run, send_keys, send_text, shell_quote, split_right, type_line, valid_key,
     };
     use std::path::Path;
     use std::process::Command;
@@ -572,7 +605,31 @@ mod tests {
         assert!(screen.lines().any(|l| l == "-n"), "{screen}");
         assert!(screen.lines().any(|l| l == "otra;"), "{screen}");
         assert!(send_text(&agent.id, "").is_err());
+        let keys = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        send_keys(&agent.id, &keys(&["o", "k", "1", "Enter"])).unwrap();
+        let screen = screen_until(&agent.id, |sc| {
+            sc.lines().filter(|l| *l == "ok1").count() >= 2
+        });
+        assert_eq!(
+            screen.lines().filter(|l| *l == "ok1").count(),
+            2,
+            "{screen}"
+        );
+        assert!(send_keys(&agent.id, &[]).is_err());
+        assert!(send_keys(&agent.id, &keys(&["Enter", "kill-server"])).is_err());
         assert!(!capture(&agent.id).unwrap().contains("desde-la-terminal"));
+    }
+
+    #[test]
+    fn solo_teclas_conocidas() {
+        for k in ["Enter", "Escape", "BTab", "Down", "C-c", "1", "y", "N"] {
+            assert!(valid_key(k), "{k}");
+        }
+        for k in [
+            "", "enter", "C-", "C-cc", "C-1", "M-x", "12", "ñ", "-", ";", "Enter;",
+        ] {
+            assert!(!valid_key(k), "{k}");
+        }
     }
 
     #[test]

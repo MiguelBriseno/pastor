@@ -205,6 +205,30 @@ pub fn send(agent_key: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Pulsa teclas sueltas en el agente (Enter, Escape, flechas…), para los
+/// menús que no se contestan con texto.
+pub fn send_keys(agent_key: &str, keys: &[String]) -> Result<()> {
+    let state = State::load()?;
+    tmux::send_keys(&agent_target(state.find_agent(agent_key)?)?, keys)
+}
+
+/// Lo que se ve ahora en el panel del agente. Si el agente ya salió, lo que
+/// haya quedado en su lugar (el shell, por ejemplo). Sin los espacios con los
+/// que tmux rellena cada línea hasta el ancho del panel.
+pub fn screen(agent_key: &str) -> Result<String> {
+    let agent = State::load()?.find_agent(agent_key)?.clone();
+    match agent_panes(&agent.id).agent {
+        Some(p) => Ok(tmux::capture(&p.id)?
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string()),
+        None => bail!("el agente {} no está corriendo", agent.name),
+    }
+}
+
 /// Entra a la sesión del agente con el foco en el agente.
 pub fn attach(agent_key: &str) -> Result<()> {
     let id = State::load()?.find_agent(agent_key)?.id.clone();

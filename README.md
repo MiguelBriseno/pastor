@@ -210,6 +210,8 @@ pastor new codex --prompt="-v revisa el diff"       # si el texto empieza por "-
 pastor ls                     # lista agentes y su estado
 pastor attach web             # entra a su terminal (salir con Ctrl-b d)
 pastor send web "ahora agrega pruebas para el login"
+pastor screen web             # lo que se ve ahora en su panel
+pastor keys web Down Enter    # pulsa teclas, para contestar sus menús
 pastor term web npm run dev   # abre una terminal al lado y ejecuta el comando
 pastor term web               # abre una terminal sin comando
 pastor term web --close       # la cierra
@@ -253,7 +255,9 @@ IP de Tailscale (que ya cifra).
 |---|---|---|
 | `GET` | `/api/agents` | — (cada agente trae `status`: `starting`, `working`, `blocked`, `idle` o `dead`) |
 | `POST` | `/api/agents` | `{"kind": "claude", "cwd": "/ruta", "name"?, "prompt"?}` |
-| `POST` | `/api/agents/{id}/send` | `{"text": "..."}` |
+| `POST` | `/api/agents/{id}/send` | `{"text": "..."}` (lo pega y pulsa Enter) |
+| `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
+| `GET` | `/api/agents/{id}/screen` | — (responde `{"text": "..."}`, lo que se ve en su panel) |
 | `DELETE` | `/api/agents/{id}` | — |
 | `GET` | `/api/tasks` | — |
 | `POST` | `/api/tasks` | `{"title": "...", "description"?}` |
@@ -264,6 +268,11 @@ IP de Tailscale (que ya cifra).
 ```sh
 curl -H "Authorization: Bearer $(cat ~/.local/share/pastor/serve-token)" localhost:7433/api/agents
 ```
+
+`keys` (como `pastor keys`) es para los menús y diálogos que no se contestan con texto, como los permisos de Claude.
+Acepta `Enter`, `Escape`, `Tab`, `BTab` (Shift-Tab), `Space`, `BSpace`, las flechas (`Up`, `Down`,
+`Left`, `Right`), `Home`, `End`, `PageUp`, `PageDown`, Ctrl con una letra (`C-c`) y una letra o
+cifra suelta (`1`, `y`).
 
 `cwd` tiene que ser una ruta absoluta. Los errores llegan como `{"error": "..."}`: 401 sin token,
 404 si el agente o la tarea no existen y 400 para lo demás.
@@ -400,7 +409,7 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [ ] Restaurar agentes después de reiniciar
 - [ ] Integraciones con Slack y Asana
 - [ ] Manejar agentes en otras máquinas por SSH
-- [ ] Desde el celular: API y avisos con ntfy (hecho), pantalla en vivo, una PWA y una terminal
+- [ ] Desde el celular: API, avisos con ntfy y pantalla en vivo (hecho), una PWA y una terminal
   interactiva
 
 ## Contribuir
