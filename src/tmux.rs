@@ -100,8 +100,11 @@ pub fn new_session(
     // `sh` comparte grupo de procesos con él y tmux reporta "sh" como el
     // proceso en primer plano. `CLAUDECODE` fuera: si pastor se abrió desde
     // Claude Code, el agente no es un `claude` lanzado por otro.
+    // Con la trampa, un Ctrl-C antes de que el agente ponga el terminal en
+    // modo raw no se lleva también a `sh` y llega a `then`. El agente no la
+    // hereda: al hacer exec, una señal con trampa vuelve a su acción por defecto.
     let script = format!(
-        "unset CLAUDECODE\n{agent_cmd}\ntmux set-option -p -t \"$TMUX_PANE\" @pastor_exited 1 2>/dev/null\nprintf '\\n\\033[2m%s\\033[0m\\n\\n' {}\n{then}",
+        "unset CLAUDECODE\ntrap : INT\n{agent_cmd}\ntmux set-option -p -t \"$TMUX_PANE\" @pastor_exited 1 2>/dev/null\nprintf '\\n\\033[2m%s\\033[0m\\n\\n' {}\n{then}",
         shell_quote("El agente terminó. Escribe claude, codex u opencode para abrirlo de nuevo."),
     );
 
@@ -267,8 +270,19 @@ pub fn pane_size(target: &str) -> Result<String> {
         .to_string())
 }
 
+/// Quita del texto los caracteres de control salvo saltos de línea y
+/// tabuladores: un `ESC[201~` cerraría el pegado y lo que siga llegaría como
+/// teclas (Enter, Shift-Tab, respuestas a un diálogo…).
+fn paste_safe(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
 /// Pega `text` en el agente (bracketed paste) y pulsa Enter.
 pub fn send_text(name: &str, text: &str) -> Result<()> {
+    let text = paste_safe(text);
     // Único por envío: dos envíos a la vez al mismo panel (la TUI y la CLI)
     // no se pisan el buffer.
     let buf = format!("pastor-{name}-{}", unique_suffix());
@@ -286,6 +300,9 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
         bail!("tmux load-buffer falló ({status})");
     }
     written.context("no pude pasarle el texto a tmux load-buffer")?;
+    // En copy-mode (p. ej. tras subir con la rueda) el Enter se lo quedaría
+    // el modo y el mensaje se quedaría sin enviar.
+    run(&["copy-mode", "-q", "-t", name])?;
     run(&["paste-buffer", "-p", "-d", "-b", &buf, "-t", name])?;
     thread::sleep(Duration::from_millis(200));
     run(&["send-keys", "-t", name, "Enter"])?;
@@ -365,8 +382,8 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg, capture, kill_session, new_session, pane_pids, panes, parse_version, run, send_text,
-        shell_quote, split_right, type_line,
+        arg, capture, kill_session, new_session, pane_pids, panes, parse_version, paste_safe, run,
+        send_text, shell_quote, split_right, type_line,
     };
     use std::path::Path;
     use std::process::Command;
@@ -393,6 +410,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = kill_session(&self.0);
         }
+    }
+
+    #[test]
+    fn el_pegado_no_lleva_caracteres_de_control() {
+        assert_eq!(
+            paste_safe("hola\x1b[201~\r/exit\x1b[Z\r\nfin\tok\u{9b}"),
+            "hola[201~/exit[Z\nfin\tok"
+        );
+        assert_eq!(paste_safe("línea 1\nlínea 2 ✨"), "línea 1\nlínea 2 ✨");
     }
 
     #[test]
