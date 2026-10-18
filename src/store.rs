@@ -150,13 +150,22 @@ impl State {
         let mut s = Self::load_in(dir)?;
         let mut out = f(&mut s)?;
         let path = dir.join("state.json");
-        // El archivo que se va a reemplazar se pudo leer: queda como
-        // respaldo. Con un enlace no se copia nada, y el `rename` deja el
-        // contenido viejo en `state.json.bak`.
-        let bak = dir.join("state.json.bak");
-        let _ = fs::remove_file(&bak);
-        let _ = fs::hard_link(&path, &bak);
-        write_atomic(&path, serde_json::to_string_pretty(&s)?.as_bytes())?;
+        let new = serde_json::to_string_pretty(&s)?;
+        // Sin cambios no se toca nada: un enlace sin `rename` detrás dejaría
+        // `state.json.bak` y `state.json` en el mismo inodo, y editar uno a
+        // mano rompería los dos.
+        if fs::read(&path).ok().as_deref() != Some(new.as_bytes()) {
+            // El archivo que se va a reemplazar se pudo leer: queda como
+            // respaldo. Con un enlace no se copia nada, y el `rename` deja el
+            // contenido viejo en `state.json.bak`.
+            let bak = dir.join("state.json.bak");
+            let _ = fs::remove_file(&bak);
+            if fs::hard_link(&path, &bak).is_err() {
+                // Sistemas de archivos sin enlaces duros.
+                let _ = fs::copy(&path, &bak);
+            }
+            replace(&path, new.as_bytes(), None, true)?;
+        }
         saved(&mut out);
         Ok(out)
     }
@@ -328,10 +337,12 @@ fn replace(path: &Path, contents: &[u8], mode: Option<u32>, durable: bool) -> Re
         }
         fs::rename(&tmp, path)?;
         // El `rename` vive en el directorio: sin esto, tras un corte de luz
-        // puede volver el archivo viejo.
+        // puede volver el archivo viejo. Sin `?`: el archivo ya está en su
+        // sitio, y algunos sistemas de archivos no dejan sincronizar un
+        // directorio; un error aquí haría creer que no se escribió.
         if durable {
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                File::open(dir)?.sync_all()?;
+                let _ = File::open(dir).and_then(|d| d.sync_all());
             }
         }
         Ok(())
@@ -460,6 +471,14 @@ mod tests {
             |t: &str| State::update_in(&dir, |s| Ok(s.add_task(t.into(), String::new())), |_| {});
         add("uno").unwrap();
         add("dos").unwrap();
+        // Una pasada sin cambios no deja `state.json` enlazado al respaldo:
+        // si no, la escritura de abajo rompería los dos.
+        State::update_in(&dir, |_| Ok(()), |_| {}).unwrap();
+        let links = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(dir.join("state.json")).unwrap().nlink()
+        };
+        assert_eq!(links, 1);
         fs::write(dir.join("state.json"), "{roto").unwrap();
         let err = add("tres").map(|_| ()).unwrap_err().to_string();
         let bak: Result<State> = fs::read_to_string(dir.join("state.json.bak"))

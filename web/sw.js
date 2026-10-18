@@ -34,6 +34,10 @@ self.addEventListener("fetch", (e) => {
   );
   // Lo guardado solo gana si existe; si no, se sigue esperando a la red.
   const cached = () => caches.match(e.request, { ignoreSearch: true }).then((r) => r || net);
-  const slow = new Promise((ok) => setTimeout(ok, WAIT)).then(cached);
+  let timer;
+  const slow = new Promise((ok) => (timer = setTimeout(ok, WAIT))).then(cached);
+  // Si la red contesta antes, no hace falta mirar la caché.
+  const stop = () => clearTimeout(timer);
+  net.then(stop, stop);
   e.respondWith(Promise.race([net.catch(cached), slow]));
 });

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -227,8 +228,8 @@ fn descends_from(
 /// MB): con un struct, serde salta el resto sin armar objetos.
 #[derive(Deserialize, Default)]
 struct Payload {
-    #[serde(default)]
-    message: String,
+    // `Option` y no `String`: un `null` no debe tirar el resto del aviso.
+    message: Option<String>,
     notification_type: Option<String>,
     transcript_path: Option<String>,
 }
@@ -240,7 +241,14 @@ fn hook_state(event: &str, p: &Payload) -> Option<&'static str> {
             Some("idle_prompt") => "idle",
             Some("permission_prompt" | "elicitation_dialog") => "blocked",
             // Versiones sin `notification_type`: se mira el mensaje.
-            None | Some("") if p.message.contains("waiting for your input") => "idle",
+            None | Some("")
+                if p.message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("waiting for your input") =>
+            {
+                "idle"
+            }
             None | Some("") => "blocked",
             // Otros avisos (p. ej. `auth_success`) no piden nada.
             Some(_) => return None,
@@ -278,7 +286,11 @@ pub fn handle(event: &str) -> Result<()> {
         drain();
         return Ok(());
     }
-    let p: Payload = serde_json::from_reader(std::io::stdin().lock()).unwrap_or_default();
+    // Entero a memoria y luego `from_slice`: más rápido que `from_reader`, y
+    // stdin queda leído hasta el final aunque el JSON venga roto.
+    let mut input = Vec::new();
+    let _ = std::io::stdin().lock().read_to_end(&mut input);
+    let p: Payload = serde_json::from_slice(&input).unwrap_or_default();
     let Some(state) = hook_state(event, &p) else {
         return Ok(());
     };
@@ -286,7 +298,7 @@ pub fn handle(event: &str) -> Result<()> {
     let status = HookStatus {
         state: state.into(),
         at: Utc::now(),
-        message: p.message,
+        message: p.message.unwrap_or_default(),
         screen: None,
         transcript: p.transcript_path,
     };
@@ -585,7 +597,9 @@ mod tests {
             assert_eq!(hook_state(event, &p(json)), esperado, "{event} {json}");
         }
         let full = p(r#"{"message":"hola","transcript_path":"/t.jsonl","otro":null}"#);
-        assert_eq!(full.message, "hola");
+        assert_eq!(full.message.as_deref(), Some("hola"));
+        let nulo = p(r#"{"message":null,"transcript_path":"/t.jsonl"}"#);
+        assert_eq!(nulo.transcript_path.as_deref(), Some("/t.jsonl"));
         assert_eq!(full.transcript_path.as_deref(), Some("/t.jsonl"));
     }
 
