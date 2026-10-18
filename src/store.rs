@@ -1,6 +1,6 @@
 //! Estado persistente: agentes y tareas en ~/.local/share/pastor/state.json.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -130,7 +130,12 @@ impl State {
 
     fn load_in(dir: &Path) -> Result<Self> {
         match fs::read_to_string(dir.join("state.json")) {
-            Ok(s) => serde_json::from_str(&s).context("state.json está corrupto"),
+            Ok(s) => serde_json::from_str(&s).with_context(|| {
+                format!(
+                    "state.json está corrupto; la última versión buena está en {}",
+                    dir.join("state.json.bak").display()
+                )
+            }),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
@@ -144,10 +149,14 @@ impl State {
         let _lock = lock(&dir.join("state.lock"))?;
         let mut s = Self::load_in(dir)?;
         let mut out = f(&mut s)?;
-        write_atomic(
-            &dir.join("state.json"),
-            serde_json::to_string_pretty(&s)?.as_bytes(),
-        )?;
+        let path = dir.join("state.json");
+        // El archivo que se va a reemplazar se pudo leer: queda como
+        // respaldo. Con un enlace no se copia nada, y el `rename` deja el
+        // contenido viejo en `state.json.bak`.
+        let bak = dir.join("state.json.bak");
+        let _ = fs::remove_file(&bak);
+        let _ = fs::hard_link(&path, &bak);
+        write_atomic(&path, serde_json::to_string_pretty(&s)?.as_bytes())?;
         saved(&mut out);
         Ok(out)
     }
@@ -318,6 +327,13 @@ fn replace(path: &Path, contents: &[u8], mode: Option<u32>, durable: bool) -> Re
             f.sync_all()?;
         }
         fs::rename(&tmp, path)?;
+        // El `rename` vive en el directorio: sin esto, tras un corte de luz
+        // puede volver el archivo viejo.
+        if durable {
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                File::open(dir)?.sync_all()?;
+            }
+        }
         Ok(())
     })();
     if written.is_err() {
@@ -428,5 +444,29 @@ mod tests {
         let s = s.unwrap();
         assert_eq!(s.tasks.len(), hilos * por_hilo);
         assert_eq!(s.counters().1 as usize, hilos * por_hilo);
+    }
+
+    /// Si `state.json` se corrompe, el error nombra el respaldo y este
+    /// tiene la versión anterior al último guardado.
+    #[test]
+    fn respaldo_de_state_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "pastor-test-bak-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let add =
+            |t: &str| State::update_in(&dir, |s| Ok(s.add_task(t.into(), String::new())), |_| {});
+        add("uno").unwrap();
+        add("dos").unwrap();
+        fs::write(dir.join("state.json"), "{roto").unwrap();
+        let err = add("tres").map(|_| ()).unwrap_err().to_string();
+        let bak: Result<State> = fs::read_to_string(dir.join("state.json.bak"))
+            .map_err(Into::into)
+            .and_then(|b| serde_json::from_str(&b).map_err(Into::into));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("state.json.bak"), "{err}");
+        assert_eq!(bak.unwrap().tasks.len(), 1);
     }
 }

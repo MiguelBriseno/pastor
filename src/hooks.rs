@@ -3,14 +3,13 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::agent;
 use crate::history::{self, Event};
@@ -223,15 +222,51 @@ fn descends_from(
     None
 }
 
+/// Lo que importa del JSON que Claude Code manda por stdin. El de
+/// PostToolUse trae la respuesta entera de la herramienta (a veces varios
+/// MB): con un struct, serde salta el resto sin armar objetos.
+#[derive(Deserialize, Default)]
+struct Payload {
+    #[serde(default)]
+    message: String,
+    notification_type: Option<String>,
+    transcript_path: Option<String>,
+}
+
+/// El estado que deja `event`, o `None` si el aviso no pide nada.
+fn hook_state(event: &str, p: &Payload) -> Option<&'static str> {
+    Some(match event {
+        "notify" => match p.notification_type.as_deref() {
+            Some("idle_prompt") => "idle",
+            Some("permission_prompt" | "elicitation_dialog") => "blocked",
+            // Versiones sin `notification_type`: se mira el mensaje.
+            None | Some("") if p.message.contains("waiting for your input") => "idle",
+            None | Some("") => "blocked",
+            // Otros avisos (p. ej. `auth_success`) no piden nada.
+            Some(_) => return None,
+        },
+        "idle" => "idle",
+        _ => "working",
+    })
+}
+
+/// Lee y descarta stdin: si el hook sale sin leerlo, a Claude Code le puede
+/// llegar un EPIPE al escribir uno grande.
+fn drain() {
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+}
+
 /// Llamado por Claude Code. Nunca debe fallar ruidosamente.
 pub fn handle(event: &str) -> Result<()> {
     let Ok(id) = std::env::var("PASTOR_AGENT") else {
+        drain();
         return Ok(());
     };
     // Un proceso que heredó `PASTOR_AGENT` de un agente ya cerrado (p. ej. un
     // servicio que arrancó desde él y lanza sus propios `claude`) no debe
     // revivir su estado. Si no se puede leer el estado, mejor seguir.
     if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
+        drain();
         return Ok(());
     }
     // `settle` lo lanza un hook que ya pasó el filtro de abajo, y al salir
@@ -240,33 +275,20 @@ pub fn handle(event: &str) -> Result<()> {
         return settle(&id);
     }
     if !from_agent(&id) {
+        drain();
         return Ok(());
     }
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let v: Value = serde_json::from_str(&input).unwrap_or_default();
-    let message = v["message"].as_str().unwrap_or_default().to_string();
-
-    let state = match event {
-        "notify" => match v["notification_type"].as_str() {
-            Some("idle_prompt") => "idle",
-            Some("permission_prompt" | "elicitation_dialog") => "blocked",
-            // Versiones sin `notification_type`: se mira el mensaje.
-            None | Some("") if message.contains("waiting for your input") => "idle",
-            None | Some("") => "blocked",
-            // Otros avisos (p. ej. `auth_success`) no piden nada.
-            Some(_) => return Ok(()),
-        },
-        "idle" => "idle",
-        _ => "working",
+    let p: Payload = serde_json::from_reader(std::io::stdin().lock()).unwrap_or_default();
+    let Some(state) = hook_state(event, &p) else {
+        return Ok(());
     };
     ensure_dirs()?;
     let status = HookStatus {
         state: state.into(),
         at: Utc::now(),
-        message,
+        message: p.message,
         screen: None,
-        transcript: v["transcript_path"].as_str().map(String::from),
+        transcript: p.transcript_path,
     };
     {
         let _lock = lock_status(&id)?;
@@ -515,6 +537,57 @@ fn write_claude_shim(bin: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traduce_eventos_a_estado() {
+        let p = |json: &str| serde_json::from_str::<Payload>(json).unwrap();
+        let casos = [
+            ("working", "{}", Some("working")),
+            (
+                "working",
+                r#"{"tool_response":{"enorme":[1,2,3]}}"#,
+                Some("working"),
+            ),
+            ("idle", "{}", Some("idle")),
+            (
+                "notify",
+                r#"{"notification_type":"idle_prompt"}"#,
+                Some("idle"),
+            ),
+            (
+                "notify",
+                r#"{"notification_type":"permission_prompt"}"#,
+                Some("blocked"),
+            ),
+            (
+                "notify",
+                r#"{"notification_type":"elicitation_dialog"}"#,
+                Some("blocked"),
+            ),
+            ("notify", r#"{"notification_type":"auth_success"}"#, None),
+            (
+                "notify",
+                r#"{"message":"Claude is waiting for your input"}"#,
+                Some("idle"),
+            ),
+            (
+                "notify",
+                r#"{"message":"Claude needs your permission"}"#,
+                Some("blocked"),
+            ),
+            (
+                "notify",
+                r#"{"notification_type":"","message":"x"}"#,
+                Some("blocked"),
+            ),
+        ];
+        for (event, json, esperado) in casos {
+            assert_eq!(hook_state(event, &p(json)), esperado, "{event} {json}");
+        }
+        let full = p(r#"{"message":"hola","transcript_path":"/t.jsonl","otro":null}"#);
+        assert_eq!(full.message, "hola");
+        assert_eq!(full.transcript_path.as_deref(), Some("/t.jsonl"));
+    }
 
     #[test]
     fn quita_el_sufijo_de_binario_reemplazado() {

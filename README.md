@@ -349,7 +349,8 @@ pastor
 ```
 
 En ntfy.sh cualquiera que conozca el nombre del tema lee sus avisos, así que elige uno que no se
-pueda adivinar. Los avisos los manda la interfaz, así que tiene que estar abierta.
+pueda adivinar. Los avisos los manda la interfaz, así que tiene que estar abierta. Si un aviso no
+sale (URL o token mal puestos, sin red), el motivo queda en `hooks.log`.
 
 ## Iconos y fuente
 
@@ -444,7 +445,9 @@ panel.
 **¿Dónde guarda sus datos?**
 En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` en macOS:
 
-- `state.json`: agentes y tareas
+- `state.json`: agentes y tareas. `state.json.bak` guarda la versión anterior al último cambio:
+  si `state.json` se corrompe (p. ej. al editarlo a mano), cópialo encima
+- `hooks.log`: errores de los hooks y de los avisos de ntfy
 - `history.jsonl`: el historial de eventos para la pestaña Historial. Si lo borras con pastor
   cerrado, empieza de nuevo pero conserva los totales de agentes y tareas que ya había
 - `status/`: el último estado que reportó cada agente de Claude Code

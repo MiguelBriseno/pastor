@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -2021,9 +2021,10 @@ fn show_notice(msg: &str) {
     if let Ok(child) = desktop {
         wait_or_kill(child, NOTICE_TIMEOUT);
     }
-    if let Some(child) = phone {
+    if let Some(mut child) = phone {
         // curl ya corta a los 10 s (`-m`); esto es por si acaso.
-        wait_or_kill(child, NTFY_TIMEOUT);
+        let stderr = child.stderr.take();
+        ntfy::check(stderr, wait_or_kill(child, NTFY_TIMEOUT));
     }
 }
 
@@ -2031,18 +2032,22 @@ fn show_notice(msg: &str) {
 const NTFY_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Espera a `child` hasta `timeout`; si se pasa, lo mata para que no retrase
-/// a los siguientes. `false` si hubo que matarlo.
-fn wait_or_kill(mut child: Child, timeout: Duration) -> bool {
+/// a los siguientes. Cómo terminó, o `None` si hubo que matarlo.
+fn wait_or_kill(mut child: Child, timeout: Duration) -> Option<ExitStatus> {
     let start = Instant::now();
-    while let Ok(None) = child.try_wait() {
-        if start.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if start.elapsed() <= timeout => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    true
 }
 
 #[cfg(target_os = "macos")]
@@ -2299,9 +2304,9 @@ mod tests {
     #[test]
     fn un_aviso_colgado_se_mata() {
         let spawn = |secs: &str| Command::new("sleep").arg(secs).spawn().unwrap();
-        assert!(wait_or_kill(spawn("0"), Duration::from_secs(5)));
+        assert!(wait_or_kill(spawn("0"), Duration::from_secs(5)).is_some());
         let start = Instant::now();
-        assert!(!wait_or_kill(spawn("30"), Duration::from_millis(200)));
+        assert!(wait_or_kill(spawn("30"), Duration::from_millis(200)).is_none());
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
