@@ -39,6 +39,7 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/tmux.rs` | Capa fina sobre el binario `tmux` |
 | `src/store.rs` | Modelo de datos (`Agent`, `Task`) y persistencia en `state.json` |
 | `src/history.rs` | Historial de eventos en `history.jsonl` y las estadísticas de la pestaña Historial |
+| `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
 
 ## Decisiones importantes
 
@@ -168,6 +169,14 @@ recién creado.
 `tmux::send_text` carga el texto en un buffer de tmux y lo pega con *bracketed paste*
 (`paste-buffer -p`) antes de pulsar Enter. Así los mensajes de varias líneas llegan como un solo
 mensaje y no se envían línea por línea.
+
+### `pastor serve` es opcional
+
+El servidor trae `axum` y `tokio`, que pesan más que todo lo demás junto, así que va detrás del
+feature `serve` y quien no lo usa no los compila. Llama a `ops` como la CLI (no lanza `pastor`),
+cada operación en un hilo de `spawn_blocking` porque tocan tmux y el disco. Guarda un `Tracker`
+entre consultas, así un cliente que pregunta cada pocos segundos ve *trabajando* como la TUI.
+El token se compara sin cortar en el primer byte distinto.
 
 ## Cómo agregar un nuevo tipo de agente
 

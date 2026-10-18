@@ -231,6 +231,40 @@ pastor task done t1
 pastor task rm t1
 ```
 
+## Desde el celular (`pastor serve`)
+
+Una API HTTP para ver y manejar los agentes desde otro dispositivo. Es opcional: hay que
+compilarla con el feature `serve`.
+
+```sh
+cargo install --path . --features serve
+pastor serve                          # en 127.0.0.1:7433
+pastor serve --bind 100.101.102.103:7433   # en la IP de Tailscale, para el celular
+```
+
+Todo pide un token (`Authorization: Bearer <token>`). Si no pasas `--token` ni `PASTOR_TOKEN`,
+pastor genera uno y lo guarda en `~/.local/share/pastor/serve-token`. Controlar un agente equivale a
+ejecutar comandos en tu máquina: no lo expongas a internet y prefiere una red privada como
+Tailscale. Si escuchas en `0.0.0.0`, pastor te avisa.
+
+| Método | Ruta | Cuerpo |
+|---|---|---|
+| `GET` | `/api/agents` | — (cada agente trae `status`: `starting`, `working`, `blocked`, `idle` o `dead`) |
+| `POST` | `/api/agents` | `{"kind": "claude", "cwd": "/ruta", "name"?, "prompt"?}` |
+| `POST` | `/api/agents/{id}/send` | `{"text": "..."}` |
+| `DELETE` | `/api/agents/{id}` | — |
+| `GET` | `/api/tasks` | — |
+| `POST` | `/api/tasks` | `{"title": "...", "description"?}` |
+| `POST` | `/api/tasks/{id}/assign` | `{"agent": "web"}` o `{"kind": "claude", "cwd": "/ruta"}` |
+| `POST` | `/api/tasks/{id}/done` | — |
+| `DELETE` | `/api/tasks/{id}` | — |
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.local/share/pastor/serve-token)" localhost:7433/api/agents
+```
+
+Los errores llegan como `{"error": "..."}`.
+
 ## Iconos y fuente
 
 pastor usa iconos de [Nerd Font](https://www.nerdfonts.com): una oveja como logo, un icono por
@@ -348,6 +382,8 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [ ] Restaurar agentes después de reiniciar
 - [ ] Integraciones con Slack y Asana
 - [ ] Manejar agentes en otras máquinas por SSH
+- [ ] Desde el celular: API (hecho), avisos con ntfy, pantalla en vivo, una PWA y una terminal
+  interactiva
 
 ## Contribuir
 
