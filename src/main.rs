@@ -68,6 +68,21 @@ enum Cmd {
         )]
         text: Vec<String>,
     },
+    /// Pulsa teclas en un agente, para sus menús (Enter, Escape, Down, C-c, 1…)
+    Keys {
+        /// Id o nombre del agente
+        #[arg(value_name = "AGENTE")]
+        agent: String,
+        /// Nombres de tmux: Enter, Escape, Tab, BTab, Up, Down, C-c, una letra o cifra…
+        #[arg(required = true, value_name = "TECLA")]
+        keys: Vec<String>,
+    },
+    /// Muestra lo que se ve ahora en el panel de un agente
+    Screen {
+        /// Id o nombre del agente
+        #[arg(value_name = "AGENTE")]
+        agent: String,
+    },
     /// Abre (o cierra) una terminal al lado del agente, p. ej. para `npm run dev`
     Term {
         /// Id o nombre del agente
@@ -271,6 +286,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Send { agent, text }) => ops::send(&agent, &text.join(" ")),
+        Some(Cmd::Keys { agent, keys }) => ops::send_keys(&agent, &keys),
+        Some(Cmd::Screen { agent }) => {
+            println!("{}", ops::screen(&agent)?);
+            Ok(())
+        }
         Some(Cmd::Kill { agent }) => ops::kill_agent(&agent),
         Some(Cmd::Task(cmd)) => task_cmd(cmd),
     }

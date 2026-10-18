@@ -68,6 +68,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/agents", get(list_agents).post(new_agent))
         .route("/agents/{id}", delete(kill_agent))
         .route("/agents/{id}/send", post(send))
+        .route("/agents/{id}/keys", post(keys))
+        .route("/agents/{id}/screen", get(screen))
         .route("/tasks", get(list_tasks).post(add_task))
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
@@ -286,6 +288,19 @@ struct Message {
 
 async fn send(Path(id): Path<String>, Body(req): Body<Message>) -> Response {
     blocking(move || ops::send(&id, &req.text).map(|()| ok())).await
+}
+
+#[derive(Deserialize)]
+struct Keys {
+    keys: Vec<String>,
+}
+
+async fn keys(Path(id): Path<String>, Body(req): Body<Keys>) -> Response {
+    blocking(move || ops::send_keys(&id, &req.keys).map(|()| ok())).await
+}
+
+async fn screen(Path(id): Path<String>) -> Response {
+    blocking(move || ops::screen(&id).map(|text| json!({ "text": text }))).await
 }
 
 async fn kill_agent(Path(id): Path<String>) -> Response {
