@@ -36,7 +36,13 @@ pub fn new_agent(
         bail!("{} no es un directorio", cwd.display());
     }
     let cmd = kind.launch_command(prompt)?;
-    let agent = State::update(|s| Ok(s.add_agent(kind, cwd, name)))?;
+    // Si se perdió el estado, el contador vuelve a empezar y `a1` podría
+    // seguir vivo: el nuevo chocaría con su sesión y recibiría sus hooks.
+    let taken = tmux::panes().unwrap_or_default();
+    let agent = State::update(|s| {
+        s.skip_ids(|id| taken.contains_key(id));
+        Ok(s.add_agent(kind, cwd, name))
+    })?;
     hooks::clear_status(&agent.id);
     let started = hooks::relaunch_shell().and_then(|then| {
         tmux::new_session(
@@ -147,10 +153,7 @@ impl Procs {
         let Some(fg) = procs.iter().find(|p| p.pid == pid).map(|p| p.tpgid) else {
             return false;
         };
-        fg > 0
-            && procs
-                .iter()
-                .any(|p| p.pgid == fg && is_agent_command(&p.name))
+        fg > 0 && procs.iter().any(|p| p.pgid == fg && p.is_agent())
     }
 }
 
@@ -175,9 +178,44 @@ fn parse_ps(out: &str) -> Vec<Proc> {
         .collect()
 }
 
-/// Instalados con npm o bun, los agentes aparecen como su intérprete.
 fn is_agent_command(cmd: &str) -> bool {
-    Kind::ALL.iter().any(|k| k.bin() == cmd) || cmd == "node" || cmd == "bun"
+    Kind::ALL.iter().any(|k| k.bin() == cmd)
+}
+
+impl Proc {
+    /// Instalados con npm o bun, los agentes aparecen como su intérprete: hay
+    /// que mirar qué script corre. Un `node` cualquiera (un REPL) no cuenta,
+    /// o lo que se le mande al agente se ejecutaría ahí.
+    fn is_agent(&self) -> bool {
+        if is_agent_command(&self.name) {
+            return true;
+        }
+        if self.name != "node" && self.name != "bun" {
+            return false;
+        }
+        std::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &self.pid.to_string()])
+            .output()
+            .is_ok_and(|o| {
+                o.status.success() && runs_agent_script(&String::from_utf8_lossy(&o.stdout))
+            })
+    }
+}
+
+/// Si la línea de órdenes de un intérprete corre un agente: algún argumento
+/// es su script (`.../bin/claude`, `.../codex.js`) o está en su paquete
+/// (`node_modules/@anthropic-ai/claude-code/cli.js`).
+fn runs_agent_script(args: &str) -> bool {
+    let agent = |name: &str| Kind::ALL.iter().any(|k| name.starts_with(k.bin()));
+    args.split_whitespace().skip(1).any(|arg| {
+        let parts: Vec<_> = Path::new(arg)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        let package = parts.iter().position(|c| c == "node_modules");
+        parts.last().is_some_and(|f| agent(f))
+            || package.is_some_and(|i| parts[i + 1..].iter().any(|c| agent(c)))
+    })
 }
 
 /// Panel al que hay que hablarle para llegar al agente. Falla si el agente
@@ -320,14 +358,22 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
     // del candado: si dos lo matan a la vez, solo uno lo encuentra, y el fin
     // de la sesión no queda dos veces en el historial.
     let agent = update_recording(|s, mut record| remove_agent(s, agent_key, &mut record))?;
-    let _ = tmux::kill_session(&agent.id);
+    let killed = tmux::kill_session(&agent.id);
     hooks::clear_status(&agent.id);
     history::record(Event::AgentEnded {
         agent: agent.id.clone(),
         kind: agent.kind,
         secs: (Utc::now() - agent.created_at).num_seconds(),
     });
-    Ok(())
+    // Si ya no estaba, bien; si sigue viva, que se sepa: fuera del estado ya
+    // no se ve, y seguiría gastando.
+    match killed {
+        Err(e) if !tmux::session_gone(&e) => Err(e.context(format!(
+            "lo quité de pastor, pero su sesión sigue viva (tmux -L pastor kill-session -t ={})",
+            agent.id
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Saca al agente del estado y libera su tarea.
@@ -890,6 +936,23 @@ mod tests {
         assert!(Procs(OnceCell::from(Some(procs))).runs_agent(4242));
         // Si `ps` falló no se sabe: mejor no darlo por salido.
         assert!(Procs(OnceCell::from(None)).runs_agent(4242));
+    }
+
+    #[test]
+    fn un_interprete_solo_cuenta_si_corre_un_agente() {
+        assert!(runs_agent_script(
+            "node /home/yo/.npm-global/bin/claude --settings x"
+        ));
+        assert!(runs_agent_script(
+            "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        ));
+        assert!(runs_agent_script("bun /home/yo/.bun/bin/opencode"));
+        assert!(runs_agent_script(
+            "node /usr/lib/node_modules/@openai/codex/bin/codex.js"
+        ));
+        assert!(!runs_agent_script("node"));
+        assert!(!runs_agent_script("node servidor.js"));
+        assert!(!runs_agent_script("node /home/yo/claude-notas/servidor.js"));
     }
 
     #[test]

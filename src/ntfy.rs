@@ -62,7 +62,7 @@ fn curl_config(c: &Config, msg: &str) -> String {
 }
 
 /// Una cadena entre comillas del archivo de configuración de curl.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {

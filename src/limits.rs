@@ -26,6 +26,8 @@ use crate::agent::Kind;
 pub const TTL: Duration = Duration::from_secs(60);
 /// Desde cuándo un dato se considera viejo y se dice de cuándo es.
 const STALE: Duration = Duration::from_secs(5 * 60);
+/// Hasta cuándo un fallo deja ver el último dato bueno en vez del error.
+const KEEP: Duration = Duration::from_secs(60 * 60);
 /// Lo que se lee del final de una sesión de Codex buscando el último evento.
 const TAIL: u64 = 1 << 20;
 /// Cuántas sesiones de Codex, de la más reciente hacia atrás, se miran: sin
@@ -100,7 +102,7 @@ impl Cache {
         if self.fresh() {
             return false;
         }
-        self.usage = fetch();
+        self.usage = keep_last_good(&self.usage, fetch(), Utc::now());
         self.at = Some(Instant::now());
         true
     }
@@ -127,7 +129,7 @@ impl Cache {
     #[cfg(any(feature = "serve", test))]
     pub fn set(&mut self, at: Instant, usage: Vec<Usage>) {
         if self.at == Some(at) {
-            self.usage = usage;
+            self.usage = keep_last_good(&self.usage, usage, Utc::now());
         }
     }
 
@@ -142,6 +144,29 @@ impl Cache {
     pub fn usage(&self) -> &[Usage] {
         &self.usage
     }
+}
+
+/// Un fallo pasajero (un 429, un timeout) no borra lo último que se supo:
+/// se sigue mostrando, y pasado `STALE` se dice de cuándo es. Si el fallo
+/// dura más de `KEEP`, ya se muestra.
+fn keep_last_good(old: &[Usage], new: Vec<Usage>, now: DateTime<Utc>) -> Vec<Usage> {
+    let age = |o: &Usage| o.updated_at.map(|t| (now - t).to_std().unwrap_or_default());
+    new.into_iter()
+        .map(|u| match old.iter().find(|o| o.kind == u.kind) {
+            Some(o)
+                if u.error.is_some()
+                    && o.error.is_none()
+                    && !o.windows.is_empty()
+                    && age(o).is_some_and(|a| a < KEEP) =>
+            {
+                Usage {
+                    stale: age(o).is_some_and(|a| a >= STALE),
+                    ..o.clone()
+                }
+            }
+            _ => u,
+        })
+        .collect()
 }
 
 pub fn fetch() -> Vec<Usage> {
@@ -186,10 +211,16 @@ fn get_usage(token: &str) -> Result<Value> {
         .stderr(Stdio::piped())
         .spawn()
         .context("no pude ejecutar curl")?;
+    // Entre comillas de verdad: un token con `"` o un salto de línea (un
+    // archivo dañado) no debe poder añadir opciones a curl.
+    if token.chars().any(char::is_control) {
+        bail!("el token de Claude tiene caracteres no válidos");
+    }
     let config = format!(
         "url = \"https://api.anthropic.com/api/oauth/usage\"\n\
-         header = \"Authorization: Bearer {token}\"\n\
-         header = \"anthropic-beta: oauth-2025-04-20\"\n"
+         header = {}\n\
+         header = \"anthropic-beta: oauth-2025-04-20\"\n",
+        crate::ntfy::quote(&format!("Authorization: Bearer {token}"))
     );
     // Si curl murió antes de leerla, su stderr explica más que el "broken pipe".
     if let Some(mut stdin) = child.stdin.take() {
@@ -345,6 +376,35 @@ fn window_name(minutes: Option<i64>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn un_fallo_pasajero_no_borra_el_ultimo_dato() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).unwrap();
+        let good = |mins: i64| Usage {
+            kind: Kind::Claude,
+            windows: vec![Window {
+                name: "5 h".into(),
+                used_pct: 40.0,
+                resets_at: None,
+            }],
+            plan: None,
+            updated_at: Some(now - chrono::Duration::minutes(mins)),
+            stale: false,
+            error: None,
+        };
+        let failed = || vec![Usage::from(Kind::Claude, Err(anyhow!("HTTP 429")))];
+        // Recién leído: se queda tal cual.
+        assert_eq!(keep_last_good(&[good(1)], failed(), now), [good(1)]);
+        // De hace un rato: se queda, pero se dice de cuándo es.
+        let kept = keep_last_good(&[good(10)], failed(), now);
+        assert!(kept[0].stale && kept[0].error.is_none());
+        // Tras una hora fallando, se muestra el error.
+        assert!(keep_last_good(&[good(61)], failed(), now)[0]
+            .error
+            .is_some());
+        // Sin dato bueno antes, el error.
+        assert!(keep_last_good(&[], failed(), now)[0].error.is_some());
+    }
 
     #[test]
     fn lee_el_uso_de_claude() {
