@@ -2,6 +2,7 @@ mod agent;
 mod history;
 mod hooks;
 mod icons;
+mod limits;
 mod ntfy;
 mod ops;
 #[cfg(feature = "serve")]

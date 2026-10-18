@@ -20,6 +20,7 @@ const KEYS = [
 
 // Trazos de Lucide (ISC). Texto fijo nuestro: se puede meter con innerHTML.
 const ICONS = {
+  gauge: '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
   bot: '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/>',
   tasks: '<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8M13 12h8M13 18h8"/>',
   plus: '<path d="M5 12h14M12 5v14"/>',
@@ -1028,11 +1029,30 @@ function poll(ms, path, fn) {
   }));
 }
 
+/** Lo que queda de cada ventana de límite, una caja por suscripción. */
+function limitsView(list) {
+  const color = (left) => left < 10 ? "var(--magenta)" : left < 30 ? "var(--yellow)" : "var(--green)";
+  return h("div", { class: "limits" }, list.map((u) => h("div", { class: "limit", style: `--k: ${KIND[u.kind].color}` },
+    h("div", { class: "limit-title" }, h("b", { text: KIND[u.kind].label }), u.plan && h("span", { text: u.plan })),
+    u.error
+      ? h("p", { class: "quiet", text: u.error })
+      : u.windows.map((w) => {
+        const left = Math.max(0, Math.min(100, 100 - w.used_pct));
+        const reset = w.resets_at ? "se reinicia en " + human(Math.round((Date.parse(w.resets_at) - Date.now()) / 1000)) : "";
+        return h("div", { class: "hbar limit-row", style: `--c: ${color(left)}` },
+          h("span", { class: "hbar-label", text: w.name }),
+          h("span", { class: "hbar-track" }, h("i", { style: `width: ${left}%` })),
+          h("b", { text: `${Math.round(left)}%` }),
+          reset && h("small", { text: reset }));
+      }),
+  )));
+}
+
 const TASK_COLOR = { todo: "var(--muted)", in_progress: "var(--cyan)", review: "var(--yellow)", done: "var(--green)" };
 
 function dashboardView() {
   setTop({ title: "Dashboard" });
-  let tasks = null;
+  let tasks = null, limits = null;
   const body = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
   main.append(body);
   const draw = () => {
@@ -1064,6 +1084,7 @@ function dashboardView() {
         TASKS.map(([s, label]) => stat(label.toLowerCase(), t(s), TASK_COLOR[s])),
         stat("completado", `${tasks.length ? Math.floor((t("done") * 100) / tasks.length) : 0}%`, "var(--accent)"),
       )),
+      limits && panel("gauge", "Uso restante", limitsView(limits)),
       panel("bell", "Necesita tu atención", attention.length
         ? h("div", { class: "cards" }, attention)
         : h("p", { class: "quiet", text: "Nada pendiente ✓" })),
@@ -1071,6 +1092,7 @@ function dashboardView() {
     );
   };
   poll(10000, "/tasks", (list) => { tasks = list; draw(); });
+  poll(30000, "/limits", (list) => { limits = list; draw(); });
   watchAgents(draw);
 }
 
