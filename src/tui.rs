@@ -1212,25 +1212,62 @@ impl App {
         let now = chrono::Utc::now();
         for (u, &r) in self.limits.iter().zip(boxes.iter()) {
             let color = kind_color(u.kind);
+            let width = r.width.saturating_sub(2) as usize;
+            let name_w = u
+                .windows
+                .iter()
+                .map(|w| w.name.chars().count())
+                .max()
+                .unwrap_or(0);
+            // Una que ya pasó (el dato es de hace hasta `TTL`) no dice nada.
+            let resets: Vec<Option<String>> = u
+                .windows
+                .iter()
+                .map(|w| {
+                    w.resets_at
+                        .filter(|t| *t > now)
+                        .map(|t| history::human((t - now).num_seconds()))
+                })
+                .collect();
+            // De la más completa a la más corta, la primera en la que quepan
+            // todas las líneas, para que la caja quede pareja: con dos cajas
+            // en 80 columnas, cada una tiene 38.
+            const FORMS: [(usize, &str, Option<&str>); 5] = [
+                (10, " libre", Some(" · se reinicia en ")),
+                (10, " libre", Some(" ↻ ")),
+                (10, "", Some(" ↻ ")),
+                (5, "", Some(" ↻ ")),
+                (5, "", None),
+            ];
+            let (bar, libre, reset_prefix) = FORMS
+                .into_iter()
+                .find(|(bar, libre, prefix)| {
+                    resets.iter().all(|reset| {
+                        let reset = match (prefix, reset) {
+                            (Some(p), Some(r)) => p.chars().count() + r.chars().count(),
+                            _ => 0,
+                        };
+                        name_w + 2 + bar + 5 + libre.len() + reset <= width
+                    })
+                })
+                .unwrap_or(FORMS[FORMS.len() - 1]);
             let lines: Vec<Line> = match &u.error {
                 Some(e) => vec![Line::from(format!(" {e}").dark_gray())],
                 None => u
                     .windows
                     .iter()
-                    .map(|w| {
+                    .zip(&resets)
+                    .map(|(w, reset)| {
                         let left = w.left_pct();
-                        // Una que ya pasó (el dato es de hace hasta `TTL`) no dice nada.
-                        let reset = w.resets_at.filter(|t| *t > now).map_or(String::new(), |t| {
-                            format!(
-                                " · se reinicia en {}",
-                                history::human((t - now).num_seconds())
-                            )
-                        });
+                        let reset = match (reset_prefix, reset) {
+                            (Some(p), Some(r)) => format!("{p}{r}"),
+                            _ => String::new(),
+                        };
                         Line::from(vec![
-                            Span::raw(format!(" {:<13}", w.name)),
-                            Span::styled(meter(left, 10), Style::default().fg(limit_color(left))),
+                            Span::raw(format!(" {:<name_w$} ", w.name)),
+                            Span::styled(meter(left, bar), Style::default().fg(limit_color(left))),
                             Span::styled(
-                                format!(" {left:>3.0}% libre"),
+                                format!(" {left:>3.0}%{libre}"),
                                 Style::default().fg(limit_color(left)).bold(),
                             ),
                             Span::raw(reset).dark_gray(),
@@ -1238,13 +1275,26 @@ impl App {
                     })
                     .collect(),
             };
+            let head = format!(" {}{} ", pad(ic.kind(u.kind)), u.kind);
             let plan = u.plan.as_ref().map_or(String::new(), |p| format!("({p}) "));
+            let age = u.updated_at.filter(|_| u.stale).map_or(String::new(), |t| {
+                format!("· hace {} ", history::human((now - t).num_seconds()))
+            });
+            // Si no cabe todo, la antigüedad importa más que el plan.
+            let title = [
+                format!("{head}{plan}{age}"),
+                format!("{head}{age}"),
+                head.clone(),
+            ]
+            .into_iter()
+            .find(|t| t.chars().count() <= width)
+            .unwrap_or(head);
             f.render_widget(
                 Paragraph::new(lines).block(
                     Block::bordered()
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(color))
-                        .title(format!(" {}{} {plan}", pad(ic.kind(u.kind)), u.kind)),
+                        .title(title),
                 ),
                 r,
             );

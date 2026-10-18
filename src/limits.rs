@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -23,13 +24,15 @@ use crate::agent::Kind;
 
 /// Cada cuánto se vuelve a preguntar.
 pub const TTL: Duration = Duration::from_secs(60);
+/// Desde cuándo un dato se considera viejo y se dice de cuándo es.
+const STALE: Duration = Duration::from_secs(5 * 60);
 /// Lo que se lee del final de una sesión de Codex buscando el último evento.
 const TAIL: u64 = 1 << 20;
 /// Cuántas sesiones de Codex, de la más reciente hacia atrás, se miran: sin
 /// tope, alguien sin límites (con clave de API) leería todas cada `TTL`.
 const SESSIONS: usize = 20;
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Window {
     /// "5 h", "semana", "semana Opus"…
     pub name: String,
@@ -43,6 +46,18 @@ impl Window {
     }
 }
 
+/// Con `left_pct` ya calculado, para que la app no repita la cuenta.
+impl Serialize for Window {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Window", 4)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("used_pct", &self.used_pct)?;
+        st.serialize_field("left_pct", &self.left_pct())?;
+        st.serialize_field("resets_at", &self.resets_at)?;
+        st.end()
+    }
+}
+
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Usage {
     pub kind: Kind,
@@ -51,6 +66,9 @@ pub struct Usage {
     pub plan: Option<String>,
     /// De cuándo es el dato (Codex: el último evento visto).
     pub updated_at: Option<DateTime<Utc>>,
+    /// Si `updated_at` es de hace más de `STALE` (el de Codex puede ser de
+    /// hace días). Lo dice el servidor para que la app no dependa de su reloj.
+    pub stale: bool,
     /// Por qué no hay datos.
     pub error: Option<String>,
 }
@@ -62,6 +80,7 @@ impl Usage {
             windows: Vec::new(),
             plan: None,
             updated_at: None,
+            stale: false,
             error: Some(format!("{e:#}")),
         })
     }
@@ -78,12 +97,46 @@ impl Cache {
     /// Si el dato es viejo vuelve a leerlo (puede tardar unos segundos por la
     /// red). Devuelve si se leyó de nuevo.
     pub fn refresh(&mut self) -> bool {
-        if self.at.is_some_and(|t| t.elapsed() < TTL) {
+        if self.fresh() {
             return false;
         }
         self.usage = fetch();
         self.at = Some(Instant::now());
         true
+    }
+
+    fn fresh(&self) -> bool {
+        self.at.is_some_and(|t| t.elapsed() < TTL)
+    }
+
+    /// Si el dato es viejo, da la lectura por empezada y devuelve su marca:
+    /// quien lo llama lee con `fetch` sin tener el candado y lo guarda con
+    /// `set`, mientras las demás consultas sirven el dato de antes.
+    #[cfg(any(feature = "serve", test))]
+    pub fn claim(&mut self) -> Option<Instant> {
+        if self.fresh() {
+            return None;
+        }
+        let at = Instant::now();
+        self.at = Some(at);
+        Some(at)
+    }
+
+    /// Guarda la lectura `at`, salvo que haya empezado otra después: la más
+    /// nueva no la pisa una lenta que acabó tarde.
+    #[cfg(any(feature = "serve", test))]
+    pub fn set(&mut self, at: Instant, usage: Vec<Usage>) {
+        if self.at == Some(at) {
+            self.usage = usage;
+        }
+    }
+
+    /// La lectura `at` no terminó: que la siguiente consulta lo intente.
+    #[cfg(any(feature = "serve", test))]
+    pub fn forget(&mut self, at: Instant) {
+        if self.at == Some(at) {
+            self.at = None;
+        }
     }
 
     pub fn usage(&self) -> &[Usage] {
@@ -178,6 +231,7 @@ fn parse_claude(v: &Value) -> Result<Usage> {
         windows,
         plan: None,
         updated_at: Some(Utc::now()),
+        stale: false,
         error: None,
     })
 }
@@ -272,6 +326,7 @@ fn parse_codex(v: &Value, at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Usag
         windows,
         plan: v["plan_type"].as_str().map(str::to_string),
         updated_at: at,
+        stale: at.is_some_and(|t| now - t >= chrono::Duration::from_std(STALE).unwrap_or_default()),
         error: None,
     }
 }
@@ -303,6 +358,10 @@ mod tests {
         assert_eq!(u.windows[0].name, "5 h");
         assert_eq!(u.windows[0].left_pct(), 58.0);
         assert_eq!(
+            serde_json::to_value(&u.windows[0]).unwrap()["left_pct"],
+            58.0
+        );
+        assert_eq!(
             u.windows[1].resets_at,
             Some(Utc.with_ymd_and_hms(2026, 10, 24, 1, 0, 0).unwrap())
         );
@@ -320,12 +379,47 @@ mod tests {
             "plan_type": "plus",
         });
         let u = parse_codex(&v, None, now);
+        assert!(!u.stale);
+        assert!(parse_codex(&v, Some(now - chrono::Duration::minutes(5)), now).stale);
+        assert!(!parse_codex(&v, Some(now - chrono::Duration::minutes(4)), now).stale);
         assert_eq!(u.plan.as_deref(), Some("plus"));
         assert_eq!(u.windows[0].name, "5 h");
         assert_eq!(u.windows[0].used_pct, 62.0);
         assert_eq!(u.windows[1].name, "semana");
         assert_eq!(u.windows[1].used_pct, 0.0);
         assert_eq!(u.windows[1].resets_at, None);
+    }
+
+    #[test]
+    fn una_lectura_vieja_no_pisa_una_nueva() {
+        let usage = |pct| {
+            vec![Usage {
+                kind: Kind::Codex,
+                windows: vec![Window {
+                    name: "5 h".into(),
+                    used_pct: pct,
+                    resets_at: None,
+                }],
+                plan: None,
+                updated_at: None,
+                stale: false,
+                error: None,
+            }]
+        };
+        let mut c = Cache::default();
+        let a = c.claim().unwrap();
+        assert!(c.claim().is_none());
+        // `a` tardó más que `TTL` y otra lectura empezó.
+        c.at = Some(a - TTL);
+        let b = c.claim().unwrap();
+        c.set(b, usage(20.0));
+        c.set(a, usage(10.0));
+        assert_eq!(c.usage()[0].windows[0].used_pct, 20.0);
+        // Una que no terminó deja intentarlo de nuevo.
+        c.at = Some(b - TTL);
+        let d = c.claim().unwrap();
+        c.forget(d);
+        assert!(c.claim().is_some());
     }
 
     #[test]
