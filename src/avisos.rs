@@ -89,8 +89,7 @@ impl Notifier {
         let lead = self.leading();
         let (mut msgs, mut errors) = (Vec::new(), Vec::new());
         let events = transitions(state, &self.status, snaps);
-        // Una pasada suena una sola vez, como en la app del celular: si alguno
-        // te espera, gana ese.
+        // Una pasada suena una sola vez: si alguno te espera, gana ese.
         let mut sound = events
             .iter()
             .map(|e| e.0)
