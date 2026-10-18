@@ -1,14 +1,42 @@
-// La PWA de pastor: habla con /api del mismo servidor. Sin framework ni
+// La PWA de pastor: habla con la API del mismo servidor. Sin framework ni
 // build; `h` arma los nodos con textContent para no interpretar como HTML
 // nada de lo que llega de los agentes.
 "use strict";
 
-const TASK_LABEL = { todo: "pendiente", in_progress: "en curso", review: "por revisar", done: "hecha" };
-const KINDS = ["claude", "codex", "opencode"];
+const KIND = {
+  claude: { label: "Claude", color: "#ff7a45" },
+  codex: { label: "Codex", color: "#00ff9c" },
+  opencode: { label: "OpenCode", color: "#b46bff" },
+};
+const KINDS = Object.keys(KIND);
+const AGENT_GROUPS = [["blocked", "Te esperan"], ["working", "Trabajando"], ["idle", "Inactivos"], ["dead", "Terminados"]];
+const TASKS = [["todo", "Pendientes", "pendiente"], ["in_progress", "En curso", "en curso"], ["review", "Por revisar", "por revisar"], ["done", "Hechas", "hecha"]];
+const TASK_LABEL = Object.fromEntries(TASKS.map(([s, , one]) => [s, one]));
 const KEYS = [
-  ["Enter", "⏎"], ["Escape", "Esc"], ["Up", "↑"], ["Down", "↓"], ["Tab", "Tab"], ["BTab", "⇧Tab"],
-  ["1", "1"], ["2", "2"], ["3", "3"], ["y", "y"], ["n", "n"], ["C-c", "^C"],
+  ["Escape", "Esc"], ["Enter", "⏎"], ["Up", "↑"], ["Down", "↓"], ["Left", "←"], ["Right", "→"],
+  ["Tab", "Tab"], ["BTab", "⇧Tab"], ["Space", "Espacio"], ["1", "1"], ["2", "2"], ["3", "3"],
+  ["y", "y"], ["n", "n"], ["C-c", "Ctrl-C"],
 ];
+
+// Trazos de Lucide (ISC). Texto fijo nuestro: se puede meter con innerHTML.
+const ICONS = {
+  bot: '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/>',
+  tasks: '<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8M13 12h8M13 18h8"/>',
+  plus: '<path d="M5 12h14M12 5v14"/>',
+  back: '<path d="m15 18-6-6 6-6"/>',
+  forward: '<path d="m9 18 6-6-6-6"/>',
+  send: '<path d="m5 12 7-7 7 7M12 19V5"/>',
+  down: '<path d="M12 5v14M19 12l-7 7-7-7"/>',
+  more: '<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>',
+  folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  wrap: '<path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-4"/><path d="m16 16-2 2 2 2"/><path d="M3 18h7"/>',
+  type: '<path d="M4 7V4h16v3M9 20h6M12 4v16"/>',
+  trash: '<path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  assign: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/>',
+  key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+};
 
 // ---------- utilidades ----------
 
@@ -28,17 +56,32 @@ function h(tag, props = {}, ...kids) {
     else if (k in el && typeof v !== "string") el[k] = v;
     else el.setAttribute(k, v);
   }
-  el.append(...kids.flat().filter((x) => x != null && x !== false));
+  el.append(...kids.flat().filter((x) => x != null && x !== false && x !== ""));
   return el;
 }
 
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  svg.innerHTML = ICONS[name];
+  return svg;
+}
+
+const toastEl = document.getElementById("toast");
 let toastTimer;
-function toast(msg) {
-  const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.hidden = false;
+/** En la capa superior (popover), para que se vea también sobre una hoja abierta. */
+function toast(msg, error = false) {
+  toastEl.textContent = msg;
+  toastEl.classList.toggle("error", error);
+  toastEl.hidden = false;
+  try { toastEl.hidePopover(); toastEl.showPopover(); } catch {}
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), 3500);
+  toastTimer = setTimeout(() => {
+    toastEl.hidden = true;
+    try { toastEl.hidePopover(); } catch {}
+  }, 3500);
 }
 
 class Unauthorized extends Error {}
@@ -62,6 +105,7 @@ function once(fn) {
   };
 }
 
+// Relativa: funciona aunque pastor se sirva bajo una subruta.
 async function api(method, path, body) {
   const res = await fetch("api" + path, {
     method,
@@ -77,6 +121,9 @@ async function api(method, path, body) {
   return data;
 }
 
+// `fetch` rechaza con TypeError si no hay red, con otro texto en cada navegador.
+const errorText = (e) => (e instanceof TypeError ? "Sin conexión con pastor" : e.message);
+
 /** Corre `fn` y avisa si falla; sin token, vuelve a pedirlo. */
 async function attempt(fn) {
   try {
@@ -86,28 +133,133 @@ async function attempt(fn) {
       // Pueden fallar dos consultas a la vez: solo la primera vuelve al token.
       if (!store.get("pastor-token")) return;
       store.set("pastor-token", "");
-      toast(e.message);
+      toast(e.message, true);
       route();
     } else {
-      // `fetch` rechaza con TypeError si no hay red, con otro texto en cada navegador.
-      toast(e instanceof TypeError ? "sin conexión con pastor" : e.message);
+      toast(errorText(e), true);
     }
   }
 }
 
-function badge(status, label) {
-  return h("span", { class: "badge " + status, text: label });
+function ago(iso) {
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (Number.isNaN(s)) return "";
+  if (s < 60) return "ahora";
+  if (s < 3600) return `${Math.floor(s / 60)} min`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h`;
+  return `${Math.floor(s / 86400)} d`;
+}
+function since(iso) {
+  const a = ago(iso);
+  return a && a !== "ahora" ? "hace " + a : a;
+}
+const shortPath = (p) => p.replace(/^\/home\/[^/]+(?=\/|$)/, "~");
+
+function recentCwds() {
+  let saved = [];
+  try { saved = JSON.parse(store.get("pastor-cwds") || "[]"); } catch {}
+  return [...new Set([...saved, ...(feed.agents || []).map((a) => a.cwd)])].slice(0, 8);
+}
+function rememberCwd(cwd) {
+  store.set("pastor-cwd", cwd);
+  store.set("pastor-cwds", JSON.stringify([cwd, ...recentCwds().filter((c) => c !== cwd)].slice(0, 8)));
+}
+
+// ---------- piezas ----------
+
+const pill = (status, label) => h("span", { class: "pill " + status }, h("i"), label);
+
+function avatar(kind) {
+  const k = KIND[kind] || { label: kind || "?", color: "" };
+  return h("span", { class: "avatar", style: k.color ? `--kind:${k.color}` : null, text: k.label[0] });
+}
+
+const skeleton = (n) => Array.from({ length: n }, () => h("div", { class: "skeleton" }));
+
+const empty = (ic, title, text, action) =>
+  h("div", { class: "empty" }, h("div", { class: "empty-icon" }, icon(ic)), h("h3", { text: title }), h("p", { text }), action);
+
+/** Un campo con su etiqueta; `label` solo envuelve controles de texto (con
+ * botones dentro, tocar la etiqueta pulsaría el primero). */
+function field(label, control, hint) {
+  const tag = /^(INPUT|TEXTAREA|SELECT)$/.test(control.tagName) ? "label" : "div";
+  return h(tag, { class: "field" }, h("span", { class: "field-label", text: label }), control, hint && h("small", { text: hint }));
+}
+
+const row = (label, value) => [h("dt", { text: label }), h("dd", {}, value)];
+
+const menuItem = (ic, label, onclick, cls = "") =>
+  h("button", { type: "button", class: "menu-item " + cls, onclick }, icon(ic), h("span", { text: label }));
+
+function kindPicker() {
+  let kind = KINDS.includes(store.get("pastor-kind")) ? store.get("pastor-kind") : "claude";
+  const el = h("div", { class: "segmented", role: "radiogroup", "aria-label": "Tipo de agente" });
+  const draw = () => el.replaceChildren(...KINDS.map((k) => h("button", {
+    type: "button", role: "radio", "aria-checked": String(k === kind), class: k === kind ? "on" : "",
+    onclick: () => { kind = k; draw(); },
+  }, avatar(k), KIND[k].label)));
+  draw();
+  return { el, get value() { return kind; } };
+}
+
+function cwdInput() {
+  const id = "cwds-" + Math.random().toString(36).slice(2);
+  const input = h("input", {
+    required: true, placeholder: "/home/…/proyecto", value: store.get("pastor-cwd"), list: id,
+    autocapitalize: "off", autocorrect: "off", spellcheck: "false", inputmode: "url",
+  });
+  return { input, el: h("div", {}, field("Directorio", input, "Ruta absoluta en la máquina"), h("datalist", { id }, recentCwds().map((c) => h("option", { value: c })))) };
+}
+
+// ---------- hojas ----------
+
+const sheets = new Set();
+
+function sheet(title, ...body) {
+  const d = h("dialog", { class: "sheet" },
+    h("div", { class: "sheet-inner" },
+      h("div", { class: "sheet-grip" }),
+      h("div", { class: "sheet-head" },
+        h("h2", { text: title }),
+        h("button", { type: "button", class: "icon-btn", "aria-label": "Cerrar", onclick: () => d.close() }, icon("x")),
+      ),
+      body,
+    ),
+  );
+  // Fuera de `.sheet-inner` solo queda el fondo.
+  d.addEventListener("click", (e) => { if (e.target === d) d.close(); });
+  d.addEventListener("close", () => { sheets.delete(d); d.remove(); });
+  document.body.append(d);
+  sheets.add(d);
+  d.showModal();
+  return d;
+}
+
+function ask(title, text, okLabel, danger = false) {
+  return new Promise((resolve) => {
+    let answer = false;
+    const d = sheet(title,
+      h("p", { class: "sheet-text", text }),
+      h("div", { class: "sheet-actions" },
+        h("button", { type: "button", class: "btn", text: "Cancelar", onclick: () => d.close() }),
+        h("button", { type: "button", class: "btn " + (danger ? "danger-solid" : "primary"), text: okLabel, onclick: () => { answer = true; d.close(); } }),
+      ),
+    );
+    d.addEventListener("close", () => resolve(answer));
+  });
 }
 
 // ---------- navegación ----------
 
+const topEl = document.getElementById("top");
 const main = document.getElementById("main");
+const tabs = document.getElementById("tabs");
 /** Lo que hay que parar al salir de una pantalla (polling). */
 let cleanup = [];
 
-/** Llama a `fn` cada `ms` mientras la pantalla siga abierta. Devuelve una
- * función que adelanta la siguiente vuelta sin duplicar el ciclo. */
-function every(ms, fn) {
+/** Llama a `fn` cada `ms` mientras no se pare. `tick` adelanta la siguiente
+ * vuelta sin duplicar el ciclo. */
+function loop(ms, fn) {
   let stopped = false;
   let running = false;
   let again = false;
@@ -129,24 +281,87 @@ function every(ms, fn) {
   // Al volver a la app, que no espere a su siguiente vuelta.
   const onVisible = () => { if (!document.hidden) tick(); };
   document.addEventListener("visibilitychange", onVisible);
-  cleanup.push(() => {
-    stopped = true;
-    clearTimeout(timer);
-    document.removeEventListener("visibilitychange", onVisible);
-  });
   tick();
-  return tick;
+  return {
+    tick,
+    stop() {
+      stopped = true;
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    },
+  };
 }
+
+/** Cambia la lista sin esperar a la siguiente consulta. Una consulta que ya
+ * iba en camino traería la lista de antes: `version` hace que se descarte. */
+function changeAgents(list) {
+  feed.version++;
+  setAgents(list);
+}
+
+/** Un `loop` que vive lo que la pantalla actual. */
+function every(ms, fn) {
+  const l = loop(ms, fn);
+  cleanup.push(l.stop);
+  return l.tick;
+}
+
+/** Los agentes se consultan en un solo lugar para todas las pantallas (y la
+ * pestaña muestra cuántos te esperan aunque estés en Tareas). */
+const feed = { agents: null, json: "", version: 0, subs: new Set() };
+
+function watchAgents(fn) {
+  feed.subs.add(fn);
+  cleanup.push(() => feed.subs.delete(fn));
+  if (feed.agents) fn(feed.agents);
+}
+
+function setAgents(list) {
+  // Redibujar sin cambios cambia las tarjetas bajo el dedo y se pierde el toque.
+  const json = JSON.stringify(list);
+  if (json === feed.json) return;
+  feed.json = json;
+  feed.agents = list;
+  const waiting = list.filter((a) => a.status === "blocked").length;
+  const count = tabs.querySelector(".count");
+  count.textContent = String(waiting);
+  count.hidden = !waiting;
+  document.title = waiting ? `(${waiting}) pastor` : "pastor";
+  feed.subs.forEach((f) => f(list));
+}
+
+function setTop({ title, back, actions = [] }) {
+  const titleEl = h("div", { class: "title", text: title });
+  const subtitle = h("div", { class: "subtitle" });
+  topEl.replaceChildren(
+    back
+      ? h("a", { class: "icon-btn", href: back, "aria-label": "Volver" }, icon("back"))
+      : h("img", { class: "logo", src: "icon-192.png", alt: "" }),
+    h("div", { class: "titles" }, titleEl, subtitle),
+    ...actions,
+  );
+  return { title: titleEl, subtitle };
+}
+
+tabs.append(...[["agents", "Agentes", "bot"], ["tasks", "Tareas", "tasks"]].map(([tab, label, ic]) =>
+  h("a", { href: "#/" + tab, "data-tab": tab },
+    h("span", { class: "tab-icon" }, icon(ic), tab === "agents" && h("b", { class: "count", hidden: true })),
+    h("span", { text: label }),
+  )));
 
 function route() {
   cleanup.forEach((f) => f());
   cleanup = [];
+  sheets.forEach((d) => d.close());
   main.replaceChildren();
+  main.className = "";
   const hash = location.hash.slice(1) || "/agents";
   const tab = hash.startsWith("/tasks") ? "tasks" : "agents";
-  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
-  document.querySelector("nav").hidden = !store.get("pastor-token");
-  if (!store.get("pastor-token")) return tokenView();
+  tabs.querySelectorAll("a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
+  if (!store.get("pastor-token")) {
+    document.body.dataset.view = "token";
+    return tokenView();
+  }
   const agent = hash.match(/^\/agent\/(.+)$/);
   if (agent) {
     let id;
@@ -156,8 +371,10 @@ function route() {
       location.hash = "#/agents";
       return;
     }
+    document.body.dataset.view = "agent";
     return agentView(id);
   }
+  document.body.dataset.view = tab;
   if (tab === "tasks") return tasksView();
   agentsView();
 }
@@ -167,112 +384,164 @@ window.addEventListener("hashchange", route);
 // ---------- token ----------
 
 function tokenView() {
-  const input = h("input", { type: "password", autocomplete: "off", placeholder: "token", required: true });
-  main.append(
-    h("h1", { text: "Conectar con pastor" }),
+  const input = h("input", { type: "password", autocomplete: "current-password", placeholder: "Pega aquí el token", required: true });
+  main.append(h("div", { class: "login" },
+    h("img", { class: "login-logo", src: "icon-512.png", alt: "" }),
+    h("h1", { text: "pastor" }),
+    h("p", { text: "Tus agentes, desde el celular." }),
     h("form", {
-      class: "card",
+      class: "form login-form",
       onsubmit: once(async () => {
         store.set("pastor-token", input.value.trim());
-        const ok = await attempt(() => api("GET", "/agents"));
-        if (ok) route();
-        else if (store.get("pastor-token")) store.set("pastor-token", "");
+        const agents = await attempt(() => api("GET", "/agents"));
+        if (!agents) {
+          store.set("pastor-token", "");
+          return;
+        }
+        setAgents(agents);
+        route();
       }),
     },
-      h("label", { text: "Token de pastor serve" }),
-      input,
-      h("p", { class: "muted", text: "En la máquina: cat ~/.local/share/pastor/serve-token. Se guarda solo en este dispositivo." }),
-      h("div", { class: "row" }, h("button", { class: "primary", text: "Entrar" })),
+      field("Token", input),
+      h("button", { class: "btn primary block" }, icon("key"), "Conectar"),
     ),
-  );
+    h("p", { class: "hint" }, "En la máquina: ", h("code", { text: "cat ~/.local/share/pastor/serve-token" })),
+  ));
+  input.focus();
 }
 
 // ---------- agentes ----------
 
 function agentsView() {
-  const list = h("div", { class: "list" });
-  const refresh = every(3000, () => attempt(async () => {
-    const agents = await api("GET", "/agents");
-    list.replaceChildren(
-      ...(agents.length ? agents.map(agentCard) : [h("p", { class: "empty", text: "No hay agentes." })])
-    );
-  }));
-  const open = h("button", { class: "primary", text: "Nuevo", onclick: () => { open.hidden = true; form.hidden = false; } });
-  const form = newAgentForm(() => { form.hidden = true; open.hidden = false; refresh(); });
-  form.hidden = true;
-  main.append(h("div", { class: "row between" }, h("h1", { text: "Agentes" }), open), form, list);
+  const { subtitle } = setTop({
+    title: "Agentes",
+    actions: [h("button", { class: "icon-btn accent", "aria-label": "Nuevo agente", onclick: newAgentSheet }, icon("plus"))],
+  });
+  const list = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
+  main.append(list);
+  watchAgents((agents) => {
+    const n = (...st) => agents.filter((a) => st.includes(a.status)).length;
+    const parts = [n("blocked") && `${n("blocked")} te esperan`, n("working", "starting") && `${n("working", "starting")} trabajando`];
+    subtitle.textContent = parts.filter(Boolean).join(" · ") || (agents.length ? "Todo en calma" : "");
+    if (!agents.length) {
+      list.replaceChildren(empty("bot", "No hay agentes", "Crea uno para ponerlo a trabajar.",
+        h("button", { class: "btn primary", onclick: newAgentSheet }, icon("plus"), "Nuevo agente")));
+      return;
+    }
+    const group = (s) => (s === "starting" ? "working" : s);
+    list.replaceChildren(...AGENT_GROUPS.flatMap(([g, label]) => {
+      const items = agents.filter((a) => group(a.status) === g);
+      return items.length
+        ? [h("section", { class: "group" },
+            h("h2", { class: "group-title" }, label, h("span", { class: "group-count", text: String(items.length) })),
+            h("div", { class: "cards" }, items.map(agentCard)))]
+        : [];
+    }));
+  });
 }
 
 function agentCard(a) {
-  return h("a", { class: "card", href: "#/agent/" + encodeURIComponent(a.id) },
-    h("div", { class: "row between" }, h("span", { class: "name", text: a.name }), badge(a.status, a.status_label)),
-    h("div", { class: "meta", text: `${a.kind} · ${a.cwd}` }),
-    a.task && h("div", { class: "meta", text: "tarea " + a.task }),
+  return h("a", { class: "card agent " + a.status, href: "#/agent/" + encodeURIComponent(a.id) },
+    avatar(a.kind),
+    h("div", { class: "card-main" },
+      h("div", { class: "card-title" }, h("span", { class: "name", text: a.name }), pill(a.status, a.status_label)),
+      h("div", { class: "card-meta" },
+        icon("folder"), h("span", { class: "ellipsis", text: shortPath(a.cwd) }),
+        h("span", { class: "time", text: ago(a.created_at) }),
+      ),
+      a.task && h("div", { class: "card-meta" }, icon("tasks"), h("span", { class: "ellipsis", text: "Tarea " + a.task })),
+    ),
+    h("span", { class: "chev" }, icon("forward")),
   );
 }
 
-function newAgentForm(done) {
-  const kind = h("select", {}, KINDS.map((k) => h("option", { value: k, text: k })));
-  const cwd = h("input", { required: true, placeholder: "/home/…/proyecto", value: store.get("pastor-cwd") });
-  const name = h("input", { placeholder: "opcional" });
-  const prompt = h("textarea", { rows: 2, placeholder: "opcional" });
-  const form = h("form", {
-    class: "card",
+function newAgentSheet() {
+  const kind = kindPicker();
+  const cwd = cwdInput();
+  const name = h("input", { placeholder: "Opcional", autocapitalize: "off", autocorrect: "off" });
+  const prompt = h("textarea", { rows: 3, placeholder: "Opcional: lo primero que le pides" });
+  const d = sheet("Nuevo agente", h("form", {
+    class: "form",
     onsubmit: once(async () => {
-      const body = { kind: kind.value, cwd: cwd.value.trim(), name: name.value.trim() || undefined, prompt: prompt.value.trim() || undefined };
+      const body = { kind: kind.value, cwd: cwd.input.value.trim(), name: name.value.trim() || undefined, prompt: prompt.value.trim() || undefined };
       const a = await attempt(() => api("POST", "/agents", body));
       if (!a) return;
-      store.set("pastor-cwd", body.cwd);
+      rememberCwd(body.cwd);
+      store.set("pastor-kind", body.kind);
+      // Ya en la lista, para que su pantalla no lo dé por inexistente
+      // antes de la siguiente consulta.
+      changeAgents([...(feed.agents || []), { ...a, status: "starting", status_label: "iniciando" }]);
+      d.close();
       toast(`${a.name} creado`);
-      name.value = prompt.value = "";
-      done();
+      location.hash = "#/agent/" + encodeURIComponent(a.id);
     }),
   },
-    h("label", { text: "Tipo" }), kind,
-    h("label", { text: "Directorio (ruta absoluta)" }), cwd,
-    h("label", { text: "Nombre" }), name,
-    h("label", { text: "Primer mensaje" }), prompt,
-    h("div", { class: "row" },
-      h("button", { type: "button", text: "Cancelar", onclick: done }),
-      h("button", { class: "primary", text: "Crear" }),
-    ),
-  );
-  return form;
+    field("Tipo", kind.el), cwd.el, field("Nombre", name), field("Primer mensaje", prompt),
+    h("button", { class: "btn primary block" }, icon("plus"), "Crear agente"),
+  ));
+}
+
+function termPrefs(el) {
+  const size = Math.min(18, Math.max(9, Number(store.get("pastor-font")) || 12));
+  el.style.fontSize = size + "px";
+  el.classList.toggle("wrap", store.get("pastor-wrap") === "1");
+  return size;
 }
 
 function agentView(id) {
-  const title = h("span", { class: "name", text: id });
-  const status = h("span");
-  const meta = h("div", { class: "meta muted" });
-  const screen = h("pre", { class: "screen", text: "…" });
-  const note = h("p", { class: "muted", hidden: true });
-  const text = h("textarea", { rows: 2, placeholder: "Mensaje para el agente" });
+  let agent = null;
+  const more = h("button", { class: "icon-btn", "aria-label": "Opciones", onclick: () => agentMenu() }, icon("more"));
+  const top = setTop({ title: id, back: "#/agents", actions: [more] });
+  const screen = h("pre", { class: "term loading", text: "Cargando pantalla…" });
+  termPrefs(screen);
+  const atBottom = () => screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
+  const jump = h("button", { type: "button", class: "jump", hidden: true, "aria-label": "Ir al final", onclick: () => (screen.scrollTop = screen.scrollHeight) }, icon("down"));
+  screen.addEventListener("scroll", () => (jump.hidden = atBottom()), { passive: true });
+  const note = h("div", { class: "note", role: "alert", hidden: true });
 
-  every(5000, () => attempt(async () => {
-    const a = (await api("GET", "/agents")).find((x) => x.id === id);
-    if (!a) {
-      toast("ese agente ya no existe");
-      location.hash = "#/agents";
-      return;
-    }
-    title.textContent = a.name;
-    status.replaceChildren(badge(a.status, a.status_label));
-    meta.textContent = `${a.kind} · ${a.cwd}` + (a.task ? ` · tarea ${a.task}` : "");
-  }));
+  let gone = false;
+  let checking = false;
+  cleanup.push(() => (gone = true));
+  // La lista guardada puede ser de antes de que existiera el agente (recién
+  // creado o asignado, o la app estuvo en segundo plano): se confirma con
+  // el servidor antes de darlo por perdido.
+  const confirmGone = async () => {
+    if (checking) return;
+    checking = true;
+    const fresh = await attempt(() => api("GET", "/agents"));
+    checking = false;
+    if (gone || !fresh) return;
+    if (fresh.some((x) => x.id === id)) return changeAgents(fresh);
+    gone = true;
+    toast("Ese agente ya no existe", true);
+    location.hash = "#/agents";
+  };
+  watchAgents((agents) => {
+    if (gone) return;
+    const a = agents.find((x) => x.id === id);
+    if (!a) return confirmGone();
+    agent = a;
+    top.title.textContent = a.name;
+    top.subtitle.replaceChildren(pill(a.status, a.status_label), h("span", { class: "ellipsis", text: shortPath(a.cwd) }));
+  });
 
+  let first = true;
   const pollScreen = every(1500, async () => {
     try {
-      const { text: t } = await api("GET", `/agents/${encodeURIComponent(id)}/screen`);
+      const { text } = await api("GET", `/agents/${encodeURIComponent(id)}/screen`);
       note.hidden = true;
-      if (screen.textContent === t) return;
+      if (!first && screen.textContent === text) return;
       // Solo baja si ya estaba abajo: si subiste a leer, no te mueve.
-      const atBottom = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
-      screen.textContent = t;
-      if (atBottom) screen.scrollTop = screen.scrollHeight;
+      const stick = first || atBottom();
+      screen.classList.remove("loading");
+      screen.textContent = text;
+      if (stick) screen.scrollTop = screen.scrollHeight;
+      first = false;
+      jump.hidden = atBottom();
     } catch (e) {
       if (e instanceof Unauthorized) return attempt(() => { throw e; });
       // Debajo, sin tapar lo último que se vio: suele ser lo que había que leer.
-      note.textContent = e instanceof TypeError ? "sin conexión con pastor" : e.message;
+      note.textContent = errorText(e);
       note.hidden = false;
     }
   });
@@ -286,124 +555,256 @@ function agentView(id) {
     return true;
   })));
 
-  const keys = KEYS.map(([key, label]) => h("button", {
+  const keys = h("div", { class: "keys", role: "toolbar", "aria-label": "Teclas" }, KEYS.map(([key, label]) => h("button", {
     type: "button",
+    class: key === "C-c" ? "key danger" : "key",
     text: label,
-    onclick: () => {
-      if (key === "C-c" && !confirm("¿Mandar Ctrl-C? Puede terminar al agente.")) return;
+    // Que tocar una tecla no le quite el foco a la caja (cerraría el teclado).
+    onpointerdown: (e) => e.preventDefault(),
+    onclick: async () => {
+      if (key === "C-c" && !(await ask("¿Mandar Ctrl-C?", "Puede cancelar lo que está haciendo o terminar al agente.", "Mandar Ctrl-C", true))) return;
+      navigator.vibrate?.(8);
       post("/keys", { keys: [key] });
     },
-  }));
+  })));
 
+  const draftKey = "pastor-draft-" + id;
+  const text = h("textarea", { rows: 1, placeholder: "Escribe al agente…", "aria-label": "Mensaje", enterkeyhint: "enter" });
+  text.value = store.get(draftKey);
+  const grow = () => {
+    text.style.height = "auto";
+    text.style.height = Math.min(text.scrollHeight + 2, 150) + "px";
+  };
+  text.addEventListener("input", () => { store.set(draftKey, text.value); grow(); });
+  const form = h("form", {
+    class: "composer-row",
+    onsubmit: once(async () => {
+      if (!text.value.trim()) return;
+      if (await post("/send", { text: text.value })) {
+        text.value = "";
+        store.set(draftKey, "");
+        grow();
+      }
+    }),
+  }, text, h("button", { class: "send-btn", "aria-label": "Enviar" }, icon("send")));
+  // Enter hace salto de línea (en el celular no hay Shift); Ctrl+Enter envía.
+  text.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); form.requestSubmit(); }
+  });
+
+  function agentMenu() {
+    const size = h("output", { text: String(termPrefs(screen)) });
+    const step = (delta) => {
+      store.set("pastor-font", String(Number(size.textContent) + delta));
+      size.textContent = String(termPrefs(screen));
+    };
+    const wrapped = store.get("pastor-wrap") === "1";
+    const d = sheet(agent?.name || id,
+      agent && h("dl", { class: "info" },
+        row("Tipo", KIND[agent.kind]?.label || agent.kind),
+        row("Estado", agent.status_label),
+        row("Directorio", agent.cwd),
+        agent.task && row("Tarea", agent.task),
+        row("Creado", since(agent.created_at)),
+      ),
+      h("div", { class: "menu" },
+        menuItem("wrap", wrapped ? "Sin ajustar líneas" : "Ajustar líneas al ancho", () => {
+          store.set("pastor-wrap", wrapped ? "" : "1");
+          termPrefs(screen);
+          d.close();
+        }),
+        h("div", { class: "menu-row" }, icon("type"), h("span", { text: "Tamaño de letra" }),
+          h("div", { class: "stepper" },
+            h("button", { type: "button", text: "A−", "aria-label": "Más chica", onclick: () => step(-1) }),
+            size,
+            h("button", { type: "button", text: "A+", "aria-label": "Más grande", onclick: () => step(1) }),
+          ),
+        ),
+        menuItem("trash", "Terminar agente", async () => {
+          d.close();
+          const name = agent?.name || id;
+          if (!(await ask(`¿Terminar ${name}?`, "Se cierra su sesión de tmux y lo que esté haciendo.", "Terminar", true))) return;
+          if (!(await attempt(() => api("DELETE", `/agents/${encodeURIComponent(id)}`)))) return;
+          gone = true;
+          store.set(draftKey, "");
+          changeAgents((feed.agents || []).filter((a) => a.id !== id));
+          toast(`${name} terminado`);
+          location.hash = "#/agents";
+        }, "danger"),
+      ),
+    );
+  }
+
+  main.className = "agent-main";
   main.append(
-    h("div", { class: "agent-head" },
-      h("div", { class: "row between" }, h("a", { href: "#/agents", text: "← Agentes" }), status),
-      title, meta,
-    ),
-    screen,
-    note,
-    h("div", { class: "keys" }, keys),
-    h("form", {
-      class: "send",
-      onsubmit: once(async () => {
-        if (!text.value.trim()) return;
-        if (await post("/send", { text: text.value })) text.value = "";
-      }),
-    }, text, h("button", { class: "primary", text: "Enviar" })),
-    h("div", { class: "row", style: "margin-top:24px;justify-content:flex-end" },
-      h("button", {
-        class: "danger",
-        text: "Terminar agente",
-        onclick: async () => {
-          if (!confirm("¿Terminar este agente? Se cierra su sesión de tmux.")) return;
-          if (await attempt(() => api("DELETE", `/agents/${encodeURIComponent(id)}`))) location.hash = "#/agents";
-        },
-      }),
-    ),
+    h("div", { class: "term-wrap" }, screen, jump),
+    h("div", { class: "composer" }, note, keys, form),
   );
-  requestAnimationFrame(() => (screen.scrollTop = screen.scrollHeight));
+  requestAnimationFrame(grow);
 }
 
 // ---------- tareas ----------
 
 function tasksView() {
-  const list = h("div");
-  const load = async () => {
-    const [tasks, agents] = await Promise.all([api("GET", "/tasks"), api("GET", "/agents")]);
-    const groups = Object.keys(TASK_LABEL).map((st) => [st, tasks.filter((t) => t.status === st)]).filter(([, ts]) => ts.length);
-    list.replaceChildren(
-      ...(groups.length
-        ? groups.map(([st, ts]) => [h("h2", { text: TASK_LABEL[st] }), h("div", { class: "list" }, ts.map((t) => taskCard(t, agents, reload)))])
-        : [h("p", { class: "empty", text: "No hay tareas." })]).flat()
-    );
+  let tasks = null;
+  let filter = store.get("pastor-task-filter");
+  let reload = () => {};
+  const add = () => newTaskSheet(reload);
+  setTop({
+    title: "Tareas",
+    actions: [h("button", { class: "icon-btn accent", "aria-label": "Nueva tarea", onclick: add }, icon("plus"))],
+  });
+  const chips = h("div", { class: "chips", role: "tablist" });
+  const list = h("div", { class: "cards" }, skeleton(3));
+  const agentName = (id) => (feed.agents || []).find((a) => a.id === id)?.name || id;
+
+  const card = (t) => h("button", { type: "button", class: "card task", onclick: () => taskSheet(t, agentName, reload) },
+    h("div", { class: "card-main" },
+      h("span", { class: "name", text: t.title }),
+      t.description && h("div", { class: "desc", text: t.description }),
+      h("div", { class: "card-meta" },
+        h("span", { class: "tag", text: t.id }),
+        t.agent && [icon("bot"), h("span", { class: "ellipsis", text: agentName(t.agent) })],
+        h("span", { class: "time", text: ago(t.created_at) }),
+      ),
+    ),
+    h("span", { class: "chev" }, icon("forward")),
+  );
+
+  const draw = () => {
+    if (!tasks) return;
+    const counts = Object.fromEntries(TASKS.map(([s]) => [s, tasks.filter((t) => t.status === s).length]));
+    if (!TASKS.some(([s]) => s === filter)) filter = TASKS.find(([s]) => s !== "done" && counts[s])?.[0] || "todo";
+    chips.replaceChildren(...TASKS.map(([s, label]) => h("button", {
+      type: "button", role: "tab", class: s === filter ? "chip on" : "chip", "aria-selected": String(s === filter),
+      onclick: () => { filter = s; store.set("pastor-task-filter", s); draw(); },
+    }, label, h("span", { class: "chip-count", text: String(counts[s]) }))));
+    const shown = tasks.filter((t) => t.status === filter);
+    list.replaceChildren(...(shown.length
+      ? shown.map(card)
+      : [tasks.length
+          ? empty("tasks", "Nada por aquí", "No hay tareas en este estado.")
+          : empty("tasks", "No hay tareas", "Anota lo que quieres que hagan tus agentes.",
+              h("button", { class: "btn primary", onclick: add }, icon("plus"), "Nueva tarea"))]));
   };
-  const reload = () => attempt(load);
-  reload();
 
-  const title = h("input", { required: true, placeholder: "Título" });
-  const desc = h("textarea", { rows: 2, placeholder: "Descripción (opcional)" });
-  main.append(
-    h("h1", { text: "Tareas" }),
-    h("form", {
-      class: "card",
-      onsubmit: once(async () => {
-        if (await attempt(() => api("POST", "/tasks", { title: title.value.trim(), description: desc.value.trim() }))) {
-          title.value = desc.value = "";
-          reload();
-        }
-      }),
-    }, title, h("div", { style: "height:8px" }), desc, h("div", { class: "row" }, h("button", { class: "primary", text: "Agregar" }))),
-    list,
-  );
+  main.append(chips, list);
+  let tasksJson = "";
+  reload = every(10000, () => attempt(async () => {
+    const list = await api("GET", "/tasks");
+    const json = JSON.stringify(list);
+    if (json === tasksJson) return;
+    tasksJson = json;
+    tasks = list;
+    draw();
+  }));
+  watchAgents(draw);
 }
 
-function taskCard(t, agents, reload) {
-  const card = h("div", { class: "card" },
-    h("div", { class: "name", text: `${t.id} · ${t.title}` }),
-    t.description && h("div", { class: "meta", text: t.description }),
-    t.agent && h("div", { class: "meta", text: "agente " + (agents.find((a) => a.id === t.agent)?.name || t.agent) }),
-  );
-  const act = (method, path) => attempt(async () => { await api(method, `/tasks/${encodeURIComponent(t.id)}${path}`); reload(); });
-  const actions = h("div", { class: "row wrap", style: "margin-top:8px" },
-    t.status !== "done" && h("button", { text: "Asignar", onclick: () => { actions.hidden = true; card.append(assignForm(t, agents, reload, () => { actions.hidden = false; })); } }),
-    t.status !== "done" && h("button", { text: "Hecha", onclick: () => act("POST", "/done") }),
-    h("button", { class: "danger", text: "Borrar", onclick: () => confirm(`¿Borrar «${t.title}»?`) && act("DELETE", "") }),
-  );
-  card.append(actions);
-  return card;
-}
-
-function assignForm(t, agents, reload, cancel) {
-  const target = h("select", {},
-    agents.map((a) => h("option", { value: "agent:" + a.id, text: `${a.name} (${a.status_label})` })),
-    KINDS.map((k) => h("option", { value: "new:" + k, text: `Nuevo ${k}` })),
-  );
-  const cwd = h("input", { placeholder: "/home/…/proyecto", value: store.get("pastor-cwd") });
-  const cwdWrap = h("div", {}, h("label", { text: "Directorio (ruta absoluta)" }), cwd);
-  const sync = () => (cwdWrap.hidden = !target.value.startsWith("new:"));
-  target.addEventListener("change", sync);
-  sync();
-  const form = h("form", {
+function newTaskSheet(reload) {
+  const title = h("input", { required: true, placeholder: "Qué hay que hacer" });
+  const desc = h("textarea", { rows: 4, placeholder: "Opcional: contexto, criterios, enlaces…" });
+  const d = sheet("Nueva tarea", h("form", {
+    class: "form",
     onsubmit: once(async () => {
-      const [what, val] = target.value.split(/:(.*)/);
-      const body = what === "agent" ? { agent: val } : { kind: val, cwd: cwd.value.trim() };
-      if (await attempt(() => api("POST", `/tasks/${encodeURIComponent(t.id)}/assign`, body))) {
-        if (body.cwd) store.set("pastor-cwd", body.cwd);
-        toast("tarea asignada");
-        reload();
-      }
+      if (!(await attempt(() => api("POST", "/tasks", { title: title.value.trim(), description: desc.value.trim() })))) return;
+      d.close();
+      toast("Tarea agregada");
+      reload();
     }),
   },
-    h("label", { text: "Asignar a" }), target, cwdWrap,
-    h("div", { class: "row", style: "margin-top:12px;justify-content:flex-end" },
-      h("button", { type: "button", text: "Cancelar", onclick: () => { form.remove(); cancel(); } }),
-      h("button", { class: "primary", text: "Asignar" }),
+    field("Título", title), field("Descripción", desc),
+    h("button", { class: "btn primary block" }, icon("plus"), "Agregar tarea"),
+  ));
+  title.focus();
+}
+
+function taskSheet(t, agentName, reload) {
+  const path = `/tasks/${encodeURIComponent(t.id)}`;
+  const d = sheet(t.title,
+    t.description && h("p", { class: "sheet-text", text: t.description }),
+    h("dl", { class: "info" },
+      row("Estado", TASK_LABEL[t.status] || t.status),
+      row("Id", t.id),
+      t.agent && row("Agente", agentName(t.agent)),
+      row("Creada", since(t.created_at)),
+      /^https?:\/\//.test(t.url || "") && row("Enlace", h("a", { href: t.url, target: "_blank", rel: "noopener", text: t.url })),
+    ),
+    h("div", { class: "menu" },
+      t.agent && menuItem("bot", "Abrir su agente", () => { location.hash = "#/agent/" + encodeURIComponent(t.agent); }),
+      t.status !== "done" && menuItem("assign", t.agent ? "Asignar a otro agente" : "Asignar a un agente", () => { d.close(); assignSheet(t, reload); }),
+      t.status !== "done" && menuItem("check", "Marcar como hecha", async () => {
+        d.close();
+        if (await attempt(() => api("POST", path + "/done"))) { toast("Tarea hecha"); reload(); }
+      }),
+      menuItem("trash", "Borrar", async () => {
+        d.close();
+        if (!(await ask("¿Borrar la tarea?", `«${t.title}» se borra para siempre.`, "Borrar", true))) return;
+        if (await attempt(() => api("DELETE", path))) { toast("Tarea borrada"); reload(); }
+      }, "danger"),
     ),
   );
-  return form;
+}
+
+function assignSheet(t, reload) {
+  const agents = (feed.agents || []).filter((a) => a.status !== "dead");
+  let choice = agents.length ? "agent:" + agents[0].id : "new";
+  const kind = kindPicker();
+  const cwd = cwdInput();
+  const extra = h("div", { class: "form" }, field("Tipo", kind.el), cwd.el);
+  const options = h("div", { class: "options", role: "radiogroup", "aria-label": "Agente" });
+  const option = (value, ...kids) => h("button", {
+    type: "button", role: "radio", "aria-checked": String(choice === value), class: choice === value ? "option on" : "option",
+    onclick: () => { choice = value; draw(); },
+  }, kids);
+  const draw = () => {
+    options.replaceChildren(
+      ...agents.map((a) => option("agent:" + a.id,
+        avatar(a.kind),
+        h("span", { class: "opt-main" }, h("span", { class: "name", text: a.name }), h("small", { text: shortPath(a.cwd) })),
+        pill(a.status, a.status_label))),
+      option("new",
+        h("span", { class: "avatar plus" }, icon("plus")),
+        h("span", { class: "opt-main" }, h("span", { class: "name", text: "Agente nuevo" }), h("small", { text: "Lo crea y le pasa la tarea" }))),
+    );
+    extra.hidden = choice !== "new";
+    cwd.input.required = choice === "new";
+  };
+  draw();
+  const d = sheet("Asignar «" + t.title + "»", h("form", {
+    class: "form",
+    onsubmit: once(async () => {
+      const body = choice === "new" ? { kind: kind.value, cwd: cwd.input.value.trim() } : { agent: choice.slice("agent:".length) };
+      if (!(await attempt(() => api("POST", `/tasks/${encodeURIComponent(t.id)}/assign`, body)))) return;
+      if (body.cwd) { rememberCwd(body.cwd); store.set("pastor-kind", body.kind); }
+      d.close();
+      toast("Tarea asignada");
+      reload();
+      agentsLoop.tick();
+    }),
+  }, options, extra, h("button", { class: "btn primary block" }, icon("assign"), "Asignar")));
 }
 
 // ---------- arranque ----------
+
+const agentsLoop = loop(4000, async () => {
+  if (!store.get("pastor-token")) return;
+  const version = feed.version;
+  const list = await attempt(() => api("GET", "/agents"));
+  if (!list || version !== feed.version) return;
+  setAgents(list);
+  pruneDrafts(list);
+});
+
+/** Los borradores de agentes que ya no existen. */
+function pruneDrafts(list) {
+  const ids = new Set(list.map((a) => "pastor-draft-" + a.id));
+  try {
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith("pastor-draft-") && !ids.has(k))
+      .forEach((k) => localStorage.removeItem(k));
+  } catch {}
+}
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 route();
