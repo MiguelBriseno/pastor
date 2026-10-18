@@ -4,6 +4,7 @@
 //! Llama a `ops` igual que la CLI. Controlar un agente equivale a ejecutar
 //! comandos en esta máquina, así que todo pide el token.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,6 +23,7 @@ use serde_json::{json, Value};
 use crate::agent::{Kind, Status};
 use crate::ops::{self, AssignTarget, Tracker};
 use crate::store::{self, Agent, State, TaskStatus};
+use crate::transcript;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7433";
 
@@ -29,6 +31,8 @@ struct App {
     token: String,
     /// Para saber si la pantalla de un agente cambió entre dos consultas.
     tracker: Mutex<Tracker>,
+    /// La conversación leída de cada agente, para leer solo lo nuevo.
+    transcripts: Mutex<HashMap<String, transcript::Reader>>,
 }
 
 /// El token sale de `PASTOR_TOKEN` o del archivo, nunca de un argumento:
@@ -47,6 +51,7 @@ pub fn run(bind: SocketAddr) -> Result<()> {
     let app = Arc::new(App {
         token,
         tracker: Mutex::default(),
+        transcripts: Mutex::default(),
     });
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -70,6 +75,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/agents/{id}/send", post(send))
         .route("/agents/{id}/keys", post(keys))
         .route("/agents/{id}/screen", get(screen))
+        .route("/agents/{id}/conversation", get(conversation))
         .route("/tasks", get(list_tasks).post(add_task))
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
@@ -385,6 +391,57 @@ async fn screen(Path(id): Path<String>, Query(size): Query<Size>) -> Response {
     .await
 }
 
+/// Hasta dónde llegó la consulta anterior a `/conversation`.
+#[derive(Deserialize)]
+struct Since {
+    session: Option<String>,
+    after: Option<usize>,
+}
+
+/// La conversación entera de un agente de Claude, de su transcripción. Con
+/// `session` y `after` (lo que devolvió la consulta anterior), solo lo nuevo.
+/// `available: false` si aún no se sabe dónde está (Codex y OpenCode no la
+/// dan, y Claude Code la da en su primer hook).
+async fn conversation(
+    Shared(app): Shared<Arc<App>>,
+    Path(id): Path<String>,
+    Query(since): Query<Since>,
+) -> Response {
+    blocking(move || {
+        let state = State::load()?;
+        let agent = state.find_agent(&id)?;
+        let Some(path) = transcript::path_for(&agent.id) else {
+            return Ok(json!({ "available": false }));
+        };
+        let session = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut readers = app
+            .transcripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        readers.retain(|k, _| state.agents.iter().any(|a| &a.id == k));
+        let r = readers.entry(agent.id.clone()).or_default();
+        r.update(&path)?;
+        let from = match since {
+            Since {
+                session: Some(s),
+                after: Some(n),
+            } if s == session => n.min(r.messages.len()),
+            _ => 0,
+        };
+        Ok(json!({
+            "available": true,
+            "session": session,
+            "from": from,
+            "total": r.messages.len(),
+            "messages": &r.messages[from..],
+        }))
+    })
+    .await
+}
+
 async fn kill_agent(Path(id): Path<String>) -> Response {
     blocking(move || ops::kill_agent(&id).map(|()| ok())).await
 }
@@ -490,6 +547,7 @@ mod tests {
         let app = Arc::new(App {
             token: "secreto".into(),
             tracker: Mutex::default(),
+            transcripts: Mutex::default(),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listener = rt

@@ -258,6 +258,7 @@ IP de Tailscale (que ya cifra).
 | `POST` | `/api/agents/{id}/send` | `{"text": "..."}` (lo pega y pulsa Enter) |
 | `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
 | `GET` | `/api/agents/{id}/screen` | — (responde `{"text": "..."}`, lo que se ve en su panel; con `?cols=48&rows=30` antes lo ajusta a ese tamaño) |
+| `GET` | `/api/agents/{id}/conversation` | — (la conversación entera de un agente de Claude, de su transcripción; con `?session=…&after=N`, solo lo nuevo) |
 | `DELETE` | `/api/agents/{id}` | — |
 | `GET` | `/api/tasks` | — |
 | `POST` | `/api/tasks` | `{"title": "...", "description"?}` |
@@ -282,7 +283,8 @@ viniera después llegaría al shell.
 
 `pastor serve` también sirve una app web en `/`, pensada para el celular: los agentes agrupados por
 estado (los que te esperan, primero), la pantalla de cada uno en vivo con una caja para escribirle y
-botones para las teclas (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C), y las tareas. La
+botones para las teclas (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C), la conversación entera
+con los agentes de Claude, y las tareas. La
 primera vez pide el token y lo guarda solo en ese dispositivo.
 
 Para instalarla como app (PWA) el navegador exige HTTPS. Con Tailscale basta con publicar el puerto

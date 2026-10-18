@@ -9,6 +9,8 @@ mod server;
 mod store;
 mod text;
 mod tmux;
+#[cfg(feature = "serve")]
+mod transcript;
 mod tui;
 
 use std::path::PathBuf;

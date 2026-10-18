@@ -560,7 +560,10 @@ function agentView(id) {
 
   let first = true;
   let sentSize = "";
+  // Con la conversación a la vista, la pantalla no se pide.
+  let screenVisible = true;
   const pollScreen = every(1500, async () => {
+    if (!screenVisible) return;
     try {
       // El tamaño solo va cuando cambia (o al abrir): el agente redibuja a este
       // ancho y sus líneas caben sin moverse de lado. Mandarlo siempre haría
@@ -688,12 +691,118 @@ function agentView(id) {
     );
   }
 
+  const termWrap = h("div", { class: "term-wrap" }, screen, jump);
+  const chat = conversationPane(id, () => agent);
+  const views = { screen: termWrap, chat: chat.el };
+  const switcher = h("div", { class: "view-switch", role: "tablist", "aria-label": "Vista" });
+  const show = (v) => {
+    store.set("pastor-agent-view", v);
+    for (const [k, el] of Object.entries(views)) el.hidden = k !== v;
+    screenVisible = v === "screen";
+    if (screenVisible) pollScreen();
+    chat.active(v === "chat");
+    switcher.replaceChildren(...[["screen", "Pantalla"], ["chat", "Conversación"]].map(([k, label]) =>
+      h("button", { type: "button", role: "tab", "aria-selected": String(k === v), class: k === v ? "on" : "", text: label, onclick: () => show(k) })));
+  };
+
   main.className = "agent-main";
-  main.append(
-    h("div", { class: "term-wrap" }, screen, jump),
-    h("div", { class: "composer" }, note, keys, form),
-  );
+  main.append(switcher, termWrap, chat.el, h("div", { class: "composer" }, note, keys, form));
+  show(store.get("pastor-agent-view") === "chat" ? "chat" : "screen");
   requestAnimationFrame(grow);
+}
+
+/** Texto de un mensaje con lo básico de Markdown: bloques de código, `código`
+ * y **negritas**. Todo con nodos de texto, nunca como HTML. */
+function markdown(text) {
+  const out = [];
+  text.split(/^```[^\n]*\n?/m).forEach((part, i) => {
+    if (i % 2) {
+      out.push(h("pre", { class: "md-code", text: part.replace(/\n$/, "") }));
+      return;
+    }
+    const p = h("div", { class: "md-text" });
+    for (const piece of part.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/)) {
+      if (/^`[^`]+`$/.test(piece)) p.append(h("code", { text: piece.slice(1, -1) }));
+      else if (/^\*\*[^*]+\*\*$/.test(piece)) p.append(h("strong", { text: piece.slice(2, -2) }));
+      else if (piece) p.append(piece);
+    }
+    if (part.trim()) out.push(p);
+  });
+  return out;
+}
+
+const hhmm = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+};
+
+/** La conversación entera del agente, de su transcripción de Claude Code: la
+ * pantalla solo tiene lo visible. Pide solo lo nuevo mientras está a la vista. */
+function conversationPane(id, getAgent) {
+  const list = h("div", { class: "chat" });
+  const scroller = h("div", { class: "chat-scroll" }, list);
+  const atBottom = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60;
+  const jump = h("button", { type: "button", class: "jump", hidden: true, "aria-label": "Ir al final", onclick: () => (scroller.scrollTop = scroller.scrollHeight) }, icon("down"));
+  scroller.addEventListener("scroll", () => (jump.hidden = atBottom()), { passive: true });
+  const el = h("div", { class: "chat-wrap" }, scroller, jump);
+  let session = "";
+  let total = 0;
+  let visible = false;
+  let loaded = false;
+
+  /** Las herramientas seguidas van juntas en un grupo que se abre al tocarlo. */
+  const addTool = (m) => {
+    let group = list.lastElementChild;
+    if (!group?.classList.contains("tools")) {
+      group = h("details", { class: "tools" }, h("summary"), h("div", { class: "tools-list" }));
+      list.append(group);
+    }
+    group.querySelector(".tools-list").append(h("div", { class: "tool", text: m.text }));
+    const n = group.querySelector(".tools-list").childElementCount;
+    group.querySelector("summary").textContent = `${n === 1 ? "1 herramienta" : `${n} herramientas`} · ${m.text}`;
+  };
+  const add = (m) => {
+    if (m.role === "tool") return addTool(m);
+    list.append(h("div", { class: "msg " + m.role },
+      markdown(m.text),
+      m.role === "user" && m.at && h("span", { class: "msg-time", text: hhmm(m.at) })));
+  };
+
+  const poll = async () => {
+    if (!visible) return;
+    const q = session ? `?session=${encodeURIComponent(session)}&after=${total}` : "";
+    const data = await attempt(() => api("GET", `/agents/${encodeURIComponent(id)}/conversation${q}`));
+    if (!data) return;
+    if (!data.available) {
+      const kind = getAgent()?.kind;
+      list.replaceChildren(empty("bot", "Sin conversación todavía",
+        kind && kind !== "claude"
+          ? "Por ahora solo se ve la conversación de los agentes de Claude."
+          : "Aparece cuando el agente responda por primera vez."));
+      session = "";
+      total = 0;
+      return;
+    }
+    const stick = !loaded || atBottom();
+    // Otra sesión (`/clear`) o la primera vez: desde el principio.
+    if (data.session !== session || data.from === 0) list.replaceChildren();
+    session = data.session;
+    total = data.total;
+    if (data.messages.length) list.querySelector(":scope > .empty")?.remove();
+    data.messages.forEach(add);
+    if (!list.childElementCount) list.append(empty("bot", "Sin mensajes", "La conversación aún está vacía."));
+    loaded = true;
+    if (stick) scroller.scrollTop = scroller.scrollHeight;
+    jump.hidden = atBottom();
+  };
+  const tick = every(3000, poll);
+  return {
+    el,
+    active(on) {
+      visible = on;
+      if (on) tick();
+    },
+  };
 }
 
 // ---------- tareas ----------

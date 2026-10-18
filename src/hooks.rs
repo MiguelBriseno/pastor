@@ -28,6 +28,10 @@ pub struct HookStatus {
     /// pantalla ya es otra, el hook es viejo aunque nadie la viera cambiar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<Screen>,
+    /// La transcripción de la sesión de Claude Code (llega en cada hook):
+    /// de ahí sale la conversación entera para la app del celular.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -262,6 +266,7 @@ pub fn handle(event: &str) -> Result<()> {
         at: Utc::now(),
         message,
         screen: None,
+        transcript: v["transcript_path"].as_str().map(String::from),
     };
     {
         let _lock = lock_status(&id)?;
