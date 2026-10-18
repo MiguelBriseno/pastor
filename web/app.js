@@ -124,6 +124,13 @@ async function api(method, path, body) {
     body: body ? JSON.stringify(body) : undefined,
     // Sin límite, al perder la red una petición puede quedar colgada minutos.
     signal: AbortSignal.timeout?.(API_TIMEOUT),
+  }).catch((e) => {
+    // Cortada a medias, una orden pudo hacerse igual: repetirla sin mirar
+    // lanzaría un segundo agente.
+    if (e.name === "TimeoutError" && method !== "GET") {
+      throw new Error("pastor no respondió a tiempo; revisa si se hizo antes de repetirlo");
+    }
+    throw e;
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) throw new Unauthorized(data.error || "token no válido");

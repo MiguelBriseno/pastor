@@ -154,7 +154,7 @@ fn keep_last_good(old: &[Usage], new: Vec<Usage>, now: DateTime<Utc>) -> Vec<Usa
     new.into_iter()
         .map(|u| match old.iter().find(|o| o.kind == u.kind) {
             Some(o)
-                if u.error.is_some()
+                if u.error.as_deref().is_some_and(transient)
                     && o.error.is_none()
                     && !o.windows.is_empty()
                     && age(o).is_some_and(|a| a < KEEP) =>
@@ -168,6 +168,14 @@ fn keep_last_good(old: &[Usage], new: Vec<Usage>, now: DateTime<Utc>) -> Vec<Usa
         })
         .collect()
 }
+
+/// Si el error es de la consulta y puede pasar solo (sin red, un 429, un
+/// 5xx). Uno que pide hacer algo (la sesión venció, un 401) se muestra ya.
+fn transient(error: &str) -> bool {
+    error.starts_with(FETCH_FAILED) && !error.contains(" 401") && !error.contains(" 403")
+}
+
+const FETCH_FAILED: &str = "no pude consultar el uso";
 
 pub fn fetch() -> Vec<Usage> {
     let home = dirs::home_dir().unwrap_or_default();
@@ -203,6 +211,12 @@ fn claude(home: &Path) -> Result<Usage> {
 }
 
 fn get_usage(token: &str) -> Result<Value> {
+    // Antes de lanzar curl, para no dejarlo sin esperar. Además va entre
+    // comillas: un token con `"` o un salto de línea (un
+    // archivo dañado) no debe poder añadir opciones a curl.
+    if token.chars().any(char::is_control) {
+        bail!("el token de Claude tiene caracteres no válidos");
+    }
     let mut child = Command::new("curl")
         // La configuración por la entrada: así el token no se ve en `ps`.
         .args(["-fsS", "-m", "5", "-K", "-"])
@@ -211,11 +225,6 @@ fn get_usage(token: &str) -> Result<Value> {
         .stderr(Stdio::piped())
         .spawn()
         .context("no pude ejecutar curl")?;
-    // Entre comillas de verdad: un token con `"` o un salto de línea (un
-    // archivo dañado) no debe poder añadir opciones a curl.
-    if token.chars().any(char::is_control) {
-        bail!("el token de Claude tiene caracteres no válidos");
-    }
     let config = format!(
         "url = \"https://api.anthropic.com/api/oauth/usage\"\n\
          header = {}\n\
@@ -229,7 +238,7 @@ fn get_usage(token: &str) -> Result<Value> {
     let out = child.wait_with_output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        bail!("no pude consultar el uso: {}", err.trim());
+        bail!("{FETCH_FAILED}: {}", err.trim());
     }
     serde_json::from_slice(&out.stdout).context("respuesta de uso inesperada")
 }
@@ -392,7 +401,14 @@ mod tests {
             stale: false,
             error: None,
         };
-        let failed = || vec![Usage::from(Kind::Claude, Err(anyhow!("HTTP 429")))];
+        let failed = || {
+            vec![Usage::from(
+                Kind::Claude,
+                Err(anyhow!(
+                    "{FETCH_FAILED}: The requested URL returned error: 429"
+                )),
+            )]
+        };
         // Recién leído: se queda tal cual.
         assert_eq!(keep_last_good(&[good(1)], failed(), now), [good(1)]);
         // De hace un rato: se queda, pero se dice de cuándo es.
@@ -404,6 +420,14 @@ mod tests {
             .is_some());
         // Sin dato bueno antes, el error.
         assert!(keep_last_good(&[], failed(), now)[0].error.is_some());
+        // Lo que pide hacer algo se ve enseguida.
+        for e in [
+            "la sesión venció; abre Claude Code para renovarla",
+            "no pude consultar el uso: The requested URL returned error: 401",
+        ] {
+            let u = vec![Usage::from(Kind::Claude, Err(anyhow!("{e}")))];
+            assert!(keep_last_good(&[good(1)], u, now)[0].error.is_some(), "{e}");
+        }
     }
 
     #[test]

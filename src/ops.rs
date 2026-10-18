@@ -38,7 +38,9 @@ pub fn new_agent(
     let cmd = kind.launch_command(prompt)?;
     // Si se perdió el estado, el contador vuelve a empezar y `a1` podría
     // seguir vivo: el nuevo chocaría con su sesión y recibiría sus hooks.
-    let taken = tmux::panes().unwrap_or_default();
+    // Sin saber qué sesiones hay, mejor no lanzar: la limpieza de un fallo
+    // («duplicate session») mataría la de otro.
+    let taken = tmux::panes()?;
     let agent = State::update(|s| {
         s.skip_ids(|id| taken.contains_key(id));
         Ok(s.add_agent(kind, cwd, name))
@@ -117,8 +119,12 @@ fn agent_gone(pane: &tmux::Pane, procs: &Procs) -> bool {
 /// Tabla de procesos del sistema. Se pide a `ps` una sola vez, y solo si algún
 /// panel la necesita, para no lanzarlo por cada agente en cada refresco.
 #[derive(Default)]
-/// `None` si `ps` falló.
-struct Procs(OnceCell<Option<Vec<Proc>>>);
+/// `None` si `ps` falló. La línea de órdenes de cada proceso, aparte y solo si
+/// hace falta (hay un `node` o un `bun` en primer plano).
+struct Procs(
+    OnceCell<Option<Vec<Proc>>>,
+    OnceCell<Option<HashMap<u32, String>>>,
+);
 
 struct Proc {
     pid: u32,
@@ -153,8 +159,46 @@ impl Procs {
         let Some(fg) = procs.iter().find(|p| p.pid == pid).map(|p| p.tpgid) else {
             return false;
         };
-        fg > 0 && procs.iter().any(|p| p.pgid == fg && p.is_agent())
+        fg > 0 && procs.iter().any(|p| p.pgid == fg && self.is_agent(p))
     }
+
+    fn args(&self) -> Option<&HashMap<u32, String>> {
+        self.1
+            .get_or_init(|| {
+                std::process::Command::new("ps")
+                    .args(["-A", "-o", "pid=,args="])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| parse_ps_args(&String::from_utf8_lossy(&o.stdout)))
+            })
+            .as_ref()
+    }
+
+    /// Instalados con npm o bun, los agentes aparecen como su intérprete: hay
+    /// que mirar qué script corre. Un `node` cualquiera (un REPL) no cuenta,
+    /// o lo que se le mande al agente se ejecutaría ahí. Si `ps` falló, como
+    /// en `runs_agent`, se da por bueno.
+    fn is_agent(&self, p: &Proc) -> bool {
+        if is_agent_command(&p.name) {
+            return true;
+        }
+        if p.name != "node" && p.name != "bun" {
+            return false;
+        }
+        self.args()
+            .is_none_or(|args| args.get(&p.pid).is_some_and(|a| runs_agent_script(a)))
+    }
+}
+
+/// Lee la salida de `ps -o pid=,args=`.
+fn parse_ps_args(out: &str) -> HashMap<u32, String> {
+    out.lines()
+        .filter_map(|l| {
+            let (pid, args) = l.trim_start().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, args.trim().to_string()))
+        })
+        .collect()
 }
 
 /// Lee la salida de `ps -o pid=,pgid=,tpgid=,comm=`.
@@ -182,40 +226,27 @@ fn is_agent_command(cmd: &str) -> bool {
     Kind::ALL.iter().any(|k| k.bin() == cmd)
 }
 
-impl Proc {
-    /// Instalados con npm o bun, los agentes aparecen como su intérprete: hay
-    /// que mirar qué script corre. Un `node` cualquiera (un REPL) no cuenta,
-    /// o lo que se le mande al agente se ejecutaría ahí.
-    fn is_agent(&self) -> bool {
-        if is_agent_command(&self.name) {
-            return true;
-        }
-        if self.name != "node" && self.name != "bun" {
-            return false;
-        }
-        std::process::Command::new("ps")
-            .args(["-o", "args=", "-p", &self.pid.to_string()])
-            .output()
-            .is_ok_and(|o| {
-                o.status.success() && runs_agent_script(&String::from_utf8_lossy(&o.stdout))
-            })
-    }
-}
-
-/// Si la línea de órdenes de un intérprete corre un agente: algún argumento
-/// es su script (`.../bin/claude`, `.../codex.js`) o está en su paquete
-/// (`node_modules/@anthropic-ai/claude-code/cli.js`).
+/// Si la línea de órdenes de un intérprete corre un agente: el script que
+/// ejecuta (el primer argumento que no es una opción) es el suyo
+/// (`.../bin/claude`, `.../codex.js`) o está en su paquete
+/// (`node_modules/@anthropic-ai/claude-code/cli.js`). Lo que va después son
+/// argumentos del script: `node app.js codex.json` no es un agente.
 fn runs_agent_script(args: &str) -> bool {
     let agent = |name: &str| Kind::ALL.iter().any(|k| name.starts_with(k.bin()));
-    args.split_whitespace().skip(1).any(|arg| {
-        let parts: Vec<_> = Path::new(arg)
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect();
-        let package = parts.iter().position(|c| c == "node_modules");
-        parts.last().is_some_and(|f| agent(f))
-            || package.is_some_and(|i| parts[i + 1..].iter().any(|c| agent(c)))
-    })
+    let Some(script) = args
+        .split_whitespace()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+    else {
+        return false;
+    };
+    let parts: Vec<_> = Path::new(script)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    let package = parts.iter().position(|c| c == "node_modules");
+    parts.last().is_some_and(|f| agent(f))
+        || package.is_some_and(|i| parts[i + 1..].iter().any(|c| agent(c)))
 }
 
 /// Panel al que hay que hablarle para llegar al agente. Falla si el agente
@@ -887,7 +918,7 @@ mod tests {
                 name: name.to_string(),
             })
             .collect();
-        Procs(OnceCell::from(Some(list)))
+        Procs(OnceCell::from(Some(list)), OnceCell::new())
     }
 
     #[test]
@@ -933,9 +964,9 @@ mod tests {
                 (4251, 4250, 4250, "Google Chrome Helper"),
             ]
         );
-        assert!(Procs(OnceCell::from(Some(procs))).runs_agent(4242));
+        assert!(Procs(OnceCell::from(Some(procs)), OnceCell::new()).runs_agent(4242));
         // Si `ps` falló no se sabe: mejor no darlo por salido.
-        assert!(Procs(OnceCell::from(None)).runs_agent(4242));
+        assert!(Procs(OnceCell::from(None), OnceCell::new()).runs_agent(4242));
     }
 
     #[test]
@@ -953,6 +984,14 @@ mod tests {
         assert!(!runs_agent_script("node"));
         assert!(!runs_agent_script("node servidor.js"));
         assert!(!runs_agent_script("node /home/yo/claude-notas/servidor.js"));
+        assert!(!runs_agent_script("node servidor.js --config codex.json"));
+        assert!(!runs_agent_script("node app.js claude-notas.md"));
+        assert!(runs_agent_script(
+            "node --no-warnings /usr/lib/node_modules/@openai/codex/bin/codex.js"
+        ));
+        let args = parse_ps_args("  42 node /x/bin/claude -c\n   7 /sbin/init\nbasura\n");
+        assert_eq!(args[&42], "node /x/bin/claude -c");
+        assert_eq!(args.len(), 2);
     }
 
     #[test]

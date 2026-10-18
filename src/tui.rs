@@ -159,9 +159,11 @@ struct App {
     state: State,
     snaps: HashMap<String, Snapshot>,
     observer: Observer,
-    /// Pánicos del observador hasta ahora, y cuándo toca reiniciarlo.
+    /// Pánicos seguidos del observador, cuándo toca reiniciarlo y desde
+    /// cuándo corre el de ahora.
     observer_fails: u32,
     observer_retry: Option<Instant>,
+    observer_since: Instant,
     actions: Actions,
     agent_sel: ListState,
     task_sel: TableState,
@@ -193,6 +195,7 @@ impl App {
             observer: Observer::spawn(HashMap::new(), true),
             observer_fails: 0,
             observer_retry: None,
+            observer_since: Instant::now(),
             actions: Actions::spawn(),
             agent_sel: ListState::default(),
             task_sel: TableState::default(),
@@ -230,6 +233,10 @@ impl App {
     fn restart_observer(&mut self) {
         match self.observer_retry {
             None => {
+                // Si llevaba un rato bien, este pánico no es seguido del anterior.
+                if self.observer_since.elapsed() > Duration::from_secs(5 * 60) {
+                    self.observer_fails = 0;
+                }
                 let wait = Duration::from_secs(1 << self.observer_fails.min(6))
                     .min(Duration::from_secs(60));
                 self.observer_fails += 1;
@@ -242,6 +249,7 @@ impl App {
             }
             Some(at) if Instant::now() >= at => {
                 self.observer_retry = None;
+                self.observer_since = Instant::now();
                 // Con los estados que ya se veían, para no perder un aviso.
                 let seen = self.snaps.iter().map(|(id, s)| (id.clone(), s.status));
                 self.observer = Observer::spawn(seen.collect(), false);

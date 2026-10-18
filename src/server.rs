@@ -309,12 +309,13 @@ async fn blocking<T: Serialize + Send + 'static>(
     }
 }
 
-/// Un fallo de disco (salvo un directorio que no existe, que es del pedido)
-/// o un JSON nuestro que no se entiende.
+/// Un fallo de disco o un JSON nuestro que no se entiende. Un `cwd` que no
+/// existe, no es un directorio o no se puede abrir es del pedido.
 fn internal(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::{NotADirectory, NotFound, PermissionDenied};
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() != std::io::ErrorKind::NotFound)
+            .is_some_and(|io| !matches!(io.kind(), NotFound | NotADirectory | PermissionDenied))
             || c.is::<serde_json::Error>()
     })
 }
@@ -722,7 +723,10 @@ mod tests {
     fn distingue_errores_internos_de_los_del_pedido() {
         let io = |kind| anyhow::Error::from(std::io::Error::from(kind));
         assert!(internal(
-            &io(std::io::ErrorKind::PermissionDenied).context("no pude leer state.json")
+            &io(std::io::ErrorKind::StorageFull).context("no pude guardar state.json")
+        ));
+        assert!(!internal(
+            &io(std::io::ErrorKind::PermissionDenied).context("el directorio /root/x no existe")
         ));
         assert!(!internal(
             &io(std::io::ErrorKind::NotFound).context("el directorio /x no existe")
