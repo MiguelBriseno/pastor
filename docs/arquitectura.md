@@ -41,6 +41,7 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/history.rs` | Historial de eventos en `history.jsonl` y las estadísticas de la pestaña Historial |
 | `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
 | `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
+| `web/` | La app del celular (PWA) que sirve `pastor serve` en `/`: HTML, CSS y JS sin build, metidos en el binario |
 
 ## Decisiones importantes
 
@@ -179,6 +180,16 @@ cada operación en un hilo de `spawn_blocking` porque tocan tmux y el disco. Gua
 entre consultas, así un cliente que pregunta cada pocos segundos ve *trabajando* como la TUI.
 El token se compara sin cortar en el primer byte distinto, y su archivo se crea ya con permisos
 0600 (`write_atomic_mode` crea el temporal con el modo, no lo cambia después).
+
+### La app del celular va dentro del binario
+
+`web/` es HTML, CSS y JavaScript sin framework ni paso de build, y `server.rs` lo mete en el binario
+con `include_bytes!`: no hay archivos que instalar junto a `pastor` y la página siempre corresponde
+a la API del mismo binario. Se sirve en el mismo origen que `/api`, así que no hace falta CORS ni hay
+contenido mixto con HTTPS. La página no pide token para cargarse (sin él no puede hacer nada); lo
+pide la API, y la página lo guarda en `localStorage`. Los textos de los agentes se insertan con
+`textContent`, nunca como HTML. El service worker solo guarda la página para que abra sin red,
+siempre pregunta primero a la red, y nunca guarda respuestas de `/api`.
 
 ### Los avisos al celular van con `curl`
 

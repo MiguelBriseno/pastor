@@ -1,0 +1,126 @@
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --line: #e2e5ea;
+  --text: #111827;
+  --muted: #6b7280;
+  --accent: #b45309;
+  --accent-text: #ffffff;
+  --screen-bg: #111827;
+  --screen-text: #e5e7eb;
+  --working: #2563eb;
+  --blocked: #d97706;
+  --idle: #16a34a;
+  --dead: #9ca3af;
+  --danger: #dc2626;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0f17;
+    --card: #151b26;
+    --line: #273042;
+    --text: #e5e7eb;
+    --muted: #9ca3af;
+    --accent: #fbbf24;
+    --accent-text: #111827;
+    --screen-bg: #05070b;
+    --screen-text: #d1d5db;
+    --working: #60a5fa;
+    --blocked: #fbbf24;
+    --idle: #4ade80;
+    --dead: #6b7280;
+    --danger: #f87171;
+    color-scheme: dark;
+  }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+a { color: inherit; }
+
+header {
+  position: sticky; top: 0; z-index: 2;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: calc(8px + env(safe-area-inset-top)) 16px 8px;
+  background: var(--card); border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 700; text-decoration: none; }
+.brand img { width: 28px; height: 28px; border-radius: 6px; }
+nav { display: flex; gap: 4px; }
+nav a {
+  padding: 6px 12px; border-radius: 999px; text-decoration: none; color: var(--muted);
+}
+nav a.on { background: var(--accent); color: var(--accent-text); }
+
+main { padding: 16px; max-width: 760px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 0 0 12px; }
+h2 { font-size: 16px; margin: 20px 0 8px; color: var(--muted); font-weight: 600; }
+.muted { color: var(--muted); }
+.empty { color: var(--muted); text-align: center; padding: 32px 0; }
+
+.row { display: flex; align-items: center; gap: 8px; }
+.row.between { justify-content: space-between; }
+.wrap { flex-wrap: wrap; }
+
+.list { display: flex; flex-direction: column; gap: 8px; }
+.card {
+  display: block; background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px; text-decoration: none; min-width: 0;
+}
+.card .name { font-weight: 600; }
+.card .meta { color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 13px; white-space: nowrap;
+  color: var(--muted);
+}
+.badge::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--dead); }
+.badge.working::before, .badge.starting::before { background: var(--working); }
+.badge.blocked { color: var(--blocked); font-weight: 600; }
+.badge.blocked::before { background: var(--blocked); }
+.badge.idle::before { background: var(--idle); }
+
+button, input, select, textarea { font: inherit; color: inherit; }
+button {
+  min-height: 40px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--card); cursor: pointer;
+}
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button.danger { color: var(--danger); }
+button:disabled { opacity: .5; }
+input, select, textarea {
+  width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--card);
+}
+textarea { resize: vertical; min-height: 44px; }
+label { display: block; font-size: 14px; color: var(--muted); margin: 10px 0 4px; }
+form.card { display: flex; flex-direction: column; }
+form.card .row { margin-top: 12px; justify-content: flex-end; }
+
+/* Pantalla del agente */
+.agent-head { margin-bottom: 8px; }
+.agent-head .name { font-size: 18px; font-weight: 700; }
+pre.screen {
+  margin: 0; padding: 10px; border-radius: 10px;
+  background: var(--screen-bg); color: var(--screen-text);
+  font: 12px/1.35 ui-monospace, "JetBrains Mono", Menlo, monospace;
+  height: 55vh; overflow: auto; white-space: pre;
+}
+.keys { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin: 10px 0; }
+.keys button { padding: 6px 0; font-size: 14px; }
+.send { display: flex; gap: 8px; align-items: flex-end; }
+.send textarea { flex: 1; }
+
+#toast {
+  position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
+  max-width: 520px; margin: 0 auto; padding: 10px 14px; border-radius: 10px;
+  background: var(--text); color: var(--bg); z-index: 3;
+}
