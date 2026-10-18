@@ -112,6 +112,7 @@ impl Cache {
     /// Si el dato es viejo, da la lectura por empezada y devuelve su marca:
     /// quien lo llama lee con `fetch` sin tener el candado y lo guarda con
     /// `set`, mientras las demás consultas sirven el dato de antes.
+    #[cfg(any(feature = "serve", test))]
     pub fn claim(&mut self) -> Option<Instant> {
         if self.fresh() {
             return None;
@@ -123,6 +124,7 @@ impl Cache {
 
     /// Guarda la lectura `at`, salvo que haya empezado otra después: la más
     /// nueva no la pisa una lenta que acabó tarde.
+    #[cfg(any(feature = "serve", test))]
     pub fn set(&mut self, at: Instant, usage: Vec<Usage>) {
         if self.at == Some(at) {
             self.usage = usage;
@@ -130,6 +132,7 @@ impl Cache {
     }
 
     /// La lectura `at` no terminó: que la siguiente consulta lo intente.
+    #[cfg(any(feature = "serve", test))]
     pub fn forget(&mut self, at: Instant) {
         if self.at == Some(at) {
             self.at = None;
