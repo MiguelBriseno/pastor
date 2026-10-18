@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -23,13 +24,15 @@ use crate::agent::Kind;
 
 /// Cada cuánto se vuelve a preguntar.
 pub const TTL: Duration = Duration::from_secs(60);
+/// Desde cuándo un dato se considera viejo y se dice de cuándo es.
+pub const STALE: Duration = Duration::from_secs(5 * 60);
 /// Lo que se lee del final de una sesión de Codex buscando el último evento.
 const TAIL: u64 = 1 << 20;
 /// Cuántas sesiones de Codex, de la más reciente hacia atrás, se miran: sin
 /// tope, alguien sin límites (con clave de API) leería todas cada `TTL`.
 const SESSIONS: usize = 20;
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Window {
     /// "5 h", "semana", "semana Opus"…
     pub name: String,
@@ -40,6 +43,18 @@ pub struct Window {
 impl Window {
     pub fn left_pct(&self) -> f64 {
         (100.0 - self.used_pct).clamp(0.0, 100.0)
+    }
+}
+
+/// Con `left_pct` ya calculado, para que la app no repita la cuenta.
+impl Serialize for Window {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Window", 4)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("used_pct", &self.used_pct)?;
+        st.serialize_field("left_pct", &self.left_pct())?;
+        st.serialize_field("resets_at", &self.resets_at)?;
+        st.end()
     }
 }
 
@@ -78,12 +93,27 @@ impl Cache {
     /// Si el dato es viejo vuelve a leerlo (puede tardar unos segundos por la
     /// red). Devuelve si se leyó de nuevo.
     pub fn refresh(&mut self) -> bool {
-        if self.at.is_some_and(|t| t.elapsed() < TTL) {
+        if !self.claim() {
             return false;
         }
         self.usage = fetch();
+        true
+    }
+
+    /// Si el dato es viejo, da la lectura por hecha y devuelve `true`: quien
+    /// lo llama lee con `fetch` sin tener el candado y lo guarda con `set`,
+    /// mientras las demás consultas sirven el dato de antes. Si aún no hay
+    /// ninguno, todas leen: mejor eso que contestar con nada.
+    pub fn claim(&mut self) -> bool {
+        if self.at.is_some_and(|t| t.elapsed() < TTL) && !self.usage.is_empty() {
+            return false;
+        }
         self.at = Some(Instant::now());
         true
+    }
+
+    pub fn set(&mut self, usage: Vec<Usage>) {
+        self.usage = usage;
     }
 
     pub fn usage(&self) -> &[Usage] {
@@ -302,6 +332,10 @@ mod tests {
         assert_eq!(u.windows.len(), 2);
         assert_eq!(u.windows[0].name, "5 h");
         assert_eq!(u.windows[0].left_pct(), 58.0);
+        assert_eq!(
+            serde_json::to_value(&u.windows[0]).unwrap()["left_pct"],
+            58.0
+        );
         assert_eq!(
             u.windows[1].resets_at,
             Some(Utc.with_ymd_and_hms(2026, 10, 24, 1, 0, 0).unwrap())

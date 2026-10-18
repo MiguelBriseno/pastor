@@ -1031,13 +1031,16 @@ function poll(ms, path, fn) {
 
 /** Lo que queda de cada ventana de límite, una caja por suscripción. */
 function limitsView(list) {
+  // Como `limits::STALE`: el de Codex es de la última sesión, que puede ser de hace días.
+  const stale = (u) => u.updated_at && Date.now() - Date.parse(u.updated_at) >= 5 * 60e3;
   const color = (left) => left < 10 ? "var(--magenta)" : left < 30 ? "var(--yellow)" : "var(--green)";
   return h("div", { class: "limits" }, list.map((u) => h("div", { class: "limit", style: `--k: ${KIND[u.kind].color}` },
-    h("div", { class: "limit-title" }, h("b", { text: KIND[u.kind].label }), u.plan && h("span", { text: u.plan })),
+    h("div", { class: "limit-title" }, h("b", { text: KIND[u.kind].label }), u.plan && h("span", { text: u.plan }),
+      stale(u) && h("small", { text: since(u.updated_at) })),
     u.error
       ? h("p", { class: "quiet", text: u.error })
       : u.windows.map((w) => {
-        const left = Math.max(0, Math.min(100, 100 - w.used_pct));
+        const left = w.left_pct;
         const secs = w.resets_at ? Math.round((Date.parse(w.resets_at) - Date.now()) / 1000) : 0;
         const reset = secs > 0 ? "se reinicia en " + human(secs) : "";
         return h("div", { class: "hbar limit-row", style: `--c: ${color(left)}` },

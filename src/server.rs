@@ -569,9 +569,14 @@ async fn stats(Shared(app): Shared<Arc<App>>) -> Response {
 /// Lo que queda de cada ventana de límite de las suscripciones.
 async fn limits(Shared(app): Shared<Arc<App>>) -> Response {
     blocking(move || {
-        let mut cache = app.limits.lock().unwrap_or_else(PoisonError::into_inner);
-        cache.refresh();
-        Ok(json!(cache.usage()))
+        let lock = || app.limits.lock().unwrap_or_else(PoisonError::into_inner);
+        // Sin el candado mientras se consulta la red: las demás consultas
+        // no esperan y sirven el dato de antes.
+        if lock().claim() {
+            let usage = limits::fetch();
+            lock().set(usage);
+        }
+        Ok(json!(lock().usage()))
     })
     .await
 }

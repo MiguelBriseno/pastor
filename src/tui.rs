@@ -1212,6 +1212,13 @@ impl App {
         let now = chrono::Utc::now();
         for (u, &r) in self.limits.iter().zip(boxes.iter()) {
             let color = kind_color(u.kind);
+            let width = r.width.saturating_sub(2) as usize;
+            let name_w = u
+                .windows
+                .iter()
+                .map(|w| w.name.chars().count())
+                .max()
+                .unwrap_or(0);
             let lines: Vec<Line> = match &u.error {
                 Some(e) => vec![Line::from(format!(" {e}").dark_gray())],
                 None => u
@@ -1220,31 +1227,55 @@ impl App {
                     .map(|w| {
                         let left = w.left_pct();
                         // Una que ya pasó (el dato es de hace hasta `TTL`) no dice nada.
-                        let reset = w.resets_at.filter(|t| *t > now).map_or(String::new(), |t| {
-                            format!(
-                                " · se reinicia en {}",
-                                history::human((t - now).num_seconds())
-                            )
-                        });
+                        let reset = w
+                            .resets_at
+                            .filter(|t| *t > now)
+                            .map(|t| history::human((t - now).num_seconds()));
+                        let name = format!(" {:<name_w$} ", w.name);
+                        // De la más completa a la más corta, la primera que quepa:
+                        // con dos cajas en 80 columnas, cada una tiene 38.
+                        let (bar, libre, reset) = [
+                            (
+                                10,
+                                " libre",
+                                reset.as_ref().map(|r| format!(" · se reinicia en {r}")),
+                            ),
+                            (10, " libre", reset.as_ref().map(|r| format!(" ↻ {r}"))),
+                            (10, "", reset.as_ref().map(|r| format!(" ↻ {r}"))),
+                            (5, "", reset.as_ref().map(|r| format!(" ↻ {r}"))),
+                            (5, "", None),
+                        ]
+                        .into_iter()
+                        .find(|(bar, libre, reset)| {
+                            let reset = reset.as_ref().map_or(0, |r| r.chars().count());
+                            name.chars().count() + bar + 5 + libre.len() + reset <= width
+                        })
+                        .unwrap_or((5, "", None));
                         Line::from(vec![
-                            Span::raw(format!(" {:<13}", w.name)),
-                            Span::styled(meter(left, 10), Style::default().fg(limit_color(left))),
+                            Span::raw(name),
+                            Span::styled(meter(left, bar), Style::default().fg(limit_color(left))),
                             Span::styled(
-                                format!(" {left:>3.0}% libre"),
+                                format!(" {left:>3.0}%{libre}"),
                                 Style::default().fg(limit_color(left)).bold(),
                             ),
-                            Span::raw(reset).dark_gray(),
+                            Span::raw(reset.unwrap_or_default()).dark_gray(),
                         ])
                     })
                     .collect(),
             };
             let plan = u.plan.as_ref().map_or(String::new(), |p| format!("({p}) "));
+            // El de Codex es de la última sesión, que puede ser de hace días.
+            let age = u
+                .updated_at
+                .map(|t| (now - t).num_seconds())
+                .filter(|&s| s >= limits::STALE.as_secs() as i64)
+                .map_or(String::new(), |s| format!("· hace {} ", history::human(s)));
             f.render_widget(
                 Paragraph::new(lines).block(
                     Block::bordered()
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(color))
-                        .title(format!(" {}{} {plan}", pad(ic.kind(u.kind)), u.kind)),
+                        .title(format!(" {}{} {plan}{age}", pad(ic.kind(u.kind)), u.kind)),
                 ),
                 r,
             );
