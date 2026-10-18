@@ -105,7 +105,12 @@ impl Tab {
     const ALL: [Tab; 4] = [Tab::Agents, Tab::Tasks, Tab::Dashboard, Tab::History];
 
     fn index(self) -> usize {
-        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
+        match self {
+            Tab::Agents => 0,
+            Tab::Tasks => 1,
+            Tab::Dashboard => 2,
+            Tab::History => 3,
+        }
     }
 
     /// La pestaña `d` lugares más allá, dando la vuelta.
@@ -200,6 +205,9 @@ struct App {
     fit_sent: Instant,
     /// Si algo cambió desde el último cuadro: sin cambios no se redibuja.
     dirty: bool,
+    /// Cuándo se dibujó el último cuadro: el spinner y las cuentas atrás
+    /// cambian con el reloj aunque no cambie nada más.
+    drawn: Instant,
     quit: bool,
 }
 
@@ -228,6 +236,7 @@ impl App {
             want_since: Instant::now(),
             fit_sent: Instant::now(),
             dirty: true,
+            drawn: Instant::now(),
             quit: false,
         }
     }
@@ -295,12 +304,10 @@ impl App {
                     self.set_flash(pass.flashes.join(" · "));
                 }
                 self.reload();
-                self.dirty = true;
             }
             while let Ok((result, retry)) = self.actions.results.try_recv() {
                 self.actions.pending -= 1;
                 self.finish(result, retry);
-                self.dirty = true;
             }
             if self.observer.died() {
                 self.restart_observer();
@@ -313,7 +320,11 @@ impl App {
                 self.flash = None;
                 self.dirty = true;
             }
+            if self.drawn.elapsed() >= self.frame_every() {
+                self.dirty = true;
+            }
             if std::mem::take(&mut self.dirty) {
+                self.drawn = Instant::now();
                 let before = self.want_fit.clone();
                 term.draw(|f| self.draw(f))?;
                 if self.want_fit != before {
@@ -383,6 +394,7 @@ impl App {
             .selected_agent()
             .map(|a| (a.id.clone(), a.name.clone()));
         let task = self.selected_task().map(|t| t.id.clone());
+        self.dirty = true;
         match State::load() {
             Ok(s) => self.state = s,
             Err(e) => self.set_flash(format!("Error: {e:#}")),
@@ -402,6 +414,21 @@ impl App {
             .select(clamped(self.agent_sel.selected(), self.state.agents.len()));
         self.task_sel
             .select(clamped(self.task_sel.selected(), self.state.tasks.len()));
+    }
+
+    /// Cada cuánto hace falta un cuadro aunque no cambie nada: el spinner
+    /// de los que trabajan avanza cada 100 ms; lo demás, cada segundo.
+    fn frame_every(&self) -> Duration {
+        let spinning = self
+            .state
+            .agents
+            .iter()
+            .any(|a| self.status(&a.id) == Status::Working);
+        if spinning {
+            Duration::from_millis(100)
+        } else {
+            REFRESH
+        }
     }
 
     fn status(&self, id: &str) -> Status {
@@ -580,6 +607,7 @@ impl App {
             }
             KeyCode::Char('T') => {
                 if let Some((id, name)) = selected {
+                    self.set_flash(format!("Cerrando la terminal de {name}…"));
                     self.actions.run(None, move || {
                         ops::close_term(&id)?;
                         Ok(Done::Msg(format!("Terminal de {name} cerrada")))
@@ -1253,7 +1281,7 @@ impl App {
 
         let counts =
             Kind::ALL.map(|k| self.state.agents.iter().filter(|a| a.kind == k).count() as u64);
-        f.render_widget(kind_bars(" Agentes por tipo ", &counts), right);
+        f.render_widget(kind_bars("Agentes por tipo", &counts), right);
     }
 
     /// Una caja por suscripción con lo que queda de cada ventana.
@@ -1479,7 +1507,7 @@ impl App {
 
         let [kinds, projects] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
-        f.render_widget(kind_bars(" Sesiones por tipo ", &s.by_kind), kinds);
+        f.render_widget(kind_bars("Sesiones por tipo", &s.by_kind), kinds);
 
         let room = projects.width.saturating_sub(10) as usize;
         let mut items: Vec<ListItem> = s
@@ -1592,20 +1620,13 @@ impl App {
                     kinds.push(Span::styled("← →", Style::default().fg(Color::DarkGray)));
                 }
                 let mut lines = vec![Line::from(kinds), Line::raw("")];
-                let fields = [
+                let fields = vec![
                     field_lines("Directorio", &form.cwd, form.field == 1, w),
                     field_lines("Nombre", &form.name, form.field == 2, w),
                     field_lines("Mensaje", &form.prompt, form.field == 3, w),
                 ];
                 let room = modal_room(f, 2).saturating_sub(lines.len());
-                let lens = fields.each_ref().map(Vec::len);
-                for (field, n) in
-                    fields
-                        .into_iter()
-                        .zip(share(&lens, form.field.checked_sub(1), room))
-                {
-                    lines.extend(keep_tail(field, n));
-                }
+                lines.extend(fields_in(fields, form.field.checked_sub(1), room));
                 let inner = popup(f, " Nuevo agente ", w, lines.len() as u16 + 4);
                 f.render_widget(Paragraph::new(lines), inner);
             }
@@ -1641,15 +1662,12 @@ impl App {
             Mode::NewTask { title, desc, field } => {
                 let w = modal_width(f, 100);
                 let mut lines = vec![Line::raw("")];
-                let fields = [
+                let fields = vec![
                     field_lines("Título", title, *field == 0, w),
                     field_lines("Descripción", desc, *field == 1, w),
                 ];
                 let room = modal_room(f, 0).saturating_sub(lines.len());
-                let lens = fields.each_ref().map(Vec::len);
-                for (lines_of, n) in fields.into_iter().zip(share(&lens, Some(*field), room)) {
-                    lines.extend(keep_tail(lines_of, n));
-                }
+                lines.extend(fields_in(fields, Some(*field), room));
                 let inner = popup(f, " Nueva tarea ", w, lines.len() as u16 + 2);
                 f.render_widget(Paragraph::new(lines), inner);
             }
@@ -2167,7 +2185,7 @@ fn kind_bars<'a>(title: &str, counts: &[u64]) -> BarChart<'a> {
         .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(format!(" {}{}", pad(ic.agents), title.trim_start())),
+                .title(format!(" {}{title} ", pad(ic.agents))),
         )
         .data(BarGroup::default().bars(&bars))
         .bar_width(10)
@@ -2221,7 +2239,7 @@ fn modal_room(f: &Frame, pad: usize) -> usize {
 /// Un campo de formulario partido en varias líneas para que quepa en un modal
 /// de ancho `w`; las líneas siguientes quedan alineadas con el valor.
 fn field_lines(name: &str, value: &str, active: bool, w: u16) -> Vec<Line<'static>> {
-    // Bordes del modal + hueco para el cursor.
+    // Bordes del modal + hueco para el cursor (o para el `…` de `keep_head`).
     let avail = (w as usize).saturating_sub(LABEL_W + 3).max(1);
     let mut chunks: Vec<String> = Vec::new();
     for line in value.split('\n') {
@@ -2271,21 +2289,66 @@ fn keep_tail(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// Reparte `room` líneas entre campos de `lens` líneas: cada uno tiene al
-/// menos su primera línea (la de la etiqueta), el activo lo que le haga
-/// falta y los demás lo que sobre, en orden.
+/// Reparte `room` líneas entre campos de `lens` líneas: primero la de la
+/// etiqueta de cada uno, empezando por el activo, y después el resto, también
+/// empezando por el activo. Si no cabe ni eso, el activo se ve igual y los
+/// demás se quedan sin línea.
 fn share(lens: &[usize], active: Option<usize>, room: usize) -> Vec<usize> {
-    let mut got: Vec<usize> = lens.iter().map(|&n| n.min(1)).collect();
-    let mut left = room.saturating_sub(got.iter().sum());
-    let order = active
+    let order: Vec<usize> = active
         .into_iter()
-        .chain((0..lens.len()).filter(|&i| Some(i) != active));
-    for i in order.filter(|&i| i < lens.len()) {
-        let more = (lens[i] - got[i]).min(left);
-        got[i] += more;
-        left -= more;
+        .chain((0..lens.len()).filter(|&i| Some(i) != active))
+        .filter(|&i| i < lens.len())
+        .collect();
+    let mut got = vec![0; lens.len()];
+    let mut left = room;
+    for labels_only in [true, false] {
+        for &i in &order {
+            let want = if labels_only { lens[i].min(1) } else { lens[i] };
+            let more = want.saturating_sub(got[i]).min(left);
+            got[i] += more;
+            left -= more;
+        }
+    }
+    if let Some(i) = active.filter(|&i| i < lens.len() && lens[i] > 0) {
+        got[i] = got[i].max(1);
     }
     got
+}
+
+/// Las líneas de cada campo según `share`: del activo, las del final (donde
+/// está el cursor); de los demás, las del principio.
+fn fields_in(
+    fields: Vec<Vec<Line<'static>>>,
+    active: Option<usize>,
+    room: usize,
+) -> Vec<Line<'static>> {
+    let lens: Vec<usize> = fields.iter().map(Vec::len).collect();
+    let mut lines = Vec::new();
+    for (i, (field, n)) in fields
+        .into_iter()
+        .zip(share(&lens, active, room))
+        .enumerate()
+    {
+        match n {
+            0 => {}
+            _ if Some(i) == active => lines.extend(keep_tail(field, n)),
+            _ => lines.extend(keep_head(field, n)),
+        }
+    }
+    lines
+}
+
+/// Las primeras `n` líneas, con `…` al final si no caben todas.
+fn keep_head(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
+    let n = n.max(1);
+    if lines.len() > n {
+        lines.truncate(n);
+        if let Some(last) = lines.last_mut() {
+            last.spans
+                .push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+        }
+    }
+    lines
 }
 
 fn edit(s: &mut String, key: &KeyEvent) {
@@ -2295,7 +2358,11 @@ fn edit(s: &mut String, key: &KeyEvent) {
         KeyCode::Char('u') if ctrl => s.clear(),
         // La palabra anterior, con los espacios que la siguen.
         KeyCode::Char('w') if ctrl => {
-            let word = s.trim_end().rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            let word = s
+                .trim_end()
+                .char_indices()
+                .rfind(|(_, c)| c.is_whitespace())
+                .map_or(0, |(i, c)| i + c.len_utf8());
             s.truncate(word);
         }
         KeyCode::Char(c) if !ctrl && !alt => s.push(c),
@@ -2444,7 +2511,11 @@ mod tests {
         edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
         edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(s, "");
-        s.push('a');
+        // También con espacios de más de un byte (copiados de la web).
+        s.push_str("hola\u{a0}mundo\u{3000}");
+        edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(s, "hola\u{a0}");
+        s = "a".into();
         edit(&mut s, &key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(s, "");
         edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
@@ -2460,8 +2531,10 @@ mod tests {
         assert_eq!(share(&[5, 1, 5], Some(0), 6), [4, 1, 1]);
         // Sin campo activo (el de Tipo), en orden.
         assert_eq!(share(&[5, 1, 5], None, 8), [5, 1, 2]);
-        // Ni las etiquetas caben: keep_tail deja al menos una línea.
-        assert_eq!(share(&[3, 3], Some(1), 1), [1, 1]);
+        // Ni las etiquetas caben: solo el activo, y nunca más de `room`.
+        assert_eq!(share(&[3, 3, 3], Some(2), 1), [0, 0, 1]);
+        assert_eq!(share(&[3, 3, 3], Some(2), 2), [1, 0, 1]);
+        assert_eq!(share(&[3, 3], Some(1), 0), [0, 1]);
     }
 
     #[test]
