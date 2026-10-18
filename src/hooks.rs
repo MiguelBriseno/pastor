@@ -57,9 +57,15 @@ fn normalize_blink(screen: &str) -> String {
     screen.replace(BLINK, " ")
 }
 
-/// Huella de la pantalla: con ella el observador decide si hubo actividad y
-/// si un hook sigue valiendo. Responder un diálogo o interrumpir el turno
-/// cambia lo que hay encima del pie.
+/// Hash de la pantalla entera para observar agentes que no son Claude Code,
+/// cuyo pie no sigue el formato de `FOOTER`.
+pub fn activity_hash(screen: &str) -> u64 {
+    screen_hash(&normalize_blink(screen))
+}
+
+/// Huella de la pantalla para saber si un hook sigue valiendo y si Claude
+/// Code hizo algo. Responder un diálogo o interrumpir el turno cambia lo que
+/// hay encima del pie.
 pub fn fingerprint(screen: &str) -> u64 {
     let screen = normalize_blink(screen);
     let lines: Vec<&str> = screen.trim_end().lines().map(str::trim_end).collect();

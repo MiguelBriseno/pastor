@@ -577,16 +577,20 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
                 cmd: Some(t.cmd).filter(|c| !c.is_empty()),
             });
             let size = pane.map_or("", |p| p.size.as_str());
-            // Lo que pasa en el pie (escribir en el prompt, las pistas que
-            // Claude Code pone y quita) no es actividad del agente.
+            // En Claude Code lo que pasa en el pie (escribir en el prompt, las
+            // pistas que pone y quita) no es actividad del agente.
             let fingerprint = hooks::fingerprint(&screen);
+            let hash = match a.kind {
+                Kind::Claude => fingerprint,
+                _ => hooks::activity_hash(&screen),
+            };
             let obs = Observation {
                 dead: pane.is_none_or(|p| p.dead),
                 gone,
                 screen: &screen,
                 fingerprint,
                 size,
-                last_change: tracker.observe(&a.id, fingerprint, size),
+                last_change: tracker.observe(&a.id, hash, size),
                 age_secs: (Utc::now() - a.created_at).num_seconds(),
             };
             // Si lo vuelven a abrir a mano, que no herede el estado de la vez anterior.

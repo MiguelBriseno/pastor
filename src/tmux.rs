@@ -275,6 +275,7 @@ pub fn pane_size(target: &str) -> Result<String> {
 /// teclas (Enter, Shift-Tab, respuestas a un diálogo…).
 fn paste_safe(text: &str) -> String {
     text.replace("\r\n", "\n")
+        .replace('\r', "\n")
         .chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()
@@ -283,6 +284,14 @@ fn paste_safe(text: &str) -> String {
 /// Pega `text` en el agente (bracketed paste) y pulsa Enter.
 pub fn send_text(name: &str, text: &str) -> Result<()> {
     let text = paste_safe(text);
+    // Un Enter sin nada pegado enviaría lo que hubiera en el prompt o
+    // confirmaría la opción marcada de un diálogo.
+    if text.trim().is_empty() {
+        bail!("el mensaje está vacío");
+    }
+    // En copy-mode (p. ej. tras subir con la rueda) el Enter se lo quedaría
+    // el modo y el mensaje se quedaría sin enviar.
+    run(&["copy-mode", "-q", "-t", name])?;
     // Único por envío: dos envíos a la vez al mismo panel (la TUI y la CLI)
     // no se pisan el buffer.
     let buf = format!("pastor-{name}-{}", unique_suffix());
@@ -300,9 +309,6 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
         bail!("tmux load-buffer falló ({status})");
     }
     written.context("no pude pasarle el texto a tmux load-buffer")?;
-    // En copy-mode (p. ej. tras subir con la rueda) el Enter se lo quedaría
-    // el modo y el mensaje se quedaría sin enviar.
-    run(&["copy-mode", "-q", "-t", name])?;
     run(&["paste-buffer", "-p", "-d", "-b", &buf, "-t", name])?;
     thread::sleep(Duration::from_millis(200));
     run(&["send-keys", "-t", name, "Enter"])?;
@@ -416,7 +422,7 @@ mod tests {
     fn el_pegado_no_lleva_caracteres_de_control() {
         assert_eq!(
             paste_safe("hola\x1b[201~\r/exit\x1b[Z\r\nfin\tok\u{9b}"),
-            "hola[201~/exit[Z\nfin\tok"
+            "hola[201~\n/exit[Z\nfin\tok"
         );
         assert_eq!(paste_safe("línea 1\nlínea 2 ✨"), "línea 1\nlínea 2 ✨");
     }

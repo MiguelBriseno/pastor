@@ -109,8 +109,10 @@ se ignoran.
 `agent::classify` decide en este orden:
 
 1. Si el panel está muerto, o el agente salió y en primer plano no hay un agente → **terminado**.
-2. Si hay un *inactivo* de hook vigente (solo Claude Code) → **inactivo**. Va antes que los textos:
-   el último mensaje del turno puede traer un `Do you want to…` o un `(y/n)` sin que haya diálogo.
+2. Si hay un *inactivo* de hook (solo Claude Code) cuya huella es la pantalla actual → **inactivo**.
+   Va antes que los textos: el último mensaje del turno puede traer un `Do you want to…` o un
+   `(y/n)` sin que haya diálogo. Sin huella que coincida mandan los textos, por si es un diálogo
+   que no lanza hooks.
 3. Si en las últimas líneas de la pantalla hay un diálogo de permiso o confirmación
    (`do you want to`, `enter to confirm`…) → **esperando**.
 4. Si aparece `esc to interrupt` → **trabajando**.
@@ -121,8 +123,9 @@ se ignoran.
 6. Si el agente tiene menos de 5 segundos → **iniciando**. Si no, si la pantalla cambió en los
    últimos 3 segundos → **trabajando**; si no → **inactivo**.
 
-Para el observador, la pantalla cambia cuando cambia su huella (ver abajo): lo que pasa en el pie,
-como escribir en el prompt o las pistas que Claude Code pone y quita, no cuenta como actividad.
+En Claude Code, para el observador la pantalla cambia cuando cambia su huella (ver abajo): lo que
+pasa en el pie, como escribir en el prompt o las pistas que pone y quita, no cuenta como actividad.
+En Codex y opencode, cuyo pie es distinto, cuenta la pantalla entera.
 
 Un estado de hook se considera viejo cuando la pantalla cambió después de él; esto evita que un
 *esperando* quede pegado después de que respondiste. Hay dos formas de saberlo:

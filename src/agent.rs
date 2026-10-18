@@ -190,9 +190,16 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
                 .as_ref()
                 .is_none_or(|s| s.size != obs.size || s.hash == obs.fingerprint)
     });
-    // Un `idle` vigente gana a los textos: el último mensaje de Claude puede
-    // traer un «Do you want to…» o un «(y/n)» sin que haya ningún diálogo.
-    if hook.is_some_and(|h| h.state == "idle") {
+    // Un `idle` cuya huella es la pantalla actual gana a los textos: el último
+    // mensaje de Claude puede traer un «Do you want to…» o un «(y/n)» sin que
+    // haya ningún diálogo. Sin huella que coincida mandan los textos, por si
+    // es un diálogo que no lanza hooks.
+    let same_screen = |h: &&HookStatus| {
+        h.screen
+            .as_ref()
+            .is_some_and(|s| s.size == obs.size && s.hash == obs.fingerprint)
+    };
+    if hook.filter(same_screen).is_some_and(|h| h.state == "idle") {
         return Status::Idle;
     }
     let tail = tail_lower(obs.screen, 15);
@@ -209,6 +216,7 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     let interrupted = INTERRUPTED.iter().any(|p| last.contains(p));
     match hook.map(|h| h.state.as_str()) {
         Some("blocked") if !interrupted => return Status::Blocked,
+        Some("idle") => return Status::Idle,
         Some("working") if changed_recently => return Status::Working,
         _ => {}
     }
@@ -337,10 +345,19 @@ mod tests {
     }
 
     #[test]
-    fn un_idle_vigente_gana_a_los_textos() {
-        let o = obs("● Listo. Do you want to que siga con los tests? (y/n)\n───\n❯ \n───");
-        assert_eq!(classify(&o, Some(&hook("idle", 0))), Status::Idle);
-        // Sin hook, el texto sigue mandando.
+    fn un_idle_con_la_misma_pantalla_gana_a_los_textos() {
+        let o = obs("● Listo. Do you want to que siga con los tests? (y/n)\n\n───\n❯ \n───\n  ? for shortcuts");
+        let con_huella = |size: &str| HookStatus {
+            screen: Some(hooks::Screen {
+                hash: o.fingerprint,
+                size: size.into(),
+            }),
+            ..hook("idle", 0)
+        };
+        assert_eq!(classify(&o, Some(&con_huella("80x24"))), Status::Idle);
+        // Sin huella que coincida (o sin hook), el texto sigue mandando.
+        assert_eq!(classify(&o, Some(&con_huella("120x40"))), Status::Blocked);
+        assert_eq!(classify(&o, Some(&hook("idle", 0))), Status::Blocked);
         assert_eq!(classify(&o, None), Status::Blocked);
     }
 
