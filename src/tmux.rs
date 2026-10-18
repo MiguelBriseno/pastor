@@ -631,6 +631,8 @@ mod tests {
         let base = std::env::temp_dir().join(format!("pastor-numeral{}", std::process::id()));
         let dir = base.join("C#S #(touch pwned)");
         std::fs::create_dir_all(&dir).unwrap();
+        // Como lo hace `ops`: en macOS el temporal es un enlace a /private/var.
+        let dir = dir.canonicalize().unwrap();
         let s = Session(format!("numeral{}", std::process::id()));
         let cmd = ["sleep".to_string(), "30".to_string()];
         new_session(&s.0, &dir, &[], &cmd, "true").unwrap();
