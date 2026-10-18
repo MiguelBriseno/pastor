@@ -127,7 +127,7 @@ enum TaskCmd {
         #[arg(long, hide_possible_values = true, value_name = "TIPO")]
         new: Option<Kind>,
         /// Directorio del agente nuevo (por defecto el actual)
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, conflicts_with = "agent", value_name = "DIR")]
         cwd: Option<PathBuf>,
     },
     /// Marca una tarea como hecha
@@ -233,7 +233,7 @@ fn main() -> Result<()> {
             if state.agents.is_empty() {
                 println!("No hay agentes. Lanza uno con `pastor new claude`.");
             }
-            let snaps = ops::observe(&state, &mut ops::Tracker::default());
+            let snaps = ops::observe(&state, &mut ops::Tracker::default())?;
             for a in &state.agents {
                 let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
                 println!(
@@ -350,6 +350,16 @@ mod tests {
             term_command(&args(&["echo", "it's"])).as_deref(),
             Some(r"echo 'it'\''s'")
         );
+    }
+
+    #[test]
+    fn cwd_solo_con_un_agente_nuevo() {
+        let assign = |extra: &[&str]| {
+            let args = ["pastor", "task", "assign", "t1"].iter().chain(extra);
+            Cli::try_parse_from(args).map(|_| ())
+        };
+        assert!(assign(&["--agent", "a1", "--cwd", "/tmp"]).is_err());
+        assert!(assign(&["--new", "claude", "--cwd", "/tmp"]).is_ok());
     }
 
     #[test]

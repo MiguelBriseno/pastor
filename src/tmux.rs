@@ -167,7 +167,9 @@ fn set_role(pane: &str, role: &str) -> Result<()> {
 
 /// Recuerda en el panel el comando con el que se abrió.
 pub fn set_cmd(pane: &str, cmd: &str) -> Result<()> {
-    run(&["set-option", "-p", "-t", pane, "@pastor_cmd", cmd]).map(|_| ())
+    // En una línea: `panes` lee una por panel.
+    let cmd = cmd.replace(['\n', '\r'], " ");
+    run(&["set-option", "-p", "-t", pane, "@pastor_cmd", &cmd]).map(|_| ())
 }
 
 #[derive(Clone, Debug)]
@@ -191,13 +193,16 @@ pub struct Pane {
 /// Formato del tamaño de un panel (`Pane::size`), p. ej. `80x24`.
 const SIZE: &str = "#{pane_width}x#{pane_height}";
 
-/// Paneles de cada sesión. Vacío si el servidor no está corriendo.
-pub fn panes() -> HashMap<String, Vec<Pane>> {
+/// Paneles de cada sesión. Vacío si el servidor no está corriendo; otro fallo
+/// es un error, para no dar por terminados a todos los agentes.
+pub fn panes() -> Result<HashMap<String, Vec<Pane>>> {
     let format = format!(
         "#{{session_name}}\t#{{pane_id}}\t#{{pane_dead}}\t{SIZE}\t#{{pane_current_command}}\t#{{@pastor_exited}}\t#{{@pastor_role}}\t#{{pane_pid}}\t#{{@pastor_cmd}}"
     );
-    let Ok(out) = run(&["list-panes", "-a", "-F", &format]) else {
-        return HashMap::new();
+    let out = match run(&["list-panes", "-a", "-F", &format]) {
+        Ok(out) => out,
+        Err(e) if no_server(&e) => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
     };
     let mut map: HashMap<String, Vec<Pane>> = HashMap::new();
     for line in out.lines() {
@@ -219,7 +224,14 @@ pub fn panes() -> HashMap<String, Vec<Pane>> {
             cmd: f.collect::<Vec<_>>().join("\t"),
         });
     }
-    map
+    Ok(map)
+}
+
+/// Si el error de tmux es que no hay servidor (sin socket, o uno que quedó
+/// de un servidor que ya no está).
+fn no_server(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("no server running") || msg.contains("error connecting to")
 }
 
 /// Abre una terminal a la derecha de `pane` (sin quitarle el foco) y devuelve su id.
@@ -309,7 +321,11 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
         bail!("tmux load-buffer falló ({status})");
     }
     written.context("no pude pasarle el texto a tmux load-buffer")?;
-    run(&["paste-buffer", "-p", "-d", "-b", &buf, "-t", name])?;
+    if let Err(e) = run(&["paste-buffer", "-p", "-d", "-b", &buf, "-t", name]) {
+        // Sin pegar, `-d` no lo borró: que no quede el texto en el servidor.
+        let _ = run(&["delete-buffer", "-b", &buf]);
+        return Err(e);
+    }
     thread::sleep(Duration::from_millis(200));
     run(&["send-keys", "-t", name, "Enter"])?;
     Ok(())
@@ -388,8 +404,8 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg, capture, kill_session, new_session, pane_pids, panes, parse_version, paste_safe, run,
-        send_text, shell_quote, split_right, type_line,
+        arg, capture, kill_session, new_session, no_server, pane_pids, panes, parse_version,
+        paste_safe, run, send_text, shell_quote, split_right, type_line,
     };
     use std::path::Path;
     use std::process::Command;
@@ -419,6 +435,16 @@ mod tests {
     }
 
     #[test]
+    fn distingue_no_hay_servidor_de_otro_fallo() {
+        let e = |m: &str| anyhow::anyhow!("tmux list-panes: {m}");
+        assert!(no_server(&e("no server running on /tmp/tmux-1000/pastor")));
+        assert!(no_server(&e(
+            "error connecting to /tmp/tmux-1000/pastor (No such file or directory)"
+        )));
+        assert!(!no_server(&e("server exited unexpectedly")));
+    }
+
+    #[test]
     fn el_pegado_no_lleva_caracteres_de_control() {
         assert_eq!(
             paste_safe("hola\x1b[201~\r/exit\x1b[Z\r\nfin\tok\u{9b}"),
@@ -435,7 +461,7 @@ mod tests {
         let s = Session(format!("nueva{}", std::process::id()));
         let cmd = ["sleep".to_string(), "30".to_string()];
         new_session(&s.0, Path::new("/"), &[], &cmd, "true").unwrap();
-        assert!(panes().contains_key(&s.0));
+        assert!(panes().unwrap().contains_key(&s.0));
     }
 
     #[test]
@@ -448,7 +474,7 @@ mod tests {
         let s = Session(format!("prueba{pid}-12"));
         run(&["new-session", "-d", "-s", &s.0, "sleep", "30"]).unwrap();
         assert!(kill_session(&format!("prueba{pid}-1")).is_err());
-        assert!(panes().contains_key(&s.0));
+        assert!(panes().unwrap().contains_key(&s.0));
     }
 
     #[test]
@@ -459,9 +485,10 @@ mod tests {
         let s = Session(format!("pids{}", std::process::id()));
         let cmd = ["sleep".to_string(), "30".to_string()];
         new_session(&s.0, Path::new("/"), &[], &cmd, "true").unwrap();
-        let agent = panes().remove(&s.0).unwrap().remove(0);
+        let agent = panes().unwrap().remove(&s.0).unwrap().remove(0);
         split_right(&agent.id, Path::new("/")).unwrap();
         let mut esperados: Vec<u32> = panes()
+            .unwrap()
             .remove(&s.0)
             .unwrap()
             .iter()
@@ -495,11 +522,11 @@ mod tests {
         let s = Session(format!("paneles{}", std::process::id()));
         // `cat` devuelve lo que recibe: hace de agente.
         new_session(&s.0, Path::new("/"), &[], &["cat".to_string()], "true").unwrap();
-        let agent = panes().remove(&s.0).unwrap().remove(0);
+        let agent = panes().unwrap().remove(&s.0).unwrap().remove(0);
         assert_eq!(agent.role, "agent");
 
         let term = split_right(&agent.id, Path::new("/")).unwrap();
-        let mut list = panes().remove(&s.0).unwrap();
+        let mut list = panes().unwrap().remove(&s.0).unwrap();
         list.sort_by_key(|p| p.id != agent.id);
         let roles: Vec<_> = list
             .iter()

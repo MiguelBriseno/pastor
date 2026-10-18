@@ -325,8 +325,8 @@ panel.
 En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` en macOS:
 
 - `state.json`: agentes y tareas
-- `history.jsonl`: el historial de eventos para la pestaña Historial (puedes borrarlo para
-  empezar de cero)
+- `history.jsonl`: el historial de eventos para la pestaña Historial. Si lo borras con pastor
+  cerrado, empieza de nuevo pero conserva los totales de agentes y tareas que ya había
 - `status/`: el último estado que reportó cada agente de Claude Code
 - `claude-settings.json`: los hooks que se le pasan a Claude Code
 

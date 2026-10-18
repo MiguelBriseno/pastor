@@ -67,7 +67,10 @@ pub fn run() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let current = std::thread::current();
         match current.name() {
-            _ if current.id() == tui => restore(info),
+            _ if current.id() == tui => {
+                let _ = execute!(io::stdout(), DisableBracketedPaste);
+                restore(info);
+            }
             Some(OBSERVER) => {
                 *LAST_PANIC.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(info.to_string().replace('\n', " "));
@@ -187,6 +190,18 @@ impl App {
     }
 
     fn run(&mut self, term: &mut DefaultTerminal) -> Result<()> {
+        let result = self.event_loop(term);
+        // Que una acción a medias (lanzar un agente, por ejemplo) termine,
+        // también si el bucle salió por un error de la terminal.
+        if self.actions.pending > 0 {
+            self.set_flash("Esperando a que termine la acción en curso…".to_string());
+            let _ = term.draw(|f| self.draw(f));
+        }
+        self.actions.wait();
+        result
+    }
+
+    fn event_loop(&mut self, term: &mut DefaultTerminal) -> Result<()> {
         self.reload();
         while !self.quit {
             if let Some(pass) = self.observer.take() {
@@ -222,12 +237,6 @@ impl App {
                 }
             }
         }
-        // Que una acción a medias (lanzar un agente, por ejemplo) termine.
-        if self.actions.pending > 0 {
-            self.set_flash("Esperando a que termine la acción en curso…".to_string());
-            term.draw(|f| self.draw(f))?;
-        }
-        self.actions.wait();
         Ok(())
     }
 
@@ -266,9 +275,19 @@ impl App {
     }
 
     fn reload(&mut self) {
+        // La selección sigue al agente y a la tarea, no a la posición: si otro
+        // proceso borra uno de arriba, que `T` o ⏎ no caigan sobre otro.
+        let agent = self.selected_agent().map(|a| a.id.clone());
+        let task = self.selected_task().map(|t| t.id.clone());
         match State::load() {
             Ok(s) => self.state = s,
             Err(e) => self.set_flash(format!("Error: {e:#}")),
+        }
+        if let Some(i) = agent.and_then(|id| self.state.agents.iter().position(|a| a.id == id)) {
+            self.agent_sel.select(Some(i));
+        }
+        if let Some(i) = task.and_then(|id| self.state.tasks.iter().position(|t| t.id == id)) {
+            self.task_sel.select(Some(i));
         }
 
         clamp(&mut self.agent_sel, self.state.agents.len());
@@ -755,7 +774,11 @@ impl App {
                 .state
                 .agents
                 .iter()
-                .filter(|a| self.status(&a.id) == st)
+                .filter(|a| match self.status(&a.id) {
+                    // Como en el Dashboard: el que arranca cuenta como trabajando.
+                    Status::Starting => st == Status::Working,
+                    s => s == st,
+                })
                 .count();
             spans.push(Span::styled(
                 format!("{} {}  ", ic.status(st), n),
@@ -1436,13 +1459,24 @@ impl App {
 
 /// Sale de la TUI mientras corre `f` (p. ej. tmux attach) y vuelve después.
 fn suspend<T>(term: &mut DefaultTerminal, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
-    let result = f();
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
-    term.clear()?;
-    result
+    // Cada paso aunque falle el anterior: a medias, la TUI seguiría dibujando
+    // fuera de la pantalla alternativa o con eco de teclas.
+    let left = disable_raw_mode().and(execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    ));
+    let result = left.map_err(Into::into).and_then(|()| f());
+    let back = enable_raw_mode()
+        .and(execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        ))
+        .and(term.clear());
+    let result = result?;
+    back?;
+    Ok(result)
 }
 
 /// Las últimas `h` líneas con contenido de una pantalla capturada.
@@ -1486,7 +1520,8 @@ struct Watch {
 impl Watch {
     fn look(&mut self) -> Option<Pass> {
         let state = State::load().ok()?;
-        let snaps = ops::observe(&state, &mut self.tracker);
+        // Si tmux falló, mejor saltar esta pasada que dar a todos por terminados.
+        let snaps = ops::observe(&state, &mut self.tracker).ok()?;
         // Avisar desde aquí y no desde la TUI hace que lleguen también
         // mientras estás dentro de un agente (la TUI está suspendida).
         let mut flashes = Vec::new();
@@ -1939,7 +1974,11 @@ const NO_CWD: &str = "Error: falta el directorio";
 /// La ruta escrita en un formulario, con `~` expandido; `None` si está vacía.
 fn expand(s: &str) -> Option<PathBuf> {
     let s = s.trim();
-    Some(match (s.strip_prefix('~'), dirs::home_dir()) {
+    // Solo `~` y `~/…`: `~ana/…` (el home de otro) se deja tal cual.
+    let rest = s
+        .strip_prefix('~')
+        .filter(|r| r.is_empty() || r.starts_with('/'));
+    Some(match (rest, dirs::home_dir()) {
         _ if s.is_empty() => return None,
         (Some(rest), Some(home)) => home.join(rest.trim_start_matches('/')),
         _ => PathBuf::from(s),
@@ -1983,6 +2022,7 @@ mod tests {
         assert_eq!(expand("~"), Some(home.clone()));
         assert_eq!(expand(" ~/web "), Some(home.join("web")));
         assert_eq!(expand("/tmp/x"), Some(PathBuf::from("/tmp/x")));
+        assert_eq!(expand("~ana/web"), Some(PathBuf::from("~ana/web")));
     }
 
     #[test]

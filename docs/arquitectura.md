@@ -87,7 +87,8 @@ secundaria lo desactiva en su propio panel (`set-option -p`), así que al hacer 
 
 `State::update` carga `state.json`, aplica el cambio y lo guarda con escritura atómica (archivo
 temporal y `rename`). La TUI recarga el archivo cada segundo. Así la CLI y la TUI pueden usarse a
-la vez.
+la vez. Los temporales de una escritura que murió a medias los borra la limpieza de `status/` al
+abrir la TUI o con `pastor ls`.
 
 ### El historial solo crece
 
