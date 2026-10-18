@@ -272,7 +272,8 @@ curl -H "Authorization: Bearer $(cat ~/.local/share/pastor/serve-token)" localho
 `keys` (como `pastor keys`) es para los menús y diálogos que no se contestan con texto, como los permisos de Claude.
 Acepta `Enter`, `Escape`, `Tab`, `BTab` (Shift-Tab), `Space`, `BSpace`, las flechas (`Up`, `Down`,
 `Left`, `Right`), `Home`, `End`, `PageUp`, `PageDown`, Ctrl con una letra (`C-c`) y una letra o
-cifra suelta (`1`, `y`).
+cifra suelta (`1`, `y`). Ctrl solo puede ir al final: `C-c` puede terminar al agente, y lo que
+viniera después llegaría al shell.
 
 `cwd` tiene que ser una ruta absoluta. Los errores llegan como `{"error": "..."}`: 401 sin token,
 404 si el agente o la tarea no existen y 400 para lo demás.

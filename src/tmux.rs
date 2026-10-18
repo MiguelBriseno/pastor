@@ -291,19 +291,37 @@ fn valid_key(key: &str) -> bool {
         || one_char(key, u8::is_ascii_alphanumeric)
 }
 
-/// Pulsa `keys` en el panel, en orden.
-pub fn send_keys(pane: &str, keys: &[String]) -> Result<()> {
+/// Si `keys` se puede mandar de una vez. Ctrl solo va al final: `C-c` o `C-d`
+/// pueden terminar al agente, y lo que viniera después llegaría al shell y se
+/// ejecutaría. Lo siguiente va en otro envío, que vuelve a comprobar que el
+/// agente sigue ahí.
+pub fn check_keys(keys: &[String]) -> Result<()> {
     if keys.is_empty() {
         bail!("no hay teclas que enviar");
     }
     if let Some(k) = keys.iter().find(|k| !valid_key(k)) {
         bail!("tecla desconocida: {k:?}");
     }
+    if let Some(k) = keys[..keys.len() - 1].iter().find(|k| k.starts_with("C-")) {
+        bail!("{k} solo puede ir al final; manda lo demás en otro envío");
+    }
+    Ok(())
+}
+
+/// Pulsa `keys` en el panel, en orden.
+pub fn send_keys(pane: &str, keys: &[String]) -> Result<()> {
+    check_keys(keys)?;
     // Como en `send_text`: en copy-mode las teclas se las quedaría el modo.
     run(&["copy-mode", "-q", "-t", pane])?;
-    let mut args = vec!["send-keys", "-t", pane];
-    args.extend(keys.iter().map(String::as_str));
-    run(&args).map(|_| ())
+    for (i, key) in keys.iter().enumerate() {
+        // Seguidas, Escape y la tecla siguiente llegarían como una sola
+        // secuencia (Alt+tecla).
+        if i > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        run(&["send-keys", "-t", pane, key])?;
+    }
+    Ok(())
 }
 
 /// Texto visible del panel.
@@ -440,8 +458,9 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg, capture, kill_session, new_session, no_server, pane_pids, panes, parse_version,
-        paste_safe, run, send_keys, send_text, shell_quote, split_right, type_line, valid_key,
+        arg, capture, check_keys, kill_session, new_session, no_server, pane_pids, panes,
+        parse_version, paste_safe, run, send_keys, send_text, shell_quote, split_right, type_line,
+        valid_key,
     };
     use std::path::Path;
     use std::process::Command;
@@ -617,6 +636,7 @@ mod tests {
         );
         assert!(send_keys(&agent.id, &[]).is_err());
         assert!(send_keys(&agent.id, &keys(&["Enter", "kill-server"])).is_err());
+        assert!(send_keys(&agent.id, &keys(&["C-c", "l", "s", "Enter"])).is_err());
         assert!(!capture(&agent.id).unwrap().contains("desde-la-terminal"));
     }
 
@@ -630,6 +650,15 @@ mod tests {
         ] {
             assert!(!valid_key(k), "{k}");
         }
+    }
+
+    #[test]
+    fn ctrl_solo_al_final() {
+        let keys = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        assert!(check_keys(&keys(&["Escape", "C-c"])).is_ok());
+        assert!(check_keys(&keys(&["C-c"])).is_ok());
+        assert!(check_keys(&keys(&["C-c", "C-c"])).is_err());
+        assert!(check_keys(&keys(&["C-d", "r", "m", "Enter"])).is_err());
     }
 
     #[test]

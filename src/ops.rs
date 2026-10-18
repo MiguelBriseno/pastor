@@ -208,6 +208,7 @@ pub fn send(agent_key: &str, text: &str) -> Result<()> {
 /// Pulsa teclas sueltas en el agente (Enter, Escape, flechas…), para los
 /// menús que no se contestan con texto.
 pub fn send_keys(agent_key: &str, keys: &[String]) -> Result<()> {
+    tmux::check_keys(keys)?;
     let state = State::load()?;
     tmux::send_keys(&agent_target(state.find_agent(agent_key)?)?, keys)
 }
@@ -216,8 +217,11 @@ pub fn send_keys(agent_key: &str, keys: &[String]) -> Result<()> {
 /// haya quedado en su lugar (el shell, por ejemplo). Sin los espacios con los
 /// que tmux rellena cada línea hasta el ancho del panel.
 pub fn screen(agent_key: &str) -> Result<String> {
-    let agent = State::load()?.find_agent(agent_key)?.clone();
-    match agent_panes(&agent.id).agent {
+    let state = State::load()?;
+    let agent = state.find_agent(agent_key)?;
+    // Con `?` y no `agent_panes`: si tmux falla, que se vea por qué.
+    let panes = split_panes(tmux::panes()?.remove(&agent.id).unwrap_or_default());
+    match panes.agent {
         Some(p) => Ok(tmux::capture(&p.id)?
             .lines()
             .map(str::trim_end)
