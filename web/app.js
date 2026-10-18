@@ -901,15 +901,7 @@ function tasksView() {
   };
 
   main.append(chips, list);
-  let tasksJson = "";
-  reload = every(10000, () => attempt(async () => {
-    const list = await api("GET", "/tasks");
-    const json = JSON.stringify(list);
-    if (json === tasksJson) return;
-    tasksJson = json;
-    tasks = list;
-    draw();
-  }));
+  reload = poll(10000, "/tasks", (list) => { tasks = list; draw(); });
   watchAgents(draw);
 }
 
@@ -1023,10 +1015,11 @@ function hbars(rows) {
   )));
 }
 
-/** Datos que se consultan cada `ms` y se redibujan solo si cambiaron. */
+/** Datos que se consultan cada `ms` y se redibujan solo si cambiaron.
+ * Devuelve el `tick` de `every`, para consultar ya. */
 function poll(ms, path, fn) {
   let json = "";
-  every(ms, () => attempt(async () => {
+  return every(ms, () => attempt(async () => {
     const v = await api("GET", path);
     const j = JSON.stringify(v);
     if (j === json) return;
@@ -1054,7 +1047,7 @@ function dashboardView() {
           h("div", { class: "card-main" }, h("span", { class: "name", text: a.name }), h("div", { class: "card-meta", text: "Está esperando tu respuesta" })),
           h("span", { class: "chev" }, icon("forward")))),
       ...tasks.filter((x) => x.status === "review").map((x) =>
-        h("a", { class: "card task", href: "#/tasks" },
+        h("a", { class: "card task", href: "#/tasks", onclick: () => store.set("pastor-task-filter", "review") },
           h("div", { class: "card-main" }, h("span", { class: "name", text: x.title }),
             h("div", { class: "card-meta" }, h("span", { class: "tag", text: x.id }), h("span", { text: "Por revisar" }))),
           h("span", { class: "chev" }, icon("forward")))),
