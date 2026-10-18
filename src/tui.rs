@@ -39,6 +39,8 @@ use crate::store::{Agent, State, Task, TaskStatus};
 use crate::text::{self, truncate};
 
 const REFRESH: Duration = Duration::from_secs(1);
+/// Cuánto se ve un aviso en el pie.
+const FLASH: Duration = Duration::from_secs(5);
 const SELECTED: Color = Color::Rgb(45, 45, 60);
 const ACCENT: Color = Color::Magenta;
 /// Columnas de la etiqueta de un campo (`" {name:>11}: "`).
@@ -96,6 +98,20 @@ enum Tab {
     Tasks,
     Dashboard,
     History,
+}
+
+impl Tab {
+    /// En el orden de la cabecera.
+    const ALL: [Tab; 4] = [Tab::Agents, Tab::Tasks, Tab::Dashboard, Tab::History];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    /// La pestaña `d` lugares más allá, dando la vuelta.
+    fn step(self, d: usize) -> Tab {
+        Self::ALL[(self.index() + d) % Self::ALL.len()]
+    }
 }
 
 enum Mode {
@@ -182,6 +198,8 @@ struct App {
     /// Desde cuándo `want_fit` tiene su valor actual, y cuándo se pidió el último.
     want_since: Instant,
     fit_sent: Instant,
+    /// Si algo cambió desde el último cuadro: sin cambios no se redibuja.
+    dirty: bool,
     quit: bool,
 }
 
@@ -209,6 +227,7 @@ impl App {
             fitted: None,
             want_since: Instant::now(),
             fit_sent: Instant::now(),
+            dirty: true,
             quit: false,
         }
     }
@@ -276,21 +295,35 @@ impl App {
                     self.set_flash(pass.flashes.join(" · "));
                 }
                 self.reload();
+                self.dirty = true;
             }
             while let Ok((result, retry)) = self.actions.results.try_recv() {
                 self.actions.pending -= 1;
                 self.finish(result, retry);
+                self.dirty = true;
             }
             if self.observer.died() {
                 self.restart_observer();
             }
-            let before = self.want_fit.clone();
-            term.draw(|f| self.draw(f))?;
-            if self.want_fit != before {
-                self.want_since = Instant::now();
+            if self
+                .flash
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= FLASH)
+            {
+                self.flash = None;
+                self.dirty = true;
+            }
+            if std::mem::take(&mut self.dirty) {
+                let before = self.want_fit.clone();
+                term.draw(|f| self.draw(f))?;
+                if self.want_fit != before {
+                    self.want_since = Instant::now();
+                }
             }
             self.send_fit();
             if event::poll(Duration::from_millis(100))? {
+                // Cualquier evento, también un cambio de tamaño, pide un cuadro.
+                self.dirty = true;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         // Si la usas, que el agente vuelva a tu tamaño aunque
@@ -365,14 +398,10 @@ impl App {
             self.task_sel.select(Some(i));
         }
 
-        clamp(&mut self.agent_sel, self.state.agents.len());
-        let n = self.state.tasks.len();
-        match self.task_sel.selected() {
-            _ if n == 0 => self.task_sel.select(None),
-            None => self.task_sel.select(Some(0)),
-            Some(i) if i >= n => self.task_sel.select(Some(n - 1)),
-            _ => {}
-        }
+        self.agent_sel
+            .select(clamped(self.agent_sel.selected(), self.state.agents.len()));
+        self.task_sel
+            .select(clamped(self.task_sel.selected(), self.state.tasks.len()));
     }
 
     fn status(&self, id: &str) -> Status {
@@ -415,6 +444,7 @@ impl App {
 
     fn set_flash(&mut self, msg: String) {
         self.flash = Some((msg, Instant::now()));
+        self.dirty = true;
     }
 
     // ---------- teclado ----------
@@ -473,18 +503,9 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('1') => self.tab = Tab::Agents,
-            KeyCode::Char('2') => self.tab = Tab::Tasks,
-            KeyCode::Char('3') => self.tab = Tab::Dashboard,
-            KeyCode::Char('4') => self.tab = Tab::History,
-            KeyCode::Tab => {
-                self.tab = match self.tab {
-                    Tab::Agents => Tab::Tasks,
-                    Tab::Tasks => Tab::Dashboard,
-                    Tab::Dashboard => Tab::History,
-                    Tab::History => Tab::Agents,
-                }
-            }
+            KeyCode::Char(c @ '1'..='4') => self.tab = Tab::ALL[c as usize - '1' as usize],
+            KeyCode::Tab => self.tab = self.tab.step(1),
+            KeyCode::BackTab => self.tab = self.tab.step(Tab::ALL.len() - 1),
             _ => match self.tab {
                 Tab::Agents => self.on_agents(key, term)?,
                 Tab::Tasks => self.on_tasks(key)?,
@@ -559,9 +580,10 @@ impl App {
             }
             KeyCode::Char('T') => {
                 if let Some((id, name)) = selected {
-                    ops::close_term(&id)?;
-                    self.set_flash(format!("Terminal de {name} cerrada"));
-                    self.refresh();
+                    self.actions.run(None, move || {
+                        ops::close_term(&id)?;
+                        Ok(Done::Msg(format!("Terminal de {name} cerrada")))
+                    });
                 }
             }
             KeyCode::Char('x') => {
@@ -587,6 +609,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.task_sel.select(step(self.task_sel.selected(), n, 1))
             }
+            // Como en Agentes, `<` encoge la lista (y agranda la descripción).
             KeyCode::Char('<') => self.desc_height = (self.desc_height + 2).min(100),
             KeyCode::Char('>') => self.desc_height = self.desc_height.saturating_sub(2).max(3),
             KeyCode::Char('n') => {
@@ -634,14 +657,19 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('g') => {
-                if let Some(agent) = task.and_then(|t| t.agent) {
-                    if let Some(i) = self.state.agents.iter().position(|a| a.id == agent) {
-                        self.agent_sel.select(Some(i));
-                        self.tab = Tab::Agents;
+            KeyCode::Char('g') => match task.map(|t| (t.id, t.agent)) {
+                Some((id, None)) => self.set_flash(format!("La tarea {id} no tiene agente")),
+                Some((_, Some(agent))) => {
+                    match self.state.agents.iter().position(|a| a.id == agent) {
+                        Some(i) => {
+                            self.agent_sel.select(Some(i));
+                            self.tab = Tab::Agents;
+                        }
+                        None => self.set_flash(format!("El agente {agent} ya no existe")),
                     }
                 }
-            }
+                None => {}
+            },
             _ => {}
         }
         Ok(())
@@ -703,7 +731,10 @@ impl App {
             },
             Mode::Send { agent, mut input } => {
                 if key.code == KeyCode::Enter {
-                    if !input.trim().is_empty() {
+                    if input.trim().is_empty() {
+                        self.set_flash("Escribe el mensaje antes de enviarlo".to_string());
+                        self.mode = Mode::Send { agent, input };
+                    } else {
                         let name = self.agent_name(&agent);
                         let (a, text) = (agent.clone(), input.clone());
                         self.set_flash(format!("Enviando a {name}…"));
@@ -752,6 +783,10 @@ impl App {
                     let i = self.state.tasks.iter().position(|x| x.id == t.id);
                     self.task_sel.select(i);
                     self.set_flash(format!("Tarea {} creada · ⏎ para asignarla", t.id));
+                }
+                KeyCode::Enter => {
+                    self.set_flash("La tarea necesita un título".to_string());
+                    self.mode = Mode::NewTask { title, desc, field };
                 }
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
                     field = 1 - field;
@@ -853,19 +888,13 @@ impl App {
             ),
             logo,
         );
-        let idx = match self.tab {
-            Tab::Agents => 0,
-            Tab::Tasks => 1,
-            Tab::Dashboard => 2,
-            Tab::History => 3,
-        };
         let t = Tabs::new([
             format!(" 1 {}Agentes ", pad(ic.agents)),
             format!(" 2 {}Tareas ", pad(ic.tasks)),
             format!(" 3 {}Dashboard ", pad(ic.dashboard)),
             format!(" 4 {}Historial ", pad(ic.history)),
         ])
-        .select(idx)
+        .select(self.tab.index())
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(Style::default().fg(Color::White).bold())
         .divider("│");
@@ -1105,7 +1134,6 @@ impl App {
 
     fn draw_dashboard(&self, f: &mut Frame, area: Rect) {
         let ic = icons::get();
-        let named = |icon: &str, name: &str| format!("{}{name}", pad(icon));
         let rows = self.limits.iter().map(|u| u.windows.len().max(1)).max();
         let [r1, r2, r4, r3] = Layout::vertical([
             Constraint::Length(4),
@@ -1223,27 +1251,9 @@ impl App {
             left,
         );
 
-        let bars: Vec<Bar> = Kind::ALL
-            .iter()
-            .map(|k| {
-                let n = self.state.agents.iter().filter(|a| a.kind == *k).count() as u64;
-                Bar::default()
-                    .value(n)
-                    .label(Line::from(format!("{}{k}", pad(ic.kind(*k)))))
-                    .style(Style::default().fg(kind_color(*k)))
-                    .value_style(Style::default().fg(Color::Black).bg(kind_color(*k)).bold())
-            })
-            .collect();
-        let chart = BarChart::default()
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .title(format!(" {}Agentes por tipo ", pad(ic.agents))),
-            )
-            .data(BarGroup::default().bars(&bars))
-            .bar_width(10)
-            .bar_gap(2);
-        f.render_widget(chart, right);
+        let counts =
+            Kind::ALL.map(|k| self.state.agents.iter().filter(|a| a.kind == k).count() as u64);
+        f.render_widget(kind_bars(" Agentes por tipo ", &counts), right);
     }
 
     /// Una caja por suscripción con lo que queda de cada ventana.
@@ -1346,7 +1356,6 @@ impl App {
     fn draw_history(&self, f: &mut Frame, area: Rect) {
         let ic = icons::get();
         let s = &self.stats;
-        let named = |icon: &str, name: &str| format!("{}{name}", pad(icon));
         let [r1, r2, r3] = Layout::vertical([
             Constraint::Length(4),
             Constraint::Length(4),
@@ -1362,7 +1371,10 @@ impl App {
                     .to_string()
             },
         );
-        let days = s.since.map_or(0, |d| (chrono::Utc::now() - d).num_days());
+        // Con el reloj desfasado podría salir "hace -1 días".
+        let days = s
+            .since
+            .map_or(0, |d| (chrono::Utc::now() - d).num_days().max(0));
         let [a, b, c, d, e, g] = Layout::horizontal([Constraint::Ratio(1, 6); 6]).areas(r1);
         stat(f, a, &format!("desde (hace {days} días)"), since, ACCENT);
         stat(
@@ -1467,29 +1479,7 @@ impl App {
 
         let [kinds, projects] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
-        let bars: Vec<Bar> = Kind::ALL
-            .iter()
-            .zip(&s.by_kind)
-            .map(|(k, n)| {
-                Bar::default()
-                    .value(*n)
-                    .label(Line::from(format!("{}{k}", pad(ic.kind(*k)))))
-                    .style(Style::default().fg(kind_color(*k)))
-                    .value_style(Style::default().fg(Color::Black).bg(kind_color(*k)).bold())
-            })
-            .collect();
-        f.render_widget(
-            BarChart::default()
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .title(format!(" {}Sesiones por tipo ", pad(ic.agents))),
-                )
-                .data(BarGroup::default().bars(&bars))
-                .bar_width(10)
-                .bar_gap(2),
-            kinds,
-        );
+        f.render_widget(kind_bars(" Sesiones por tipo ", &s.by_kind), kinds);
 
         let room = projects.width.saturating_sub(10) as usize;
         let mut items: Vec<ListItem> = s
@@ -1519,29 +1509,63 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        if let Some((msg, at)) = &self.flash {
-            if at.elapsed() < Duration::from_secs(5) {
-                f.render_widget(
-                    Span::styled(
-                        format!(" {}{msg}", pad(icons::get().bell)),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    area,
-                );
-                return;
-            }
+        if let Some((msg, _)) = &self.flash {
+            f.render_widget(
+                Span::styled(
+                    format!(" {}{msg}", pad(icons::get().bell)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                area,
+            );
+            return;
         }
-        let help = match (&self.mode, self.tab) {
-            (Mode::Normal, Tab::Agents) => "↑↓ mover · ⏎ entrar · n nuevo · s mensaje · t terminal · T cerrar terminal · x terminar · < > ancho lista · [ ] ancho terminal · q salir",
-            (Mode::Normal, Tab::Tasks) => "↑↓ mover · n nueva · ⏎ asignar · espacio avanzar estado · d hecha · g ir al agente · x borrar · < > alto descripción",
-            (Mode::Normal, Tab::Dashboard | Tab::History) => "1-4 pestañas · Tab siguiente · q salir",
-            (Mode::Confirm { .. }, _) => "y confirmar · cualquier otra tecla cancela",
-            (Mode::Assign(form), _) if form.new_selected() => {
-                "↑↓ elegir · escribe el directorio · ⏎ asignar · Esc cancelar"
+        // Cada atajo con su importancia: si no caben todos, se quitan los
+        // de importancia más alta (0 es imprescindible).
+        let help: &[(&str, u8)] = match (&self.mode, self.tab) {
+            (Mode::Normal, Tab::Agents) => &[
+                ("↑↓ mover", 1),
+                ("⏎ entrar", 0),
+                ("n nuevo", 0),
+                ("s mensaje", 0),
+                ("t terminal", 1),
+                ("T cerrar terminal", 2),
+                ("x terminar", 1),
+                ("< > ancho lista", 3),
+                ("[ ] ancho terminal", 3),
+                ("Tab pestaña", 2),
+                ("q salir", 0),
+            ],
+            (Mode::Normal, Tab::Tasks) => &[
+                ("↑↓ mover", 1),
+                ("n nueva", 0),
+                ("⏎ asignar", 0),
+                ("espacio avanzar", 1),
+                ("d hecha", 1),
+                ("g ir al agente", 2),
+                ("x borrar", 1),
+                ("< > alto lista", 3),
+                ("Tab pestaña", 2),
+                ("q salir", 0),
+            ],
+            (Mode::Normal, Tab::Dashboard | Tab::History) => {
+                &[("1-4 pestañas", 0), ("Tab siguiente", 0), ("q salir", 0)]
             }
-            (Mode::Assign(_), _) => "↑↓ elegir · ⏎ asignar · Esc cancelar",
-            _ => "Tab cambiar campo · ⏎ confirmar · Esc cancelar",
+            (Mode::Confirm { .. }, _) => &[("y confirmar", 0), ("cualquier otra tecla cancela", 0)],
+            (Mode::Assign(form), _) if form.new_selected() => &[
+                ("↑↓ elegir", 0),
+                ("escribe el directorio", 1),
+                ("⏎ asignar", 0),
+                ("Esc cancelar", 0),
+            ],
+            (Mode::Assign(_), _) => &[("↑↓ elegir", 0), ("⏎ asignar", 0), ("Esc cancelar", 0)],
+            _ => &[
+                ("Tab cambiar campo", 0),
+                ("Ctrl-W borrar palabra", 2),
+                ("⏎ confirmar", 0),
+                ("Esc cancelar", 0),
+            ],
         };
+        let help = fit_help(help, area.width.saturating_sub(1) as usize);
         f.render_widget(
             Span::styled(format!(" {help}"), Style::default().fg(Color::DarkGray)),
             area,
@@ -1553,10 +1577,7 @@ impl App {
             Mode::Normal => {}
             Mode::NewAgent(form) => {
                 let w = modal_width(f, 100);
-                let mut kinds = vec![Span::styled(
-                    label("Tipo", form.field == 0),
-                    label_style(form.field == 0),
-                )];
+                let mut kinds = vec![Span::styled(label("Tipo"), label_style(form.field == 0))];
                 for (i, k) in Kind::ALL.iter().enumerate() {
                     let style = if i == form.kind {
                         Style::default().fg(Color::Black).bg(kind_color(*k)).bold()
@@ -1571,13 +1592,20 @@ impl App {
                     kinds.push(Span::styled("← →", Style::default().fg(Color::DarkGray)));
                 }
                 let mut lines = vec![Line::from(kinds), Line::raw("")];
-                lines.extend(field_lines("Directorio", &form.cwd, form.field == 1, w));
-                lines.extend(field_lines("Nombre", &form.name, form.field == 2, w));
-                let room = modal_room(f, 2).saturating_sub(lines.len());
-                lines.extend(keep_tail(
+                let fields = [
+                    field_lines("Directorio", &form.cwd, form.field == 1, w),
+                    field_lines("Nombre", &form.name, form.field == 2, w),
                     field_lines("Mensaje", &form.prompt, form.field == 3, w),
-                    room,
-                ));
+                ];
+                let room = modal_room(f, 2).saturating_sub(lines.len());
+                let lens = fields.each_ref().map(Vec::len);
+                for (field, n) in
+                    fields
+                        .into_iter()
+                        .zip(share(&lens, form.field.checked_sub(1), room))
+                {
+                    lines.extend(keep_tail(field, n));
+                }
                 let inner = popup(f, " Nuevo agente ", w, lines.len() as u16 + 4);
                 f.render_widget(Paragraph::new(lines), inner);
             }
@@ -1613,12 +1641,15 @@ impl App {
             Mode::NewTask { title, desc, field } => {
                 let w = modal_width(f, 100);
                 let mut lines = vec![Line::raw("")];
-                lines.extend(field_lines("Título", title, *field == 0, w));
-                let room = modal_room(f, 0).saturating_sub(lines.len());
-                lines.extend(keep_tail(
+                let fields = [
+                    field_lines("Título", title, *field == 0, w),
                     field_lines("Descripción", desc, *field == 1, w),
-                    room,
-                ));
+                ];
+                let room = modal_room(f, 0).saturating_sub(lines.len());
+                let lens = fields.each_ref().map(Vec::len);
+                for (lines_of, n) in fields.into_iter().zip(share(&lens, Some(*field), room)) {
+                    lines.extend(keep_tail(lines_of, n));
+                }
                 let inner = popup(f, " Nueva tarea ", w, lines.len() as u16 + 2);
                 f.render_widget(Paragraph::new(lines), inner);
             }
@@ -2096,6 +2127,58 @@ fn popup(f: &mut Frame, title: &str, w: u16, h: u16) -> Rect {
     inner
 }
 
+/// Los atajos de `help` unidos con ` · `, quitando de uno en uno los menos
+/// importantes (y, a igual importancia, los de más a la derecha) hasta que
+/// quepan en `width` columnas. Los de importancia 0 no se quitan.
+fn fit_help(help: &[(&str, u8)], width: usize) -> String {
+    let mut drop: Vec<usize> = (0..help.len()).filter(|&i| help[i].1 > 0).collect();
+    drop.sort_by_key(|&i| (help[i].1, i));
+    let mut shown = vec![true; help.len()];
+    loop {
+        let line = help
+            .iter()
+            .zip(&shown)
+            .filter(|(_, &s)| s)
+            .map(|((h, _), _)| *h)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        match drop.pop() {
+            Some(i) if text::width(&line) > width => shown[i] = false,
+            _ => return line,
+        }
+    }
+}
+
+/// Una barra por tipo de agente, con `counts` en el orden de `Kind::ALL`.
+fn kind_bars<'a>(title: &str, counts: &[u64]) -> BarChart<'a> {
+    let ic = icons::get();
+    let bars: Vec<Bar> = Kind::ALL
+        .iter()
+        .zip(counts)
+        .map(|(k, n)| {
+            Bar::default()
+                .value(*n)
+                .label(Line::from(format!("{}{k}", pad(ic.kind(*k)))))
+                .style(Style::default().fg(kind_color(*k)))
+                .value_style(Style::default().fg(Color::Black).bg(kind_color(*k)).bold())
+        })
+        .collect();
+    BarChart::default()
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(format!(" {}{}", pad(ic.agents), title.trim_start())),
+        )
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(10)
+        .bar_gap(2)
+}
+
+/// El nombre de una cifra con su icono delante.
+fn named(icon: &str, name: &str) -> String {
+    format!("{}{name}", pad(icon))
+}
+
 fn stat(f: &mut Frame, area: Rect, name: &str, value: String, color: Color) {
     let p = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -2113,7 +2196,7 @@ fn stat(f: &mut Frame, area: Rect, name: &str, value: String, color: Color) {
     f.render_widget(p, area);
 }
 
-fn label(name: &str, _active: bool) -> String {
+fn label(name: &str) -> String {
     format!(" {name:>11}: ")
 }
 
@@ -2161,7 +2244,7 @@ fn field_lines(name: &str, value: &str, active: bool, w: u16) -> Vec<Line<'stati
         .enumerate()
         .map(|(i, chunk)| {
             let head = if i == 0 {
-                Span::styled(label(name, active), label_style(active))
+                Span::styled(label(name), label_style(active))
             } else {
                 Span::raw(" ".repeat(LABEL_W))
             };
@@ -2188,11 +2271,33 @@ fn keep_tail(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Reparte `room` líneas entre campos de `lens` líneas: cada uno tiene al
+/// menos su primera línea (la de la etiqueta), el activo lo que le haga
+/// falta y los demás lo que sobre, en orden.
+fn share(lens: &[usize], active: Option<usize>, room: usize) -> Vec<usize> {
+    let mut got: Vec<usize> = lens.iter().map(|&n| n.min(1)).collect();
+    let mut left = room.saturating_sub(got.iter().sum());
+    let order = active
+        .into_iter()
+        .chain((0..lens.len()).filter(|&i| Some(i) != active));
+    for i in order.filter(|&i| i < lens.len()) {
+        let more = (lens[i] - got[i]).min(left);
+        got[i] += more;
+        left -= more;
+    }
+    got
+}
+
 fn edit(s: &mut String, key: &KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Char('u') if ctrl => s.clear(),
+        // La palabra anterior, con los espacios que la siguen.
+        KeyCode::Char('w') if ctrl => {
+            let word = s.trim_end().rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            s.truncate(word);
+        }
         KeyCode::Char(c) if !ctrl && !alt => s.push(c),
         KeyCode::Backspace => {
             s.pop();
@@ -2209,12 +2314,12 @@ fn step(cur: Option<usize>, n: usize, d: isize) -> Option<usize> {
     Some(i.clamp(0, n as isize - 1) as usize)
 }
 
-fn clamp(sel: &mut ListState, n: usize) {
-    match sel.selected() {
-        _ if n == 0 => sel.select(None),
-        None => sel.select(Some(0)),
-        Some(i) if i >= n => sel.select(Some(n - 1)),
-        _ => {}
+/// Una selección válida para una lista de `n` elementos.
+fn clamped(sel: Option<usize>, n: usize) -> Option<usize> {
+    match sel {
+        _ if n == 0 => None,
+        None => Some(0),
+        Some(i) => Some(i.min(n - 1)),
     }
 }
 
@@ -2329,13 +2434,47 @@ mod tests {
         edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(s, "a");
         // Ctrl+letra y Alt+letra no escriben la letra; Ctrl+U borra todo.
-        edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        edit(&mut s, &key(KeyCode::Char('e'), KeyModifiers::CONTROL));
         edit(&mut s, &key(KeyCode::Char('x'), KeyModifiers::ALT));
         assert_eq!(s, "a");
+        // Ctrl+W borra la palabra anterior y los espacios que la siguen.
+        s.push_str(" más  café  ");
+        edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(s, "a más  ");
+        edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        edit(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(s, "");
+        s.push('a');
         edit(&mut s, &key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(s, "");
         edit(&mut s, &key(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(s, "");
+    }
+
+    #[test]
+    fn el_campo_activo_se_lleva_el_alto_que_sobra() {
+        // Caben todos.
+        assert_eq!(share(&[2, 1, 3], Some(2), 10), [2, 1, 3]);
+        // No caben: cada uno su etiqueta y el activo el resto.
+        assert_eq!(share(&[5, 1, 5], Some(2), 6), [1, 1, 4]);
+        assert_eq!(share(&[5, 1, 5], Some(0), 6), [4, 1, 1]);
+        // Sin campo activo (el de Tipo), en orden.
+        assert_eq!(share(&[5, 1, 5], None, 8), [5, 1, 2]);
+        // Ni las etiquetas caben: keep_tail deja al menos una línea.
+        assert_eq!(share(&[3, 3], Some(1), 1), [1, 1]);
+    }
+
+    #[test]
+    fn la_ayuda_quita_lo_menos_importante() {
+        let help = [("a", 0), ("bb", 2), ("c", 1)];
+        assert_eq!(fit_help(&help, 80), "a · bb · c");
+        assert_eq!(fit_help(&help, 6), "a · c");
+        assert_eq!(fit_help(&help, 1), "a");
+        // Lo imprescindible se ve aunque no quepa.
+        assert_eq!(fit_help(&help, 0), "a");
+        // A igual importancia, se va primero el de la derecha.
+        let help = [("a", 1), ("b", 1), ("c", 0)];
+        assert_eq!(fit_help(&help, 5), "a · c");
     }
 
     #[test]
