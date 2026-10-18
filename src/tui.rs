@@ -1800,8 +1800,10 @@ impl Watch {
             }
         };
         self.failing = false;
-        // Avisar desde aquí y no desde la TUI hace que lleguen también
-        // mientras estás dentro de un agente (la TUI está suspendida).
+        // Desde este hilo, y no desde el de la TUI, los avisos llegan también
+        // mientras estás dentro de un agente (la TUI está suspendida). Los
+        // manda el `Notifier` solo si tiene el candado de los avisos; si no,
+        // esta TUI solo los muestra en su pie.
         let (mut flashes, errors) = self.notifier.pass(&state, &snaps);
         flashes.extend(errors.iter().map(|e| format!("Error: {e:#}")));
         let today = Local::now().date_naive();
@@ -1833,7 +1835,7 @@ impl Observer {
     /// en este hilo tumbaría la TUI; en el suyo solo lo vuelve a reiniciar.
     fn spawn(status: HashMap<String, Status>, look_now: bool) -> Self {
         let mut watch = Watch {
-            notifier: Notifier::new(status),
+            notifier: Notifier::for_tui(status),
             ..Watch::default()
         };
         let latest = Arc::new(Mutex::new(if look_now { watch.look() } else { None }));

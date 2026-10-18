@@ -350,8 +350,8 @@ pastor
 
 En ntfy.sh cualquiera que conozca el nombre del tema lee sus avisos, así que elige uno que no se
 pueda adivinar. Los avisos los manda la interfaz o `pastor serve`: basta con que uno de los dos
-esté abierto. Con los dos abiertos avisa solo uno (el que se abrió primero; si se cierra, sigue
-el otro), así que no llegan dobles. Como servicio de systemd, define las variables con
+esté abierto. Con los dos abiertos avisa solo la interfaz, así que no llegan dobles; al cerrarla,
+sigue `pastor serve` (lo que pase en ese segundo no avisa). Como servicio de systemd, define las variables con
 `Environment=PASTOR_NTFY_URL=…` en la unidad: no lee tu `.bashrc`. El que avisa también pasa a revisión la tarea de un agente que
 termina. Si un aviso no sale (URL o token mal puestos, sin red), el motivo queda en `hooks.log`.
 
@@ -451,7 +451,7 @@ En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` e
 - `state.json`: agentes y tareas. `state.json.bak` guarda la versión anterior al último cambio:
   si `state.json` se corrompe (p. ej. al editarlo a mano), cópialo encima
 - `hooks.log`: errores de los hooks y de los avisos de ntfy
-- `avisos.lock`: el candado de quien manda los avisos (la TUI o `pastor serve`)
+- `avisos.lock` y `tui.lock`: quién manda los avisos (la TUI si hay una abierta, si no `pastor serve`)
 - `history.jsonl`: el historial de eventos para la pestaña Historial. Si lo borras con pastor
   cerrado, empieza de nuevo pero conserva los totales de agentes y tareas que ya había
 - `status/`: el último estado que reportó cada agente de Claude Code

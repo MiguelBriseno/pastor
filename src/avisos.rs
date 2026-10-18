@@ -1,9 +1,14 @@
 //! Avisos de los agentes que terminan o te esperan: en el escritorio y, si
 //! está configurado, en el celular con ntfy. Los manda un solo proceso a la
 //! vez, el que tiene el candado `avisos.lock`: con la TUI y `pastor serve`
-//! abiertos, si no, cada aviso llegaría dos veces.
+//! abiertos, si no, cada aviso llegaría dos veces. Si hay una TUI abierta
+//! (lo dice `tui.lock`), avisa ella: mira los paneles de todos modos, y
+//! `serve` puede correr sin sesión gráfica, donde el aviso de escritorio no
+//! sale.
 
 use std::collections::HashMap;
+#[cfg(feature = "serve")]
+use std::collections::HashSet;
 use std::fs::{self, File};
 #[cfg(feature = "serve")]
 use std::panic::{self, AssertUnwindSafe};
@@ -35,12 +40,25 @@ const REFRESH: Duration = Duration::from_secs(1);
 pub struct Notifier {
     status: HashMap<String, Status>,
     lock: Option<File>,
+    /// En la TUI: el candado compartido que dice a `serve` que está abierta.
+    /// Solo se guarda para no soltarlo.
+    _tui: Option<File>,
 }
 
 impl Notifier {
-    /// Con los estados que ya se veían, para no perder un aviso.
-    pub fn new(status: HashMap<String, Status>) -> Self {
-        Self { status, lock: None }
+    /// El de la TUI, con los estados que ya se veían, para no perder un aviso.
+    pub fn for_tui(status: HashMap<String, Status>) -> Self {
+        Self {
+            status,
+            lock: None,
+            _tui: open_lock(&store::data_dir(), "tui.lock").filter(|f| f.try_lock_shared().is_ok()),
+        }
+    }
+
+    /// Suelta el candado de los avisos, para que los mande la TUI.
+    #[cfg(feature = "serve")]
+    fn step_down(&mut self) {
+        self.lock = None;
     }
 
     /// Si este proceso manda los avisos: si aún no, intenta tomar el candado
@@ -91,27 +109,46 @@ fn take_lock() -> Option<File> {
 }
 
 fn take_lock_in(dir: &Path) -> Option<File> {
-    fs::create_dir_all(dir).ok()?;
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("avisos.lock"))
-        .ok()?;
+    let file = open_lock(dir, "avisos.lock")?;
     file.try_lock().ok()?;
     Some(file)
 }
 
+fn open_lock(dir: &Path, name: &str) -> Option<File> {
+    fs::create_dir_all(dir).ok()?;
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(name))
+        .ok()
+}
+
+/// Si hay alguna TUI abierta: cada una tiene `tui.lock` compartido, y así no
+/// se puede tomar entero.
 #[cfg(feature = "serve")]
-/// Para `pastor serve`: mientras la TUI no esté abierta (no tenga el
-/// candado), mira los paneles y avisa desde aquí. No vuelve nunca.
+fn tui_open_in(dir: &Path) -> bool {
+    open_lock(dir, "tui.lock").is_some_and(|f| f.try_lock().is_err())
+}
+
+#[cfg(feature = "serve")]
+/// Para `pastor serve`: mientras no haya una TUI abierta (que avisa ella),
+/// mira los paneles y avisa desde aquí. No vuelve nunca. Al tomar el relevo
+/// parte de cero: lo que cambie en ese segundo no avisa.
 pub fn watch_forever() {
     let mut notifier = Notifier::default();
     let mut tracker = Tracker::default();
-    // El último error anotado: tmux caído fallaría en cada pasada.
-    let mut last_error = String::new();
+    // Los errores de la pasada anterior: tmux caído fallaría en cada una, y
+    // el registro solo debe tenerlos una vez.
+    let mut logged = HashSet::new();
     loop {
         std::thread::sleep(REFRESH);
+        // Con una TUI abierta avisa ella: se le deja el candado.
+        if tui_open_in(&store::data_dir()) {
+            notifier.step_down();
+            notifier.forget();
+            continue;
+        }
         if !notifier.leading() {
             notifier.forget();
             continue;
@@ -131,16 +168,15 @@ pub fn watch_forever() {
                 vec![anyhow!("el observador de avisos entró en pánico")]
             }
         };
-        if errors.is_empty() {
-            last_error.clear();
-        }
+        let mut now = HashSet::new();
         for e in errors {
             let text = format!("{e:#}");
-            if text != last_error {
+            if !logged.contains(&text) {
                 hooks::log_error("avisos", &e);
-                last_error = text;
             }
+            now.insert(text);
         }
+        logged = now;
     }
 }
 
@@ -271,6 +307,33 @@ mod tests {
 
     use super::*;
     use crate::agent::Kind;
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_sabe_si_hay_una_tui_abierta() {
+        let dir = std::env::temp_dir().join(format!("pastor-tui-{}", std::process::id()));
+        assert!(!tui_open_in(&dir));
+        let take = || {
+            let f = open_lock(&dir, "tui.lock").unwrap();
+            f.try_lock_shared().unwrap();
+            f
+        };
+        // Dos TUI a la vez: hasta que salen las dos, sigue habiendo una.
+        let (a, b) = (take(), take());
+        assert!(tui_open_in(&dir));
+        drop(a);
+        assert!(tui_open_in(&dir));
+        drop(b);
+        let start = Instant::now();
+        while tui_open_in(&dir) {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "el candado no se soltó"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn avisa_un_solo_proceso() {
