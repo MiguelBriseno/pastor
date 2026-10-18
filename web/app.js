@@ -36,6 +36,9 @@ const ICONS = {
   assign: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/>',
   key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  dashboard: '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+  history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+  bell: '<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>',
 };
 
 // ---------- utilidades ----------
@@ -343,7 +346,8 @@ function setTop({ title, back, actions = [] }) {
   return { title: titleEl, subtitle };
 }
 
-tabs.append(...[["agents", "Agentes", "bot"], ["tasks", "Tareas", "tasks"]].map(([tab, label, ic]) =>
+const TABS = [["agents", "Agentes", "bot"], ["tasks", "Tareas", "tasks"], ["dashboard", "Dashboard", "dashboard"], ["history", "Historial", "history"]];
+tabs.append(...TABS.map(([tab, label, ic]) =>
   h("a", { href: "#/" + tab, "data-tab": tab },
     h("span", { class: "tab-icon" }, icon(ic), tab === "agents" && h("b", { class: "count", hidden: true })),
     h("span", { text: label }),
@@ -356,7 +360,7 @@ function route() {
   main.replaceChildren();
   main.className = "";
   const hash = location.hash.slice(1) || "/agents";
-  const tab = hash.startsWith("/tasks") ? "tasks" : "agents";
+  const tab = TABS.find(([t]) => hash.startsWith("/" + t))?.[0] || "agents";
   tabs.querySelectorAll("a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
   if (!store.get("pastor-token")) {
     document.body.dataset.view = "token";
@@ -376,6 +380,8 @@ function route() {
   }
   document.body.dataset.view = tab;
   if (tab === "tasks") return tasksView();
+  if (tab === "dashboard") return dashboardView();
+  if (tab === "history") return historyView();
   agentsView();
 }
 
@@ -895,15 +901,7 @@ function tasksView() {
   };
 
   main.append(chips, list);
-  let tasksJson = "";
-  reload = every(10000, () => attempt(async () => {
-    const list = await api("GET", "/tasks");
-    const json = JSON.stringify(list);
-    if (json === tasksJson) return;
-    tasksJson = json;
-    tasks = list;
-    draw();
-  }));
+  reload = poll(10000, "/tasks", (list) => { tasks = list; draw(); });
   watchAgents(draw);
 }
 
@@ -989,6 +987,130 @@ function assignSheet(t, reload) {
       agentsLoop.tick();
     }),
   }, options, extra, h("button", { class: "btn primary block" }, icon("assign"), "Asignar")));
+}
+
+// ---------- dashboard e historial ----------
+
+/** Duración corta y legible, como `history::human`: "45s", "12m", "3h 20m", "2d 5h". */
+function human(secs) {
+  secs = Math.max(0, secs);
+  const d = Math.floor(secs / 86400), hr = Math.floor(secs / 3600) % 24, m = Math.floor(secs / 60) % 60;
+  return d ? `${d}d ${hr}h` : hr ? `${hr}h ${m}m` : m ? `${m}m` : `${secs}s`;
+}
+
+const stat = (label, value, color) =>
+  h("div", { class: "stat", style: color && `--c: ${color}` }, h("b", { text: String(value) }), h("span", { text: label }));
+
+function panel(ic, title, ...body) {
+  return h("section", { class: "panel" }, h("h2", { class: "group-title" }, icon(ic), title), body);
+}
+
+/** Barras horizontales: `[etiqueta, valor, color]`. */
+function hbars(rows) {
+  const max = Math.max(1, ...rows.map(([, n]) => n));
+  return h("div", { class: "hbars" }, rows.map(([label, n, color]) => h("div", { class: "hbar", style: `--c: ${color}` },
+    h("span", { class: "hbar-label", text: label }),
+    h("span", { class: "hbar-track" }, h("i", { style: `width: ${(n / max) * 100}%` })),
+    h("b", { text: String(n) }),
+  )));
+}
+
+/** Datos que se consultan cada `ms` y se redibujan solo si cambiaron.
+ * Devuelve el `tick` de `every`, para consultar ya. */
+function poll(ms, path, fn) {
+  let json = "";
+  return every(ms, () => attempt(async () => {
+    const v = await api("GET", path);
+    const j = JSON.stringify(v);
+    if (j === json) return;
+    json = j;
+    fn(v);
+  }));
+}
+
+const TASK_COLOR = { todo: "var(--muted)", in_progress: "var(--cyan)", review: "var(--yellow)", done: "var(--green)" };
+
+function dashboardView() {
+  setTop({ title: "Dashboard" });
+  let tasks = null;
+  const body = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
+  main.append(body);
+  const draw = () => {
+    const agents = feed.agents;
+    if (!agents || !tasks) return;
+    const n = (...st) => agents.filter((a) => st.includes(a.status)).length;
+    const t = (st) => tasks.filter((x) => x.status === st).length;
+    const attention = [
+      ...agents.filter((a) => a.status === "blocked").map((a) =>
+        h("a", { class: "card agent blocked", href: "#/agent/" + encodeURIComponent(a.id) },
+          avatar(a.kind),
+          h("div", { class: "card-main" }, h("span", { class: "name", text: a.name }), h("div", { class: "card-meta", text: "Está esperando tu respuesta" })),
+          h("span", { class: "chev" }, icon("forward")))),
+      ...tasks.filter((x) => x.status === "review").map((x) =>
+        h("a", { class: "card task", href: "#/tasks", onclick: () => store.set("pastor-task-filter", "review") },
+          h("div", { class: "card-main" }, h("span", { class: "name", text: x.title }),
+            h("div", { class: "card-meta" }, h("span", { class: "tag", text: x.id }), h("span", { text: "Por revisar" }))),
+          h("span", { class: "chev" }, icon("forward")))),
+    ];
+    body.replaceChildren(
+      panel("bot", "Agentes", h("div", { class: "stats" },
+        stat("agentes", agents.length),
+        stat("trabajando", n("working", "starting"), "var(--working)"),
+        stat("esperándote", n("blocked"), "var(--blocked)"),
+        stat("inactivos", n("idle"), "var(--idle)"),
+        stat("terminados", n("dead"), "var(--dead)"),
+      )),
+      panel("tasks", "Tareas", h("div", { class: "stats" },
+        TASKS.map(([s, label]) => stat(label.toLowerCase(), t(s), TASK_COLOR[s])),
+        stat("completado", `${tasks.length ? Math.floor((t("done") * 100) / tasks.length) : 0}%`, "var(--accent)"),
+      )),
+      panel("bell", "Necesita tu atención", attention.length
+        ? h("div", { class: "cards" }, attention)
+        : h("p", { class: "quiet", text: "Nada pendiente ✓" })),
+      panel("bot", "Agentes por tipo", hbars(KINDS.map((k) => [KIND[k].label, agents.filter((a) => a.kind === k).length, KIND[k].color]))),
+    );
+  };
+  poll(10000, "/tasks", (list) => { tasks = list; draw(); });
+  watchAgents(draw);
+}
+
+function historyView() {
+  setTop({ title: "Historial" });
+  const body = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
+  main.append(body);
+  poll(15000, "/stats", (s) => {
+    const days = s.since ? Math.floor((Date.now() - new Date(s.since)) / 86400000) : 0;
+    const dash = (v) => (v == null ? "—" : human(v));
+    const max = Math.max(1, ...s.daily.map((d) => d.events));
+    body.replaceChildren(
+      panel("history", s.since ? `Desde el ${new Date(s.since).toLocaleDateString("es")} (hace ${days} días)` : "Totales", h("div", { class: "stats" },
+        stat("sesiones", s.sessions),
+        stat("tareas creadas", s.tasks_created),
+        stat("tareas hechas", s.tasks_done, "var(--green)"),
+        stat("mensajes enviados", s.messages, "var(--cyan)"),
+        stat("turnos de Claude", s.turns, KIND.claude.color),
+        stat("sesiones por día", (s.sessions / Math.max(1, days)).toFixed(1)),
+      )),
+      panel("history", "Tiempos", h("div", { class: "stats" },
+        stat("duración media de sesión", dash(s.avg_session_secs)),
+        stat("tiempo medio por tarea", dash(s.avg_task_secs)),
+        stat("tiempo total de agentes", human(s.agent_secs)),
+      )),
+      panel("history", `Actividad de los últimos ${s.daily.length} días`,
+        h("div", { class: "vbars", role: "img", "aria-label": "Eventos por día" }, s.daily.map((d) => h("div", { class: "vbar", title: `${d.day}: ${d.events}` },
+          h("b", { text: d.events ? String(d.events) : "" }),
+          h("span", { class: "vbar-track" }, h("i", { style: `height: ${(d.events / max) * 100}%` })),
+          h("small", { text: d.day.slice(8) }),
+        ))),
+        h("p", { class: "quiet", text: "Sesiones, tareas, mensajes y turnos por día" }),
+      ),
+      panel("bot", "Sesiones por tipo", hbars(s.by_kind.map((k) => [KIND[k.kind]?.label || k.kind, k.sessions, KIND[k.kind]?.color || "var(--muted)"]))),
+      panel("folder", "Proyectos con más sesiones", s.projects.length
+        ? h("div", { class: "projects" }, s.projects.slice(0, 10).map((p) =>
+            h("div", { class: "project" }, h("b", { text: String(p.sessions) }), h("span", { class: "ellipsis", text: shortPath(p.path) }))))
+        : h("p", { class: "quiet", text: "Aún no hay sesiones registradas" })),
+    );
+  });
 }
 
 // ---------- arranque ----------

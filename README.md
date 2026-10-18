@@ -265,6 +265,7 @@ IP de Tailscale (que ya cifra).
 | `POST` | `/api/tasks/{id}/assign` | `{"agent": "web"}` o `{"kind": "claude", "cwd": "/ruta"}` |
 | `POST` | `/api/tasks/{id}/done` | — |
 | `DELETE` | `/api/tasks/{id}` | — |
+| `GET` | `/api/stats` | — (las estadísticas de la pestaña Historial; las duraciones van en segundos) |
 
 ```sh
 curl -H "Authorization: Bearer $(cat ~/.local/share/pastor/serve-token)" localhost:7433/api/agents
@@ -284,7 +285,7 @@ viniera después llegaría al shell.
 `pastor serve` también sirve una app web en `/`, pensada para el celular: los agentes agrupados por
 estado (los que te esperan, primero), la pantalla de cada uno en vivo con una caja para escribirle y
 botones para las teclas (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C), la conversación entera
-con los agentes de Claude, y las tareas. La
+con los agentes de Claude, las tareas, y el dashboard y el historial como en la TUI. La
 primera vez pide el token y lo guarda solo en ese dispositivo.
 
 Para instalarla como app (PWA) el navegador exige HTTPS. Con Tailscale basta con publicar el puerto
