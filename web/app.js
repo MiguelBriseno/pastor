@@ -1038,7 +1038,8 @@ function limitsView(list) {
       ? h("p", { class: "quiet", text: u.error })
       : u.windows.map((w) => {
         const left = Math.max(0, Math.min(100, 100 - w.used_pct));
-        const reset = w.resets_at ? "se reinicia en " + human(Math.round((Date.parse(w.resets_at) - Date.now()) / 1000)) : "";
+        const secs = w.resets_at ? Math.round((Date.parse(w.resets_at) - Date.now()) / 1000) : 0;
+        const reset = secs > 0 ? "se reinicia en " + human(secs) : "";
         return h("div", { class: "hbar limit-row", style: `--c: ${color(left)}` },
           h("span", { class: "hbar-label", text: w.name }),
           h("span", { class: "hbar-track" }, h("i", { style: `width: ${left}%` })),

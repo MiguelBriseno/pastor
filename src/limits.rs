@@ -25,6 +25,9 @@ use crate::agent::Kind;
 pub const TTL: Duration = Duration::from_secs(60);
 /// Lo que se lee del final de una sesión de Codex buscando el último evento.
 const TAIL: u64 = 1 << 20;
+/// Cuántas sesiones de Codex, de la más reciente hacia atrás, se miran: sin
+/// tope, alguien sin límites (con clave de API) leería todas cada `TTL`.
+const SESSIONS: usize = 20;
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Window {
@@ -135,8 +138,9 @@ fn get_usage(token: &str) -> Result<Value> {
          header = \"Authorization: Bearer {token}\"\n\
          header = \"anthropic-beta: oauth-2025-04-20\"\n"
     );
+    // Si curl murió antes de leerla, su stderr explica más que el "broken pipe".
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(config.as_bytes())?;
+        let _ = stdin.write_all(config.as_bytes());
     }
     let out = child.wait_with_output()?;
     if !out.status.success() {
@@ -190,6 +194,7 @@ fn codex(dir: &Path, now: DateTime<Utc>) -> Result<Usage> {
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
     files
         .iter()
+        .take(SESSIONS)
         .find_map(|(_, path)| last_rate_limits(path))
         .map(|(at, v)| parse_codex(&v, at, now))
         .ok_or_else(|| anyhow!("las sesiones de Codex no traen límites todavía"))
@@ -225,13 +230,17 @@ fn last_rate_limits(path: &Path) -> Option<(Option<DateTime<Utc>>, Value)> {
         .filter(|l| l.contains("\"rate_limits\""))
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find_map(|v| {
-            let limits = v["payload"]["rate_limits"].clone();
-            limits.is_object().then(|| {
+            let limits = &v["payload"]["rate_limits"];
+            // Sin ninguna ventana no dice nada: el evento de antes sí.
+            let any = ["primary", "secondary"]
+                .iter()
+                .any(|k| limits[*k]["used_percent"].is_number());
+            any.then(|| {
                 let at = v["timestamp"]
                     .as_str()
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&Utc));
-                (at, limits)
+                (at, limits.clone())
             })
         })
 }
@@ -344,7 +353,13 @@ mod tests {
         };
         std::fs::write(
             day.join("a.jsonl"),
-            format!("{}\n{}\n", line(10.0), line(20.0)),
+            // El último trae `rate_limits` pero sin ventanas: no cuenta.
+            format!(
+                "{}\n{}\n{}\n",
+                line(10.0),
+                line(20.0),
+                r#"{"payload":{"type":"token_count","rate_limits":{"primary":null,"secondary":null}}}"#
+            ),
         )
         .unwrap();
         // Más reciente pero sin límites todavía.

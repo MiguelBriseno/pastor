@@ -1219,7 +1219,8 @@ impl App {
                     .iter()
                     .map(|w| {
                         let left = w.left_pct();
-                        let reset = w.resets_at.map_or(String::new(), |t| {
+                        // Una que ya pasó (el dato es de hace hasta `TTL`) no dice nada.
+                        let reset = w.resets_at.filter(|t| *t > now).map_or(String::new(), |t| {
                             format!(
                                 " · se reinicia en {}",
                                 history::human((t - now).num_seconds())
@@ -1745,16 +1746,23 @@ impl Observer {
                         }
                     }
                     wait = true;
-                    if let Some(mut pass) = watch.look() {
-                        // Aquí y no en `look`: puede tardar por la red, y la
-                        // primera pasada se hace antes del primer cuadro.
-                        if watch.limits.refresh() {
-                            pass.limits = Some(watch.limits.usage().to_vec());
-                        }
+                    let publish = |pass: Pass| {
                         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
                         *slot = Some(match slot.take() {
                             Some(old) => pass.after(old),
                             None => pass,
+                        });
+                    };
+                    if let Some(pass) = watch.look() {
+                        publish(pass);
+                    }
+                    // Aparte y después de los paneles: puede tardar por la red
+                    // y no debe retrasar los avisos. Tampoco en `look`: la
+                    // primera pasada se hace antes del primer cuadro.
+                    if watch.limits.refresh() {
+                        publish(Pass {
+                            limits: Some(watch.limits.usage().to_vec()),
+                            ..Pass::default()
                         });
                     }
                 }
