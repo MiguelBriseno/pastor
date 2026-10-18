@@ -86,11 +86,10 @@ pub fn read_status(id: &str) -> Option<HookStatus> {
     serde_json::from_str(&fs::read_to_string(status_path(id)).ok()?).ok()
 }
 
-/// Con el candado del estado, para que un hook a medias no lo escriba justo
-/// después. El `.lock` se queda: otro proceso puede estar esperándolo, y si se
-/// borrara, el siguiente bloquearía otro archivo.
+/// El `.lock` se queda: otro proceso puede estar esperándolo, y si se
+/// borrara, el siguiente bloquearía otro archivo. Solo lo quita `prune`, con
+/// el agente ya fuera del estado.
 pub fn clear_status(id: &str) {
-    let _lock = lock_status(id);
     let _ = fs::remove_file(status_path(id));
 }
 
@@ -100,14 +99,16 @@ pub fn clear_status(id: &str) {
 pub fn prune_status() {
     let _ = store::State::with_lock(|s| {
         prune_status_in(&data_dir().join("status"), s);
-        // Los de `state.json`: con su candado nadie lo está escribiendo.
-        remove_stale_tmp(&data_dir(), Duration::ZERO);
+        // Los de `state.json`: con su candado nadie lo está escribiendo. Los
+        // de otros archivos (`claude-settings.json`) con margen.
+        remove_stale_tmp(&data_dir(), "state.json.", Duration::ZERO);
+        remove_stale_tmp(&data_dir(), "", Duration::from_secs(60));
     });
 }
 
-/// Borra los temporales de escrituras que no terminaron (el proceso murió
-/// entre crearlo y renombrarlo) con más de `age`.
-fn remove_stale_tmp(dir: &Path, age: Duration) {
+/// Borra los temporales que empiezan por `prefix` de escrituras que no
+/// terminaron (el proceso murió entre crearlo y renombrarlo) con más de `age`.
+fn remove_stale_tmp(dir: &Path, prefix: &str, age: Duration) {
     let Ok(dir) = fs::read_dir(dir) else {
         return;
     };
@@ -116,7 +117,9 @@ fn remove_stale_tmp(dir: &Path, age: Duration) {
             .metadata()
             .and_then(|m| m.modified())
             .is_ok_and(|t| t.elapsed().is_ok_and(|e| e >= age));
-        if entry.file_name().to_string_lossy().ends_with(".tmp") && stale {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) && name.ends_with(".tmp") && stale {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -124,7 +127,7 @@ fn remove_stale_tmp(dir: &Path, age: Duration) {
 
 fn prune_status_in(dir: &Path, state: &store::State) {
     // Un temporal reciente puede ser de una escritura en curso de su hook.
-    remove_stale_tmp(dir, Duration::from_secs(60));
+    remove_stale_tmp(dir, "", Duration::from_secs(60));
     let Ok(dir) = fs::read_dir(dir) else {
         return;
     };
@@ -262,15 +265,16 @@ pub fn handle(event: &str) -> Result<()> {
     };
     {
         let _lock = lock_status(&id)?;
-        // Otra vez con el candado: si lo quitaron mientras, `clear_status` ya
-        // pasó y nadie borraría este estado.
-        if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
-            return Ok(());
-        }
         write_volatile(
             &status_path(&id),
             serde_json::to_string(&status)?.as_bytes(),
         )?;
+        // Si quitaron el agente mientras, puede que `clear_status` ya pasara:
+        // que no quede su estado. Mirar después de escribir cubre los dos órdenes.
+        if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
+            clear_status(&id);
+            return Ok(());
+        }
     }
     if state != "working" {
         spawn_settle();

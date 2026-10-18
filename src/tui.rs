@@ -205,7 +205,9 @@ impl App {
         self.reload();
         while !self.quit {
             if let Some(pass) = self.observer.take() {
-                self.snaps = pass.snaps;
+                if let Some(snaps) = pass.snaps {
+                    self.snaps = snaps;
+                }
                 if let Some(stats) = pass.stats {
                     self.stats = stats;
                 }
@@ -277,14 +279,20 @@ impl App {
     fn reload(&mut self) {
         // La selección sigue al agente y a la tarea, no a la posición: si otro
         // proceso borra uno de arriba, que `T` o ⏎ no caigan sobre otro.
-        let agent = self.selected_agent().map(|a| a.id.clone());
+        let agent = self
+            .selected_agent()
+            .map(|a| (a.id.clone(), a.name.clone()));
         let task = self.selected_task().map(|t| t.id.clone());
         match State::load() {
             Ok(s) => self.state = s,
             Err(e) => self.set_flash(format!("Error: {e:#}")),
         }
-        if let Some(i) = agent.and_then(|id| self.state.agents.iter().position(|a| a.id == id)) {
-            self.agent_sel.select(Some(i));
+        if let Some((id, name)) = agent {
+            match self.state.agents.iter().position(|a| a.id == id) {
+                Some(i) => self.agent_sel.select(Some(i)),
+                // Quitaron el seleccionado: la selección pasa al vecino.
+                None => self.set_flash(format!("{name} ya no está; selección movida")),
+            }
         }
         if let Some(i) = task.and_then(|id| self.state.tasks.iter().position(|t| t.id == id)) {
             self.task_sel.select(Some(i));
@@ -1491,7 +1499,8 @@ fn tail(screen: &str, h: usize) -> String {
 /// Lo que vio el observador en una pasada.
 #[derive(Default)]
 struct Pass {
-    snaps: HashMap<String, Snapshot>,
+    /// `None` si no se pudo preguntar a tmux: se quedan los de antes.
+    snaps: Option<HashMap<String, Snapshot>>,
     /// Solo si el historial cambió.
     stats: Option<Stats>,
     /// Avisos de agentes que terminaron o necesitan atención.
@@ -1503,6 +1512,7 @@ impl Pass {
     fn after(mut self, old: Pass) -> Pass {
         self.flashes = [old.flashes, self.flashes].concat();
         self.stats = self.stats.or(old.stats);
+        self.snaps = self.snaps.or(old.snaps);
         self
     }
 }
@@ -1515,13 +1525,26 @@ struct Watch {
     history: history::Tail,
     /// Día de las últimas estadísticas: al cambiar se mueve el gráfico.
     day: Option<NaiveDate>,
+    /// Si la pasada anterior no pudo preguntar a tmux: se avisa una vez.
+    failing: bool,
 }
 
 impl Watch {
     fn look(&mut self) -> Option<Pass> {
         let state = State::load().ok()?;
-        // Si tmux falló, mejor saltar esta pasada que dar a todos por terminados.
-        let snaps = ops::observe(&state, &mut self.tracker).ok()?;
+        // Si tmux falló, mejor saltar esta pasada que dar a todos por
+        // terminados, pero que se sepa.
+        let snaps = match ops::observe(&state, &mut self.tracker) {
+            Ok(snaps) => snaps,
+            Err(e) => {
+                let first = !std::mem::replace(&mut self.failing, true);
+                return first.then(|| Pass {
+                    flashes: vec![format!("No pude leer los paneles: {e:#}")],
+                    ..Pass::default()
+                });
+            }
+        };
+        self.failing = false;
         // Avisar desde aquí y no desde la TUI hace que lleguen también
         // mientras estás dentro de un agente (la TUI está suspendida).
         let mut flashes = Vec::new();
@@ -1538,7 +1561,7 @@ impl Watch {
         self.day = Some(today);
         let stats = changed.then(|| self.history.stats(today));
         Some(Pass {
-            snaps,
+            snaps: Some(snaps),
             stats,
             flashes,
         })

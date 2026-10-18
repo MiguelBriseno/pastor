@@ -231,7 +231,10 @@ pub fn panes() -> Result<HashMap<String, Vec<Pane>>> {
 /// de un servidor que ya no está).
 fn no_server(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
-    msg.contains("no server running") || msg.contains("error connecting to")
+    // Sin socket o con uno abandonado; un «Permission denied» no es eso.
+    msg.contains("no server running")
+        || (msg.contains("error connecting to")
+            && (msg.contains("No such file") || msg.contains("Connection refused")))
 }
 
 /// Abre una terminal a la derecha de `pane` (sin quitarle el foco) y devuelve su id.
@@ -458,6 +461,9 @@ mod tests {
             "error connecting to /tmp/tmux-1000/pastor (No such file or directory)"
         )));
         assert!(!no_server(&e("server exited unexpectedly")));
+        assert!(!no_server(&e(
+            "error connecting to /tmp/tmux-1000/pastor (Permission denied)"
+        )));
     }
 
     #[test]
