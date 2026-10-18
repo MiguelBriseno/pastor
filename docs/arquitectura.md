@@ -40,6 +40,7 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/store.rs` | Modelo de datos (`Agent`, `Task`) y persistencia en `state.json` |
 | `src/history.rs` | Historial de eventos en `history.jsonl` y las estadísticas de la pestaña Historial |
 | `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
+| `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular |
 | `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
 | `web/` | La app del celular (PWA) que sirve `pastor serve` en `/`: HTML, CSS y JS sin build, metidos en el binario |
 
@@ -207,6 +208,16 @@ cada consulta, para que dos pantallas abiertas en el mismo agente no se lo quite
 alguien está dentro de la sesión no se toca: manda su terminal. `resize-window` deja la ventana
 en `window-size manual`, así que después se quita la opción para que `pastor attach` siga tomando
 el tamaño de tu terminal.
+
+### La conversación sale de la transcripción
+
+La pantalla de tmux solo tiene lo visible: Claude Code borra el historial de la terminal al
+redibujarse. Para ver la conversación entera, la app lee la transcripción que escribe Claude Code
+(un JSONL que solo crece). Cada hook trae su ruta (`transcript_path`), que se guarda junto al
+estado del agente; `transcript::Reader` recuerda hasta dónde leyó y solo lee lo nuevo, y la app
+pide con `session` y `after` solo los mensajes que le faltan. El formato es interno de Claude Code:
+se toman tus mensajes, las respuestas y una línea por herramienta, y lo que no se entiende se
+ignora. Codex y OpenCode no dan transcripción por ahora.
 
 ### Los avisos al celular van con `curl`
 

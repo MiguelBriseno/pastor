@@ -4,6 +4,7 @@
 //! Llama a `ops` igual que la CLI. Controlar un agente equivale a ejecutar
 //! comandos en esta máquina, así que todo pide el token.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,6 +23,7 @@ use serde_json::{json, Value};
 use crate::agent::{Kind, Status};
 use crate::ops::{self, AssignTarget, Tracker};
 use crate::store::{self, Agent, State, TaskStatus};
+use crate::transcript;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7433";
 
@@ -29,6 +31,8 @@ struct App {
     token: String,
     /// Para saber si la pantalla de un agente cambió entre dos consultas.
     tracker: Mutex<Tracker>,
+    /// La conversación leída de cada agente, para leer solo lo nuevo.
+    transcripts: Mutex<HashMap<String, Arc<Mutex<transcript::Reader>>>>,
 }
 
 /// El token sale de `PASTOR_TOKEN` o del archivo, nunca de un argumento:
@@ -47,6 +51,7 @@ pub fn run(bind: SocketAddr) -> Result<()> {
     let app = Arc::new(App {
         token,
         tracker: Mutex::default(),
+        transcripts: Mutex::default(),
     });
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -70,6 +75,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/agents/{id}/send", post(send))
         .route("/agents/{id}/keys", post(keys))
         .route("/agents/{id}/screen", get(screen))
+        .route("/agents/{id}/conversation", get(conversation))
         .route("/tasks", get(list_tasks).post(add_task))
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
@@ -385,6 +391,74 @@ async fn screen(Path(id): Path<String>, Query(size): Query<Size>) -> Response {
     .await
 }
 
+/// Qué parte de la conversación se pide. Sin nada, los últimos mensajes;
+/// con `after`, los que siguen (lo nuevo); con `before`, los anteriores.
+/// Ambos valen solo para la `session` que devolvió la consulta anterior.
+#[derive(Deserialize)]
+struct Since {
+    session: Option<String>,
+    after: Option<usize>,
+    before: Option<usize>,
+}
+
+/// Cuántos mensajes van como máximo en una respuesta.
+const PAGE: usize = 300;
+
+/// La conversación de un agente de Claude, de su transcripción, por partes.
+/// `available: false` si aún no se sabe dónde está o ya no existe (Codex y
+/// OpenCode no la dan, y Claude Code la da en su primer hook).
+async fn conversation(
+    Shared(app): Shared<Arc<App>>,
+    Path(id): Path<String>,
+    Query(since): Query<Since>,
+) -> Response {
+    blocking(move || {
+        let state = State::load()?;
+        let agent = state.find_agent(&id)?;
+        let Some(path) = transcript::path_for(&agent.id).filter(|p| p.is_file()) else {
+            return Ok(json!({ "available": false }));
+        };
+        // Uno por agente: leer la primera vez una transcripción larga no
+        // detiene las consultas de los demás.
+        let reader = {
+            let mut readers = app
+                .transcripts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            readers.retain(|k, _| state.agents.iter().any(|a| &a.id == k));
+            readers.entry(agent.id.clone()).or_default().clone()
+        };
+        let mut r = reader.lock().unwrap_or_else(PoisonError::into_inner);
+        r.update(&path)?;
+        // Si la transcripción se reescribió, lo que tiene el cliente ya no
+        // vale: con otra `session`, la app empieza de nuevo.
+        let session = format!(
+            "{}.{}",
+            path.file_stem().unwrap_or_default().to_string_lossy(),
+            r.resets
+        );
+        let total = r.messages.len();
+        let same = since.session.as_deref() == Some(session.as_str());
+        let (from, to) = match since {
+            Since { after: Some(n), .. } if same => (n.min(total), total),
+            Since {
+                before: Some(n), ..
+            } if same => (n.min(total).saturating_sub(PAGE), n.min(total)),
+            _ => (total.saturating_sub(PAGE), total),
+        };
+        let to = to.min(from + PAGE);
+        Ok(json!({
+            "available": true,
+            "session": session,
+            "from": from,
+            "to": to,
+            "total": total,
+            "messages": &r.messages[from..to],
+        }))
+    })
+    .await
+}
+
 async fn kill_agent(Path(id): Path<String>) -> Response {
     blocking(move || ops::kill_agent(&id).map(|()| ok())).await
 }
@@ -490,6 +564,7 @@ mod tests {
         let app = Arc::new(App {
             token: "secreto".into(),
             tracker: Mutex::default(),
+            transcripts: Mutex::default(),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listener = rt

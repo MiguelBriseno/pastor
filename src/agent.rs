@@ -273,6 +273,7 @@ mod tests {
             at: Utc::now() - Duration::seconds(secs_ago),
             message: String::new(),
             screen: None,
+            transcript: None,
         }
     }
 
