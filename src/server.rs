@@ -76,7 +76,66 @@ fn router(app: Arc<App>) -> Router {
         .route("/tasks/{id}/done", post(task_done))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no existe esa ruta") })
         .layer(middleware::from_fn_with_state(app.clone(), auth));
-    Router::new().nest("/api", api).with_state(app)
+    Router::new()
+        .nest("/api", api)
+        .route("/", get(|| page("index.html")))
+        .route("/{file}", get(|Path(file): Path<String>| page(file)))
+        .with_state(app)
+}
+
+/// La PWA de `web/`, metida en el binario. No pide token: la página no
+/// sirve de nada sin él, y así puede pedirlo.
+const WEB: &[(&str, &str, &[u8])] = &[
+    (
+        "index.html",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/index.html"),
+    ),
+    (
+        "app.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/app.js"),
+    ),
+    (
+        "style.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../web/style.css"),
+    ),
+    (
+        "sw.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/sw.js"),
+    ),
+    (
+        "manifest.webmanifest",
+        "application/manifest+json",
+        include_bytes!("../web/manifest.webmanifest"),
+    ),
+    (
+        "icon-192.png",
+        "image/png",
+        include_bytes!("../web/icon-192.png"),
+    ),
+    (
+        "icon-512.png",
+        "image/png",
+        include_bytes!("../web/icon-512.png"),
+    ),
+];
+
+async fn page(file: impl AsRef<str>) -> Response {
+    match WEB.iter().find(|(name, ..)| *name == file.as_ref()) {
+        // `no-cache`: que el navegador pregunte siempre y vea un pastor nuevo.
+        Some((_, mime, body)) => (
+            [
+                (header::CONTENT_TYPE, *mime),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            *body,
+        )
+            .into_response(),
+        None => error(StatusCode::NOT_FOUND, "no existe esa ruta"),
+    }
 }
 
 /// Ctrl-C o SIGTERM (`kill`, systemd): termina lo que está en curso, para no
@@ -428,12 +487,20 @@ mod tests {
     }
 
     #[test]
+    fn la_pagina_no_pide_token() {
+        let r = get("/", None);
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(r.contains("text/html") && r.contains("app.js"), "{r}");
+        assert!(get("/sw.js", None).contains("text/javascript"));
+        assert!(get("/manifest.webmanifest", None).starts_with("HTTP/1.1 200"));
+        assert!(get("/nada.js", None).starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
     fn sin_token_no_hay_api() {
         assert!(get("/api/tasks", None).starts_with("HTTP/1.1 401"));
         assert!(get("/api/tasks", Some("Bearer otro")).starts_with("HTTP/1.1 401"));
         assert!(get("/api/agents", Some("secreto")).starts_with("HTTP/1.1 401"));
-        // Lo que no es de la API no existe (todavía).
-        assert!(get("/", None).starts_with("HTTP/1.1 404"));
         let r = get("/api/nada", Some("Bearer secreto"));
         assert!(
             r.starts_with("HTTP/1.1 404") && r.contains(r#"{"error":"#),

@@ -278,6 +278,24 @@ viniera después llegaría al shell.
 `cwd` tiene que ser una ruta absoluta. Los errores llegan como `{"error": "..."}`: 401 sin token,
 404 si el agente o la tarea no existen y 400 para lo demás.
 
+### La app del celular
+
+`pastor serve` también sirve una app web en `/`: la lista de agentes con su estado, la pantalla de
+cada uno en vivo con una caja para escribirle y botones para las teclas (⏎, Esc, flechas, `1`/`2`/`3`,
+`y`/`n`, ^C), y las tareas. La primera vez pide el token y lo guarda solo en ese dispositivo.
+
+Para instalarla como app (PWA) el navegador exige HTTPS. Con Tailscale basta con publicar el puerto
+dentro de tu tailnet, sin abrir nada a internet:
+
+```sh
+pastor serve                              # en 127.0.0.1:7433
+sudo tailscale serve --bg 7433            # https://<máquina>.<tailnet>.ts.net → 127.0.0.1:7433
+tailscale serve status                    # la URL exacta
+```
+
+Abre esa URL en el celular (Chrome en Android) y elige *Instalar app* en el menú. Así el tráfico va
+cifrado y `pastor serve` sigue escuchando solo en `127.0.0.1`. Para quitarlo: `sudo tailscale serve --https=443 off`.
+
 ### Avisos en el celular con ntfy
 
 Los mismos avisos que salen en el escritorio («web te espera», «web terminó») pueden llegar al
@@ -410,7 +428,7 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [ ] Restaurar agentes después de reiniciar
 - [ ] Integraciones con Slack y Asana
 - [ ] Manejar agentes en otras máquinas por SSH
-- [ ] Desde el celular: API, avisos con ntfy y pantalla en vivo (hecho), una PWA y una terminal
+- [ ] Desde el celular: API, avisos con ntfy, pantalla en vivo y una PWA (hecho), y una terminal
   interactiva
 
 ## Contribuir
