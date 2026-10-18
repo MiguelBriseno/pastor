@@ -570,11 +570,25 @@ async fn stats(Shared(app): Shared<Arc<App>>) -> Response {
 async fn limits(Shared(app): Shared<Arc<App>>) -> Response {
     blocking(move || {
         let lock = || app.limits.lock().unwrap_or_else(PoisonError::into_inner);
-        // Sin el candado mientras se consulta la red: las demás consultas
-        // no esperan y sirven el dato de antes.
-        if lock().claim() {
-            let usage = limits::fetch();
-            lock().set(usage);
+        let mut cache = lock();
+        // La primera vez no hay nada que servir: se lee con el candado y las
+        // demás consultas esperan este dato en lugar de pedirlo también.
+        if cache.usage().is_empty() {
+            cache.refresh();
+            return Ok(json!(cache.usage()));
+        }
+        let claim = cache.claim();
+        drop(cache);
+        // Después, sin el candado mientras se consulta la red: las demás
+        // consultas no esperan y sirven el dato de antes.
+        if let Some(at) = claim {
+            match std::panic::catch_unwind(limits::fetch) {
+                Ok(usage) => lock().set(at, usage),
+                Err(p) => {
+                    lock().forget(at);
+                    std::panic::resume_unwind(p);
+                }
+            }
         }
         Ok(json!(lock().usage()))
     })
