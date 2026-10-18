@@ -559,6 +559,11 @@ pub struct TermSnapshot {
 /// Falla si no se pudo preguntar a tmux por los paneles.
 pub fn observe(state: &State, tracker: &mut Tracker) -> Result<HashMap<String, Snapshot>> {
     let mut all = tmux::panes()?;
+    // Que no recuerde para siempre a los agentes que ya no están (`pastor
+    // serve` puede correr semanas).
+    tracker
+        .seen
+        .retain(|id, _| state.agents.iter().any(|a| &a.id == id));
     let procs = Procs::default();
     // Primero si cada agente sigue en su panel, antes de las capturas, para que
     // `ps` vea lo mismo que acaba de reportar tmux.

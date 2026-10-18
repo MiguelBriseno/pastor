@@ -3,6 +3,8 @@ mod history;
 mod hooks;
 mod icons;
 mod ops;
+#[cfg(feature = "serve")]
+mod server;
 mod store;
 mod text;
 mod tmux;
@@ -91,6 +93,13 @@ enum Cmd {
     /// Gestiona tareas
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Sirve una API HTTP para manejar los agentes desde otro dispositivo
+    #[cfg(feature = "serve")]
+    Serve {
+        /// Dirección y puerto (p. ej. la IP de Tailscale)
+        #[arg(long, default_value = server::DEFAULT_BIND, value_name = "IP:PUERTO")]
+        bind: std::net::SocketAddr,
+    },
     /// Uso interno: lo llaman los hooks de Claude Code
     #[command(hide = true)]
     Hook { event: String },
@@ -249,6 +258,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Attach { agent }) => ops::attach(&agent),
+        #[cfg(feature = "serve")]
+        Some(Cmd::Serve { bind }) => server::run(bind),
         Some(Cmd::Term {
             agent, close: true, ..
         }) => ops::close_term(&agent),
