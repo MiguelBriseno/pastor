@@ -109,13 +109,23 @@ se ignoran.
 `agent::classify` decide en este orden:
 
 1. Si el panel está muerto, o el agente salió y en primer plano no hay un agente → **terminado**.
-2. Si en las últimas líneas de la pantalla hay un diálogo de permiso o confirmación
+2. Si hay un *inactivo* de hook (solo Claude Code) cuya huella es la pantalla actual → **inactivo**.
+   Va antes que los textos: el último mensaje del turno puede traer un `Do you want to…` o un
+   `(y/n)` sin que haya diálogo. Sin huella que coincida mandan los textos, por si es un diálogo
+   que no lanza hooks.
+3. Si en las últimas líneas de la pantalla hay un diálogo de permiso o confirmación
    (`do you want to`, `enter to confirm`…) → **esperando**.
-3. Si aparece `esc to interrupt` → **trabajando**.
-4. Si hay un estado de hook reciente (solo Claude Code), se usa ese. Un *esperando* del hook no
-   cuenta si al final de la pantalla está el aviso de turno interrumpido (`What should Claude do
-   instead?`): al rechazar un permiso con Esc, Claude Code no lanza `Stop`.
-5. Si la pantalla cambió en los últimos 3 segundos → **trabajando**; si no → **inactivo**.
+4. Si aparece `esc to interrupt` → **trabajando**.
+5. Si hay otro estado de hook vigente, se usa ese. Un *esperando* del hook no cuenta si al final de
+   la pantalla está el aviso de turno interrumpido (`What should Claude do instead?`): al rechazar
+   un permiso con Esc, Claude Code no lanza `Stop`. Un *trabajando* solo cuenta si la pantalla
+   cambió en los últimos 3 segundos.
+6. Si el agente tiene menos de 5 segundos → **iniciando**. Si no, si la pantalla cambió en los
+   últimos 3 segundos → **trabajando**; si no → **inactivo**.
+
+En Claude Code, para el observador la pantalla cambia cuando cambia su huella (ver abajo): lo que
+pasa en el pie, como escribir en el prompt o las pistas que pone y quita, no cuenta como actividad.
+En Codex y opencode, cuyo pie es distinto, cuenta la pantalla entera.
 
 Un estado de hook se considera viejo cuando la pantalla cambió después de él; esto evita que un
 *esperando* quede pegado después de que respondiste. Hay dos formas de saberlo:

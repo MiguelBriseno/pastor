@@ -180,17 +180,6 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     if obs.dead || obs.gone {
         return Status::Dead;
     }
-    let tail = tail_lower(obs.screen, 15);
-    if BLOCKED.iter().any(|p| tail.contains(p)) {
-        return Status::Blocked;
-    }
-    if WORKING.iter().any(|p| tail.contains(p)) {
-        return Status::Working;
-    }
-    let now = Utc::now();
-    let changed_recently = obs
-        .last_change
-        .is_some_and(|t| now - t < Duration::seconds(3));
     // Un hook vale mientras la pantalla no haya cambiado después de él: lo
     // dice quien la observa o, si acaba de empezar, la huella que guardó el
     // hook (con otro tamaño de panel no se pueden comparar).
@@ -201,6 +190,28 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
                 .as_ref()
                 .is_none_or(|s| s.size != obs.size || s.hash == obs.fingerprint)
     });
+    // Un `idle` cuya huella es la pantalla actual gana a los textos: el último
+    // mensaje de Claude puede traer un «Do you want to…» o un «(y/n)» sin que
+    // haya ningún diálogo. Sin huella que coincida mandan los textos, por si
+    // es un diálogo que no lanza hooks.
+    let same_screen = |h: &&HookStatus| {
+        h.screen
+            .as_ref()
+            .is_some_and(|s| s.size == obs.size && s.hash == obs.fingerprint)
+    };
+    if hook.filter(same_screen).is_some_and(|h| h.state == "idle") {
+        return Status::Idle;
+    }
+    let tail = tail_lower(obs.screen, 15);
+    if BLOCKED.iter().any(|p| tail.contains(p)) {
+        return Status::Blocked;
+    }
+    if WORKING.iter().any(|p| tail.contains(p)) {
+        return Status::Working;
+    }
+    let changed_recently = obs
+        .last_change
+        .is_some_and(|t| Utc::now() - t < Duration::seconds(3));
     let last = tail_lower(obs.screen, 8);
     let interrupted = INTERRUPTED.iter().any(|p| last.contains(p));
     match hook.map(|h| h.state.as_str()) {
@@ -331,6 +342,23 @@ mod tests {
         assert_eq!(classify(&activo, Some(&hook("idle", 0))), Status::Idle);
         // "working" sin cambios en pantalla no basta.
         assert_eq!(classify(&obs(""), Some(&hook("working", 30))), Status::Idle);
+    }
+
+    #[test]
+    fn un_idle_con_la_misma_pantalla_gana_a_los_textos() {
+        let o = obs("● Listo. Do you want to que siga con los tests? (y/n)\n\n───\n❯ \n───\n  ? for shortcuts");
+        let con_huella = |size: &str| HookStatus {
+            screen: Some(hooks::Screen {
+                hash: o.fingerprint,
+                size: size.into(),
+            }),
+            ..hook("idle", 0)
+        };
+        assert_eq!(classify(&o, Some(&con_huella("80x24"))), Status::Idle);
+        // Sin huella que coincida (o sin hook), el texto sigue mandando.
+        assert_eq!(classify(&o, Some(&con_huella("120x40"))), Status::Blocked);
+        assert_eq!(classify(&o, Some(&hook("idle", 0))), Status::Blocked);
+        assert_eq!(classify(&o, None), Status::Blocked);
     }
 
     #[test]
