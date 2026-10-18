@@ -416,6 +416,7 @@ main.agent-main > * { max-width: none; margin: 0; }
 .tools[open] summary::before { content: "▾ "; }
 .tools-list { display: flex; flex-direction: column; gap: 2px; padding: 2px 0 6px 14px; border-left: 1px solid var(--line); margin-left: 4px; }
 .tool { overflow-wrap: anywhere; }
+.older { min-height: 40px; margin-bottom: 12px; font-size: 12px; }
 
 /* ---------- token ---------- */
 

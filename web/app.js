@@ -527,10 +527,23 @@ function agentView(id) {
   const top = setTop({ title: id, back: "#/agents", actions: [more] });
   const screen = h("pre", { class: "term loading", text: "Cargando pantalla…" });
   termPrefs(screen);
-  const atBottom = () => screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
-  const jump = h("button", { type: "button", class: "jump", hidden: true, "aria-label": "Ir al final", onclick: () => (screen.scrollTop = screen.scrollHeight) }, icon("down"));
-  screen.addEventListener("scroll", () => (jump.hidden = atBottom()), { passive: true });
+  const { atBottom, jump, sync } = scrollFollow(screen);
   const note = h("div", { class: "note", role: "alert", hidden: true });
+
+  // Pantalla en vivo o conversación entera (solo de los agentes de Claude).
+  const termWrap = h("div", { class: "term-wrap" }, screen, jump);
+  const chat = conversationPane(id, () => agent);
+  const views = { screen: termWrap, chat: chat.el };
+  const switcher = h("div", { class: "view-switch", role: "tablist", "aria-label": "Vista" });
+  const show = (v, remember = true) => {
+    if (remember) store.set("pastor-agent-view", v);
+    for (const [k, el] of Object.entries(views)) el.hidden = k !== v;
+    screenVisible = v === "screen";
+    if (screenVisible) pollScreen();
+    chat.active(v === "chat");
+    switcher.replaceChildren(...[["screen", "Pantalla"], ["chat", "Conversación"]].map(([k, label]) =>
+      h("button", { type: "button", role: "tab", "aria-selected": String(k === v), class: k === v ? "on" : "", text: label, onclick: () => show(k) })));
+  };
 
   let gone = false;
   let checking = false;
@@ -556,6 +569,11 @@ function agentView(id) {
     agent = a;
     top.title.textContent = a.name;
     top.subtitle.replaceChildren(pill(a.status, a.status_label), h("span", { class: "ellipsis", text: shortPath(a.cwd) }));
+    if (a.kind !== "claude" && !switcher.hidden) {
+      switcher.hidden = true;
+      // Después de armar la vista: esto puede correr antes de que exista `pollScreen`.
+      queueMicrotask(() => show("screen", false));
+    }
   });
 
   let first = true;
@@ -581,7 +599,7 @@ function agentView(id) {
       screen.textContent = text;
       if (stick) screen.scrollTop = screen.scrollHeight;
       first = false;
-      jump.hidden = atBottom();
+      sync();
     } catch (e) {
       if (e instanceof Unauthorized) return attempt(() => { throw e; });
       // Debajo, sin tapar lo último que se vio: suele ser lo que había que leer.
@@ -605,7 +623,7 @@ function agentView(id) {
   let queue = Promise.resolve();
   const post = (path, body) => (queue = queue.then(() => attempt(async () => {
     await api("POST", `/agents/${encodeURIComponent(id)}${path}`, body);
-    setTimeout(pollScreen, 300);
+    setTimeout(screenVisible ? pollScreen : chat.refresh, 300);
     return true;
   })));
 
@@ -691,20 +709,6 @@ function agentView(id) {
     );
   }
 
-  const termWrap = h("div", { class: "term-wrap" }, screen, jump);
-  const chat = conversationPane(id, () => agent);
-  const views = { screen: termWrap, chat: chat.el };
-  const switcher = h("div", { class: "view-switch", role: "tablist", "aria-label": "Vista" });
-  const show = (v) => {
-    store.set("pastor-agent-view", v);
-    for (const [k, el] of Object.entries(views)) el.hidden = k !== v;
-    screenVisible = v === "screen";
-    if (screenVisible) pollScreen();
-    chat.active(v === "chat");
-    switcher.replaceChildren(...[["screen", "Pantalla"], ["chat", "Conversación"]].map(([k, label]) =>
-      h("button", { type: "button", role: "tab", "aria-selected": String(k === v), class: k === v ? "on" : "", text: label, onclick: () => show(k) })));
-  };
-
   main.className = "agent-main";
   main.append(switcher, termWrap, chat.el, h("div", { class: "composer" }, note, keys, form));
   show(store.get("pastor-agent-view") === "chat" ? "chat" : "screen");
@@ -715,7 +719,7 @@ function agentView(id) {
  * y **negritas**. Todo con nodos de texto, nunca como HTML. */
 function markdown(text) {
   const out = [];
-  text.split(/^```[^\n]*\n?/m).forEach((part, i) => {
+  text.split(/^[ \t]*(?:```|~~~)[^\n]*\n?/m).forEach((part, i) => {
     if (i % 2) {
       out.push(h("pre", { class: "md-code", text: part.replace(/\n$/, "") }));
       return;
@@ -731,73 +735,113 @@ function markdown(text) {
   return out;
 }
 
+/** Seguir el final de `el` al llegar contenido: el botón para bajar
+ * aparece si subiste a leer. */
+function scrollFollow(el) {
+  const atBottom = () => el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+  const jump = h("button", { type: "button", class: "jump", hidden: true, "aria-label": "Ir al final", onclick: () => (el.scrollTop = el.scrollHeight) }, icon("down"));
+  const sync = () => (jump.hidden = atBottom());
+  el.addEventListener("scroll", sync, { passive: true });
+  return { atBottom, jump, sync };
+}
+
 const hhmm = (iso) => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
 /** La conversación entera del agente, de su transcripción de Claude Code: la
- * pantalla solo tiene lo visible. Pide solo lo nuevo mientras está a la vista. */
+ * pantalla solo tiene lo visible. Llegan los últimos mensajes; los anteriores,
+ * al pedirlos. Mientras está a la vista pide solo lo nuevo. */
 function conversationPane(id, getAgent) {
   const list = h("div", { class: "chat" });
-  const scroller = h("div", { class: "chat-scroll" }, list);
-  const atBottom = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60;
-  const jump = h("button", { type: "button", class: "jump", hidden: true, "aria-label": "Ir al final", onclick: () => (scroller.scrollTop = scroller.scrollHeight) }, icon("down"));
-  scroller.addEventListener("scroll", () => (jump.hidden = atBottom()), { passive: true });
+  const older = h("button", { type: "button", class: "btn block older", hidden: true, text: "Ver mensajes anteriores", onclick: () => loadOlder() });
+  const scroller = h("div", { class: "chat-scroll" }, h("div", { class: "chat" }, older), list);
+  const { atBottom, jump, sync } = scrollFollow(scroller);
   const el = h("div", { class: "chat-wrap" }, scroller, jump);
   let session = "";
+  let first = 0;
   let total = 0;
   let visible = false;
-  let loaded = false;
 
-  /** Las herramientas seguidas van juntas en un grupo que se abre al tocarlo. */
-  const addTool = (m) => {
-    let group = list.lastElementChild;
-    if (!group?.classList.contains("tools")) {
-      group = h("details", { class: "tools" }, h("summary"), h("div", { class: "tools-list" }));
-      list.append(group);
+  /** Los nodos de `messages`, con las herramientas seguidas juntas en un
+   * grupo que se abre al tocarlo. `last` es el nodo previo, por si el grupo
+   * continúa. */
+  const render = (messages, last) => {
+    const out = [];
+    for (const m of messages) {
+      if (m.role !== "tool") {
+        out.push(h("div", { class: "msg " + m.role },
+          markdown(m.text),
+          m.role === "user" && m.at && h("span", { class: "msg-time", text: hhmm(m.at) })));
+        continue;
+      }
+      let group = out.length ? out[out.length - 1] : last;
+      if (!group?.classList?.contains("tools")) {
+        group = h("details", { class: "tools" }, h("summary"), h("div", { class: "tools-list" }));
+        out.push(group);
+      }
+      const tools = group.querySelector(".tools-list");
+      tools.append(h("div", { class: "tool", text: m.text }));
+      const n = tools.childElementCount;
+      group.querySelector("summary").textContent = `${n === 1 ? "1 herramienta" : `${n} herramientas`} · ${m.text}`;
     }
-    group.querySelector(".tools-list").append(h("div", { class: "tool", text: m.text }));
-    const n = group.querySelector(".tools-list").childElementCount;
-    group.querySelector("summary").textContent = `${n === 1 ? "1 herramienta" : `${n} herramientas`} · ${m.text}`;
+    return out;
   };
-  const add = (m) => {
-    if (m.role === "tool") return addTool(m);
-    list.append(h("div", { class: "msg " + m.role },
-      markdown(m.text),
-      m.role === "user" && m.at && h("span", { class: "msg-time", text: hhmm(m.at) })));
-  };
+
+  const placeholder = (title, text) => list.replaceChildren(empty("bot", title, text));
+  const url = (q) => `/agents/${encodeURIComponent(id)}/conversation${q}`;
 
   const poll = async () => {
     if (!visible) return;
     const q = session ? `?session=${encodeURIComponent(session)}&after=${total}` : "";
-    const data = await attempt(() => api("GET", `/agents/${encodeURIComponent(id)}/conversation${q}`));
+    const data = await attempt(() => api("GET", url(q)));
     if (!data) return;
     if (!data.available) {
       const kind = getAgent()?.kind;
-      list.replaceChildren(empty("bot", "Sin conversación todavía",
-        kind && kind !== "claude"
-          ? "Por ahora solo se ve la conversación de los agentes de Claude."
-          : "Aparece cuando el agente responda por primera vez."));
+      placeholder("Sin conversación todavía", kind && kind !== "claude"
+        ? "Por ahora solo se ve la conversación de los agentes de Claude."
+        : "Aparece cuando el agente responda por primera vez.");
       session = "";
-      total = 0;
+      older.hidden = true;
       return;
     }
-    const stick = !loaded || atBottom();
-    // Otra sesión (`/clear`) o la primera vez: desde el principio.
-    if (data.session !== session || data.from === 0) list.replaceChildren();
-    session = data.session;
-    total = data.total;
+    const fresh = data.session !== session;
+    const stick = fresh || atBottom();
+    // Otra sesión (`/clear`) o una transcripción reescrita: desde cero.
+    if (fresh) {
+      list.replaceChildren();
+      session = data.session;
+      first = data.from;
+      older.hidden = first === 0;
+    }
+    total = data.to;
     if (data.messages.length) list.querySelector(":scope > .empty")?.remove();
-    data.messages.forEach(add);
-    if (!list.childElementCount) list.append(empty("bot", "Sin mensajes", "La conversación aún está vacía."));
-    loaded = true;
+    list.append(...render(data.messages, list.lastElementChild));
+    if (!list.childElementCount) placeholder("Sin mensajes", "La conversación aún está vacía.");
     if (stick) scroller.scrollTop = scroller.scrollHeight;
-    jump.hidden = atBottom();
+    sync();
+    // Si quedaron mensajes nuevos por traer, que no esperen a la siguiente vuelta.
+    if (data.to < data.total) setTimeout(tick, 0);
   };
+
+  const loadOlder = async () => {
+    older.disabled = true;
+    const data = await attempt(() => api("GET", url(`?session=${encodeURIComponent(session)}&before=${first}`)));
+    older.disabled = false;
+    if (!data?.available || data.session !== session) return tick();
+    // Arriba, sin mover lo que estás leyendo.
+    const before = scroller.scrollHeight;
+    list.prepend(...render(data.messages));
+    scroller.scrollTop += scroller.scrollHeight - before;
+    first = data.from;
+    older.hidden = first === 0;
+  };
+
   const tick = every(3000, poll);
   return {
     el,
+    refresh: () => tick(),
     active(on) {
       visible = on;
       if (on) tick();

@@ -23,6 +23,17 @@ pub struct Message {
     pub at: Option<String>,
 }
 
+/// Comienzos de lo que Claude Code inyecta como mensaje del usuario.
+const INJECTED: [&str; 7] = [
+    "<command-",
+    "<local-command-",
+    "<bash-",
+    "<system-reminder>",
+    "<task-notification>",
+    "<user-prompt-submit-hook>",
+    "<persisted-output>",
+];
+
 /// Los mensajes de una línea del JSONL: los tuyos, las respuestas del agente
 /// y una línea por herramienta. Fuera el razonamiento, los resultados de las
 /// herramientas, los subagentes y los registros internos.
@@ -30,7 +41,18 @@ pub fn parse_line(line: &str) -> Vec<Message> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
     };
-    if v["isSidechain"].as_bool() == Some(true) || v["isMeta"].as_bool() == Some(true) {
+    // Subagentes, registros internos y el resumen que Claude Code escribe al
+    // compactar (llega como un mensaje tuyo).
+    let flag = |k: &str| v[k].as_bool() == Some(true);
+    if [
+        "isSidechain",
+        "isMeta",
+        "isCompactSummary",
+        "isVisibleInTranscriptOnly",
+    ]
+    .iter()
+    .any(|k| flag(k))
+    {
         return Vec::new();
     }
     let at = v["timestamp"].as_str().map(String::from);
@@ -56,8 +78,9 @@ pub fn parse_line(line: &str) -> Vec<Message> {
             };
             let text = text.trim();
             // Lo que Claude Code mete como si lo hubieras escrito tú: avisos
-            // del sistema, salidas de comandos, notificaciones…
-            if text.is_empty() || text.starts_with('<') {
+            // del sistema, salidas de comandos, notificaciones… Solo esas
+            // etiquetas: un mensaje tuyo puede empezar con `<div>`.
+            if text.is_empty() || INJECTED.iter().any(|t| text.starts_with(t)) {
                 return Vec::new();
             }
             vec![msg("user", text.to_string())]
@@ -117,6 +140,8 @@ pub struct Reader {
     /// El final de una línea que aún no termina de escribirse.
     rest: Vec<u8>,
     pub messages: Vec<Message>,
+    /// Cuántas veces empezó de nuevo porque el archivo se reescribió.
+    pub resets: u32,
 }
 
 impl Reader {
@@ -128,6 +153,7 @@ impl Reader {
         if path != self.path || len < self.offset {
             *self = Reader {
                 path: path.to_path_buf(),
+                resets: self.resets + 1,
                 ..Reader::default()
             };
         }
@@ -161,6 +187,8 @@ mod tests {
             r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"a b"}]}}"#,
             r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagente"}]}}"#,
             r#"{"type":"api-request","foo":1}"#,
+            r#"{"type":"user","isCompactSummary":true,"message":{"content":"This session is being continued"}}"#,
+            r#"{"type":"user","message":{"content":"<div> no se ve bien"}}"#,
             "no es json",
         ];
         let got: Vec<_> = lines.iter().flat_map(|l| parse_line(l)).collect();
@@ -171,6 +199,7 @@ mod tests {
                 ("user", "hola"),
                 ("assistant", "Listo."),
                 ("tool", "Bash · Lista archivos"),
+                ("user", "<div> no se ve bien"),
             ]
         );
     }
@@ -201,6 +230,7 @@ mod tests {
         r.update(&path).unwrap();
         let texts: Vec<_> = r.messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["otra"]);
+        assert_eq!(r.resets, 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

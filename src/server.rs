@@ -32,7 +32,7 @@ struct App {
     /// Para saber si la pantalla de un agente cambió entre dos consultas.
     tracker: Mutex<Tracker>,
     /// La conversación leída de cada agente, para leer solo lo nuevo.
-    transcripts: Mutex<HashMap<String, transcript::Reader>>,
+    transcripts: Mutex<HashMap<String, Arc<Mutex<transcript::Reader>>>>,
 }
 
 /// El token sale de `PASTOR_TOKEN` o del archivo, nunca de un argumento:
@@ -391,17 +391,22 @@ async fn screen(Path(id): Path<String>, Query(size): Query<Size>) -> Response {
     .await
 }
 
-/// Hasta dónde llegó la consulta anterior a `/conversation`.
+/// Qué parte de la conversación se pide. Sin nada, los últimos mensajes;
+/// con `after`, los que siguen (lo nuevo); con `before`, los anteriores.
+/// Ambos valen solo para la `session` que devolvió la consulta anterior.
 #[derive(Deserialize)]
 struct Since {
     session: Option<String>,
     after: Option<usize>,
+    before: Option<usize>,
 }
 
-/// La conversación entera de un agente de Claude, de su transcripción. Con
-/// `session` y `after` (lo que devolvió la consulta anterior), solo lo nuevo.
-/// `available: false` si aún no se sabe dónde está (Codex y OpenCode no la
-/// dan, y Claude Code la da en su primer hook).
+/// Cuántos mensajes van como máximo en una respuesta.
+const PAGE: usize = 300;
+
+/// La conversación de un agente de Claude, de su transcripción, por partes.
+/// `available: false` si aún no se sabe dónde está o ya no existe (Codex y
+/// OpenCode no la dan, y Claude Code la da en su primer hook).
 async fn conversation(
     Shared(app): Shared<Arc<App>>,
     Path(id): Path<String>,
@@ -410,33 +415,45 @@ async fn conversation(
     blocking(move || {
         let state = State::load()?;
         let agent = state.find_agent(&id)?;
-        let Some(path) = transcript::path_for(&agent.id) else {
+        let Some(path) = transcript::path_for(&agent.id).filter(|p| p.is_file()) else {
             return Ok(json!({ "available": false }));
         };
-        let session = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut readers = app
-            .transcripts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        readers.retain(|k, _| state.agents.iter().any(|a| &a.id == k));
-        let r = readers.entry(agent.id.clone()).or_default();
-        r.update(&path)?;
-        let from = match since {
-            Since {
-                session: Some(s),
-                after: Some(n),
-            } if s == session => n.min(r.messages.len()),
-            _ => 0,
+        // Uno por agente: leer la primera vez una transcripción larga no
+        // detiene las consultas de los demás.
+        let reader = {
+            let mut readers = app
+                .transcripts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            readers.retain(|k, _| state.agents.iter().any(|a| &a.id == k));
+            readers.entry(agent.id.clone()).or_default().clone()
         };
+        let mut r = reader.lock().unwrap_or_else(PoisonError::into_inner);
+        r.update(&path)?;
+        // Si la transcripción se reescribió, lo que tiene el cliente ya no
+        // vale: con otra `session`, la app empieza de nuevo.
+        let session = format!(
+            "{}.{}",
+            path.file_stem().unwrap_or_default().to_string_lossy(),
+            r.resets
+        );
+        let total = r.messages.len();
+        let same = since.session.as_deref() == Some(session.as_str());
+        let (from, to) = match since {
+            Since { after: Some(n), .. } if same => (n.min(total), total),
+            Since {
+                before: Some(n), ..
+            } if same => (n.min(total).saturating_sub(PAGE), n.min(total)),
+            _ => (total.saturating_sub(PAGE), total),
+        };
+        let to = to.min(from + PAGE);
         Ok(json!({
             "available": true,
             "session": session,
             "from": from,
-            "total": r.messages.len(),
-            "messages": &r.messages[from..],
+            "to": to,
+            "total": total,
+            "messages": &r.messages[from..to],
         }))
     })
     .await
