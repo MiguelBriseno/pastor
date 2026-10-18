@@ -10,8 +10,8 @@ const KIND = {
 };
 const KINDS = Object.keys(KIND);
 const AGENT_GROUPS = [["blocked", "Te esperan"], ["working", "Trabajando"], ["idle", "Inactivos"], ["dead", "Terminados"]];
-const TASKS = [["todo", "Pendientes"], ["in_progress", "En curso"], ["review", "Por revisar"], ["done", "Hechas"]];
-const TASK_LABEL = { todo: "pendiente", in_progress: "en curso", review: "por revisar", done: "hecha" };
+const TASKS = [["todo", "Pendientes", "pendiente"], ["in_progress", "En curso", "en curso"], ["review", "Por revisar", "por revisar"], ["done", "Hechas", "hecha"]];
+const TASK_LABEL = Object.fromEntries(TASKS.map(([s, , one]) => [s, one]));
 const KEYS = [
   ["Escape", "Esc"], ["Enter", "⏎"], ["Up", "↑"], ["Down", "↓"], ["Left", "←"], ["Right", "→"],
   ["Tab", "Tab"], ["BTab", "⇧Tab"], ["Space", "Espacio"], ["1", "1"], ["2", "2"], ["3", "3"],
@@ -75,9 +75,13 @@ let toastTimer;
 function toast(msg, error = false) {
   toastEl.textContent = msg;
   toastEl.classList.toggle("error", error);
-  try { toastEl.hidePopover(); toastEl.showPopover(); } catch { toastEl.hidden = false; }
+  toastEl.hidden = false;
+  try { toastEl.hidePopover(); toastEl.showPopover(); } catch {}
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { try { toastEl.hidePopover(); } catch { toastEl.hidden = true; } }, 3500);
+  toastTimer = setTimeout(() => {
+    toastEl.hidden = true;
+    try { toastEl.hidePopover(); } catch {}
+  }, 3500);
 }
 
 class Unauthorized extends Error {}
@@ -139,12 +143,16 @@ async function attempt(fn) {
 
 function ago(iso) {
   const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (Number.isNaN(s)) return "";
   if (s < 60) return "ahora";
   if (s < 3600) return `${Math.floor(s / 60)} min`;
   if (s < 86400) return `${Math.floor(s / 3600)} h`;
   return `${Math.floor(s / 86400)} d`;
 }
-const since = (iso) => (ago(iso) === "ahora" ? "ahora" : "hace " + ago(iso));
+function since(iso) {
+  const a = ago(iso);
+  return a && a !== "ahora" ? "hace " + a : a;
+}
 const shortPath = (p) => p.replace(/^\/home\/[^/]+(?=\/|$)/, "~");
 
 function recentCwds() {
@@ -284,6 +292,13 @@ function loop(ms, fn) {
   };
 }
 
+/** Cambia la lista sin esperar a la siguiente consulta. Una consulta que ya
+ * iba en camino traería la lista de antes: `version` hace que se descarte. */
+function changeAgents(list) {
+  feed.version++;
+  setAgents(list);
+}
+
 /** Un `loop` que vive lo que la pantalla actual. */
 function every(ms, fn) {
   const l = loop(ms, fn);
@@ -293,7 +308,7 @@ function every(ms, fn) {
 
 /** Los agentes se consultan en un solo lugar para todas las pantallas (y la
  * pestaña muestra cuántos te esperan aunque estés en Tareas). */
-const feed = { agents: null, subs: new Set() };
+const feed = { agents: null, json: "", version: 0, subs: new Set() };
 
 function watchAgents(fn) {
   feed.subs.add(fn);
@@ -302,6 +317,10 @@ function watchAgents(fn) {
 }
 
 function setAgents(list) {
+  // Redibujar sin cambios cambia las tarjetas bajo el dedo y se pierde el toque.
+  const json = JSON.stringify(list);
+  if (json === feed.json) return;
+  feed.json = json;
   feed.agents = list;
   const waiting = list.filter((a) => a.status === "blocked").length;
   const count = tabs.querySelector(".count");
@@ -375,7 +394,10 @@ function tokenView() {
       onsubmit: once(async () => {
         store.set("pastor-token", input.value.trim());
         const agents = await attempt(() => api("GET", "/agents"));
-        if (!agents) return;
+        if (!agents) {
+          store.set("pastor-token", "");
+          return;
+        }
         setAgents(agents);
         route();
       }),
@@ -448,7 +470,7 @@ function newAgentSheet() {
       store.set("pastor-kind", body.kind);
       // Ya en la lista, para que su pantalla no lo dé por inexistente
       // antes de la siguiente consulta.
-      setAgents([...(feed.agents || []), { ...a, status: "starting", status_label: "iniciando" }]);
+      changeAgents([...(feed.agents || []), { ...a, status: "starting", status_label: "iniciando" }]);
       d.close();
       toast(`${a.name} creado`);
       location.hash = "#/agent/" + encodeURIComponent(a.id);
@@ -477,13 +499,27 @@ function agentView(id) {
   screen.addEventListener("scroll", () => (jump.hidden = atBottom()), { passive: true });
   const note = h("div", { class: "note", role: "alert", hidden: true });
 
+  let gone = false;
+  let checking = false;
+  cleanup.push(() => (gone = true));
+  // La lista guardada puede ser de antes de que existiera el agente (recién
+  // creado o asignado, o la app estuvo en segundo plano): se confirma con
+  // el servidor antes de darlo por perdido.
+  const confirmGone = async () => {
+    if (checking) return;
+    checking = true;
+    const fresh = await attempt(() => api("GET", "/agents"));
+    checking = false;
+    if (gone || !fresh) return;
+    if (fresh.some((x) => x.id === id)) return changeAgents(fresh);
+    gone = true;
+    toast("Ese agente ya no existe", true);
+    location.hash = "#/agents";
+  };
   watchAgents((agents) => {
+    if (gone) return;
     const a = agents.find((x) => x.id === id);
-    if (!a) {
-      toast("Ese agente ya no existe", true);
-      location.hash = "#/agents";
-      return;
-    }
+    if (!a) return confirmGone();
     agent = a;
     top.title.textContent = a.name;
     top.subtitle.replaceChildren(pill(a.status, a.status_label), h("span", { class: "ellipsis", text: shortPath(a.cwd) }));
@@ -589,7 +625,9 @@ function agentView(id) {
           const name = agent?.name || id;
           if (!(await ask(`¿Terminar ${name}?`, "Se cierra su sesión de tmux y lo que esté haciendo.", "Terminar", true))) return;
           if (!(await attempt(() => api("DELETE", `/agents/${encodeURIComponent(id)}`)))) return;
-          setAgents((feed.agents || []).filter((a) => a.id !== id));
+          gone = true;
+          store.set(draftKey, "");
+          changeAgents((feed.agents || []).filter((a) => a.id !== id));
           toast(`${name} terminado`);
           location.hash = "#/agents";
         }, "danger"),
@@ -651,7 +689,15 @@ function tasksView() {
   };
 
   main.append(chips, list);
-  reload = every(10000, () => attempt(async () => { tasks = await api("GET", "/tasks"); draw(); }));
+  let tasksJson = "";
+  reload = every(10000, () => attempt(async () => {
+    const list = await api("GET", "/tasks");
+    const json = JSON.stringify(list);
+    if (json === tasksJson) return;
+    tasksJson = json;
+    tasks = list;
+    draw();
+  }));
   watchAgents(draw);
 }
 
@@ -743,9 +789,22 @@ function assignSheet(t, reload) {
 
 const agentsLoop = loop(4000, async () => {
   if (!store.get("pastor-token")) return;
+  const version = feed.version;
   const list = await attempt(() => api("GET", "/agents"));
-  if (list) setAgents(list);
+  if (!list || version !== feed.version) return;
+  setAgents(list);
+  pruneDrafts(list);
 });
+
+/** Los borradores de agentes que ya no existen. */
+function pruneDrafts(list) {
+  const ids = new Set(list.map((a) => "pastor-draft-" + a.id));
+  try {
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith("pastor-draft-") && !ids.has(k))
+      .forEach((k) => localStorage.removeItem(k));
+  } catch {}
+}
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 route();
