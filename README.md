@@ -24,7 +24,8 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   aprobación o respuesta), *inactivo* o *terminado*.
 - **Terminal al lado de cada agente.** Abre una terminal junto al agente, en su mismo directorio,
   para correr por ejemplo `npm run dev` mientras el agente hace cambios.
-- **Notificaciones de escritorio** cuando un agente te necesita o termina su trabajo.
+- **Notificaciones de escritorio** cuando un agente te necesita o termina su trabajo, y también
+  en el celular con [ntfy](https://ntfy.sh) si lo configuras.
 - **Tareas.** Crea tareas y asígnalas a un agente existente o a uno nuevo. Cuando el agente
   termina, la tarea pasa sola a *por revisar*.
 - **Historial** desde que instalaste pastor: sesiones, tareas, mensajes, tiempos y actividad
@@ -267,6 +268,21 @@ curl -H "Authorization: Bearer $(cat ~/.local/share/pastor/serve-token)" localho
 `cwd` tiene que ser una ruta absoluta. Los errores llegan como `{"error": "..."}`: 401 sin token,
 404 si el agente o la tarea no existen y 400 para lo demás.
 
+### Avisos en el celular con ntfy
+
+Los mismos avisos que salen en el escritorio («web te espera», «web terminó») pueden llegar al
+celular con la app de [ntfy](https://ntfy.sh). No hace falta el feature `serve`: basta con `curl`
+y definir el tema antes de abrir pastor.
+
+```sh
+export PASTOR_NTFY_URL=https://ntfy.sh/un-tema-largo-y-dificil-de-adivinar
+export PASTOR_NTFY_TOKEN=tk_...   # solo si el tema pide token (servidor propio o ntfy Pro)
+pastor
+```
+
+En ntfy.sh cualquiera que conozca el nombre del tema lee sus avisos, así que elige uno que no se
+pueda adivinar. Los avisos los manda la interfaz, así que tiene que estar abierta.
+
 ## Iconos y fuente
 
 pastor usa iconos de [Nerd Font](https://www.nerdfonts.com): una oveja como logo, un icono por
@@ -384,7 +400,7 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [ ] Restaurar agentes después de reiniciar
 - [ ] Integraciones con Slack y Asana
 - [ ] Manejar agentes en otras máquinas por SSH
-- [ ] Desde el celular: API (hecho), avisos con ntfy, pantalla en vivo, una PWA y una terminal
+- [ ] Desde el celular: API y avisos con ntfy (hecho), pantalla en vivo, una PWA y una terminal
   interactiva
 
 ## Contribuir

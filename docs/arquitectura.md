@@ -39,6 +39,7 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/tmux.rs` | Capa fina sobre el binario `tmux` |
 | `src/store.rs` | Modelo de datos (`Agent`, `Task`) y persistencia en `state.json` |
 | `src/history.rs` | Historial de eventos en `history.jsonl` y las estadísticas de la pestaña Historial |
+| `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
 | `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
 
 ## Decisiones importantes
@@ -178,6 +179,13 @@ cada operación en un hilo de `spawn_blocking` porque tocan tmux y el disco. Gua
 entre consultas, así un cliente que pregunta cada pocos segundos ve *trabajando* como la TUI.
 El token se compara sin cortar en el primer byte distinto, y su archivo se crea ya con permisos
 0600 (`write_atomic_mode` crea el temporal con el modo, no lo cambia después).
+
+### Los avisos al celular van con `curl`
+
+ntfy recibe un POST con el texto. Para eso basta el `curl` del sistema, como `notify-send` para el
+escritorio, en vez de un cliente HTTP con TLS en el binario. La URL, el token y el mensaje van por
+la entrada de `curl` (`-K -`), no como argumentos, para que el token no se vea en `ps`. El hilo de
+avisos lanza `notify-send` y `curl` a la vez y espera a los dos con un límite.
 
 ## Cómo agregar un nuevo tipo de agente
 

@@ -32,6 +32,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::agent::{Kind, Status};
 use crate::history::{self, Stats};
 use crate::icons::{self, pad};
+use crate::ntfy;
 use crate::ops::{self, AssignTarget, Snapshot, Tracker};
 use crate::store::{Agent, State, Task, TaskStatus};
 use crate::text::{self, truncate};
@@ -1770,14 +1771,23 @@ fn notify(msg: &str) {
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn show_notice(msg: &str) {
-    let child = notify_command(msg)
+    // Los dos a la vez, para que uno colgado no retrase al otro.
+    let desktop = notify_command(msg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    if let Ok(child) = child {
+    let phone = ntfy::publish(msg);
+    if let Ok(child) = desktop {
         wait_or_kill(child, NOTICE_TIMEOUT);
     }
+    if let Some(child) = phone {
+        // curl ya corta a los 10 s (`-m`); esto es por si acaso.
+        wait_or_kill(child, NTFY_TIMEOUT);
+    }
 }
+
+/// Lo que tarda como mucho un aviso a ntfy.
+const NTFY_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Espera a `child` hasta `timeout`; si se pasa, lo mata para que no retrase
 /// a los siguientes. `false` si hubo que matarlo.
