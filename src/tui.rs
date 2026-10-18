@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -30,10 +29,10 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::agent::{Kind, Status};
+use crate::avisos::Notifier;
 use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::limits::{self, Usage};
-use crate::ntfy;
 use crate::ops::{self, AssignTarget, Snapshot, Tracker};
 use crate::store::{Agent, State, Task, TaskStatus};
 use crate::text::{self, truncate};
@@ -1776,7 +1775,7 @@ impl Pass {
 #[derive(Default)]
 struct Watch {
     tracker: Tracker,
-    status: HashMap<String, Status>,
+    notifier: Notifier,
     history: history::Tail,
     limits: limits::Cache,
     /// Día de las últimas estadísticas: al cambiar se mueve el gráfico.
@@ -1801,17 +1800,12 @@ impl Watch {
             }
         };
         self.failing = false;
-        // Avisar desde aquí y no desde la TUI hace que lleguen también
-        // mientras estás dentro de un agente (la TUI está suspendida).
-        let mut flashes = Vec::new();
-        for (msg, finished) in transitions(&state, &self.status, &snaps) {
-            notify(&msg);
-            flashes.push(msg);
-            if let Some(Err(e)) = finished.map(|id| ops::finish_turn(&id)) {
-                flashes.push(format!("Error: {e:#}"));
-            }
-        }
-        self.status = snaps.iter().map(|(id, s)| (id.clone(), s.status)).collect();
+        // Desde este hilo, y no desde el de la TUI, los avisos llegan también
+        // mientras estás dentro de un agente (la TUI está suspendida). Los
+        // manda el `Notifier` solo si tiene el candado de los avisos; si no,
+        // esta TUI solo los muestra en su pie.
+        let (mut flashes, errors) = self.notifier.pass(&state, &snaps);
+        flashes.extend(errors.iter().map(|e| format!("Error: {e:#}")));
         let today = Local::now().date_naive();
         let changed = self.history.refresh() || self.day != Some(today);
         self.day = Some(today);
@@ -1823,33 +1817,6 @@ impl Watch {
             flashes,
         })
     }
-}
-
-/// Avisos por los cambios de estado de `old` a `new`, cada uno con el agente
-/// cuya tarea hay que pasar a revisión, si la tiene.
-fn transitions(
-    state: &State,
-    old: &HashMap<String, Status>,
-    new: &HashMap<String, Snapshot>,
-) -> Vec<(String, Option<String>)> {
-    let mut events = Vec::new();
-    for a in &state.agents {
-        let (Some(&old), Some(new)) = (old.get(&a.id), new.get(&a.id)) else {
-            continue;
-        };
-        match (old, new.status) {
-            (o, Status::Blocked) if o != Status::Blocked => {
-                events.push((format!("{} necesita tu atención", a.name), None));
-            }
-            (Status::Working, Status::Idle | Status::Dead) => {
-                // Sin tarea no hay nada que pasar a revisión.
-                let id = a.task.is_some().then(|| a.id.clone());
-                events.push((format!("{} terminó", a.name), id));
-            }
-            _ => {}
-        }
-    }
-    events
 }
 
 /// Hilo que mira los paneles de tmux (capturas y `ps`) y el historial cada
@@ -1868,7 +1835,7 @@ impl Observer {
     /// en este hilo tumbaría la TUI; en el suyo solo lo vuelve a reiniciar.
     fn spawn(status: HashMap<String, Status>, look_now: bool) -> Self {
         let mut watch = Watch {
-            status,
+            notifier: Notifier::for_tui(status),
             ..Watch::default()
         };
         let latest = Arc::new(Mutex::new(if look_now { watch.look() } else { None }));
@@ -2029,100 +1996,6 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("pánico")
-}
-
-/// Muestra un aviso del sistema. Los lanza, de uno en uno, un único hilo que
-/// espera a cada proceso (para que no quede zombi) sin frenar al observador.
-fn notify(msg: &str) {
-    static QUEUE: Mutex<Option<Sender<String>>> = Mutex::new(None);
-    let mut queue = QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-    let msg = match queue.as_ref().map(|tx| tx.send(msg.to_string())) {
-        Some(Ok(())) => return,
-        Some(Err(e)) => e.0,
-        None => msg.to_string(),
-    };
-    // Sin hilo todavía, o murió: se lanza otro. Si no se puede, se intentará
-    // con el próximo aviso.
-    let (tx, rx) = mpsc::channel::<String>();
-    let spawned = std::thread::Builder::new()
-        .name("avisos".into())
-        .spawn(move || {
-            for msg in rx {
-                show_notice(&msg);
-            }
-        });
-    if spawned.is_ok() && tx.send(msg).is_ok() {
-        *queue = Some(tx);
-    }
-}
-
-/// Cuánto puede tardar un aviso antes de darlo por colgado (notify-send
-/// espera hasta 25 s si nadie atiende las notificaciones).
-const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn show_notice(msg: &str) {
-    // Los dos a la vez, para que uno colgado no retrase al otro.
-    let desktop = notify_command(msg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let phone = ntfy::publish(msg);
-    if let Ok(child) = desktop {
-        wait_or_kill(child, NOTICE_TIMEOUT);
-    }
-    if let Some(mut child) = phone {
-        // curl ya corta a los 10 s (`-m`); esto es por si acaso.
-        let stderr = child.stderr.take();
-        ntfy::check(stderr, wait_or_kill(child, NTFY_TIMEOUT));
-    }
-}
-
-/// Lo que tarda como mucho un aviso a ntfy.
-const NTFY_TIMEOUT: Duration = Duration::from_secs(12);
-
-/// Espera a `child` hasta `timeout`; si se pasa, lo mata para que no retrase
-/// a los siguientes. Cómo terminó, o `None` si hubo que matarlo.
-fn wait_or_kill(mut child: Child, timeout: Duration) -> Option<ExitStatus> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if start.elapsed() <= timeout => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn notify_command(msg: &str) -> Command {
-    // El mensaje va como argumento y no dentro del AppleScript, para no
-    // tener que escaparlo. El título va antes: si el mensaje empieza con `-`
-    // (el nombre del agente), osascript ya no lo toma por una opción.
-    let mut cmd = Command::new("osascript");
-    cmd.args([
-        "-e",
-        "on run argv",
-        "-e",
-        "display notification (item 2 of argv) with title (item 1 of argv)",
-        "-e",
-        "end run",
-        "pastor",
-        msg,
-    ]);
-    cmd
-}
-
-#[cfg(not(target_os = "macos"))]
-fn notify_command(msg: &str) -> Command {
-    let mut cmd = Command::new("notify-send");
-    cmd.args(["-a", "pastor", "--", "pastor", msg]);
-    cmd
 }
 
 fn popup(f: &mut Frame, title: &str, w: u16, h: u16) -> Rect {
@@ -2456,32 +2329,6 @@ fn expand(s: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn snaps(list: &[(&str, Status)]) -> HashMap<String, Snapshot> {
-        list.iter()
-            .map(|&(id, status)| {
-                let snap = Snapshot {
-                    status,
-                    screen: String::new(),
-                    term: None,
-                };
-                (id.to_string(), snap)
-            })
-            .collect()
-    }
-
-    fn statuses(list: &[(&str, Status)]) -> HashMap<String, Status> {
-        list.iter().map(|&(id, s)| (id.to_string(), s)).collect()
-    }
-
-    #[test]
-    fn un_aviso_colgado_se_mata() {
-        let spawn = |secs: &str| Command::new("sleep").arg(secs).spawn().unwrap();
-        assert!(wait_or_kill(spawn("0"), Duration::from_secs(5)).is_some());
-        let start = Instant::now();
-        assert!(wait_or_kill(spawn("30"), Duration::from_millis(200)).is_none());
-        assert!(start.elapsed() < Duration::from_secs(5));
-    }
-
     #[test]
     fn rutas_de_los_formularios() {
         let home = dirs::home_dir().unwrap();
@@ -2559,34 +2406,6 @@ mod tests {
         assert!(lines.iter().all(|l| l.width() <= 40 - 3));
         let joined: String = lines.iter().map(|l| l.spans[1].content.as_ref()).collect();
         assert_eq!(joined, value);
-    }
-
-    #[test]
-    fn avisa_al_terminar_y_al_bloquearse() {
-        let mut state = State::default();
-        let a1 = state.add_agent(Kind::Claude, PathBuf::from("/tmp/web"), None);
-        state.add_agent(Kind::Claude, PathBuf::from("/tmp/api"), None);
-        state.agents[0].task = Some("t1".into());
-        let old = statuses(&[("a1", Status::Working), ("a2", Status::Idle)]);
-        let new = snaps(&[("a1", Status::Idle), ("a2", Status::Blocked)]);
-        assert_eq!(
-            transitions(&state, &old, &new),
-            [
-                (format!("{} terminó", a1.name), Some("a1".to_string())),
-                ("api necesita tu atención".to_string(), None),
-            ]
-        );
-        // Sin estado anterior (recién arrancado) no hay avisos.
-        assert!(transitions(&state, &HashMap::new(), &new).is_empty());
-    }
-
-    #[test]
-    fn sin_tarea_no_hay_nada_que_pasar_a_revision() {
-        let mut state = State::default();
-        state.add_agent(Kind::Claude, PathBuf::from("/tmp/web"), None);
-        let old = statuses(&[("a1", Status::Working)]);
-        let new = snaps(&[("a1", Status::Dead)]);
-        assert_eq!(transitions(&state, &old, &new)[0].1, None);
     }
 
     #[test]

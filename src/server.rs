@@ -55,6 +55,11 @@ pub fn run(bind: SocketAddr) -> Result<()> {
              mejor 127.0.0.1 o la IP de Tailscale."
         );
     }
+    // Los avisos de los agentes, para que lleguen también con la TUI cerrada.
+    std::thread::Builder::new()
+        .name("avisos".into())
+        .spawn(crate::avisos::watch_forever)
+        .context("no pude lanzar el hilo de los avisos")?;
     let app = Arc::new(App {
         token,
         tracker: Mutex::default(),
