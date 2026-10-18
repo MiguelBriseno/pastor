@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::agent::{Kind, Status};
 use crate::history;
+use crate::limits;
 use crate::ops::{self, AssignTarget, Tracker};
 use crate::store::{self, Agent, State, TaskStatus};
 use crate::transcript;
@@ -36,6 +37,8 @@ struct App {
     transcripts: Mutex<HashMap<String, Arc<Mutex<transcript::Reader>>>>,
     /// El historial leído, para leer solo las líneas nuevas.
     history: Mutex<history::Tail>,
+    /// Los límites de uso leídos, para no preguntar en cada consulta.
+    limits: Mutex<limits::Cache>,
 }
 
 /// El token sale de `PASTOR_TOKEN` o del archivo, nunca de un argumento:
@@ -56,6 +59,7 @@ pub fn run(bind: SocketAddr) -> Result<()> {
         tracker: Mutex::default(),
         transcripts: Mutex::default(),
         history: Mutex::default(),
+        limits: Mutex::default(),
     });
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -85,6 +89,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/tasks/{id}/assign", post(assign_task))
         .route("/tasks/{id}/done", post(task_done))
         .route("/stats", get(stats))
+        .route("/limits", get(limits))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no existe esa ruta") })
         .layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -559,6 +564,18 @@ async fn stats(Shared(app): Shared<Arc<App>>) -> Response {
     .await
 }
 
+// ---------- límites de uso ----------
+
+/// Lo que queda de cada ventana de límite de las suscripciones.
+async fn limits(Shared(app): Shared<Arc<App>>) -> Response {
+    blocking(move || {
+        let mut cache = app.limits.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.refresh();
+        Ok(json!(cache.usage()))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +616,7 @@ mod tests {
             tracker: Mutex::default(),
             transcripts: Mutex::default(),
             history: Mutex::default(),
+            limits: Mutex::default(),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listener = rt

@@ -32,6 +32,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::agent::{Kind, Status};
 use crate::history::{self, Stats};
 use crate::icons::{self, pad};
+use crate::limits::{self, Usage};
 use crate::ntfy;
 use crate::ops::{self, AssignTarget, Snapshot, Tracker};
 use crate::store::{Agent, State, Task, TaskStatus};
@@ -167,6 +168,7 @@ struct App {
     desc_height: u16,
     flash: Option<(String, Instant)>,
     stats: Stats,
+    limits: Vec<Usage>,
     /// Tamaño al que debe dibujar el agente que se ve (id, columnas, filas),
     /// y el último que se le pidió: solo se le pide otra vez si cambia, o
     /// si vuelves a usar la TUI (el celular pudo haberlo cambiado).
@@ -194,6 +196,7 @@ impl App {
             desc_height: 7,
             flash: None,
             stats: Stats::default(),
+            limits: Vec::new(),
             want_fit: None,
             fitted: None,
             want_since: Instant::now(),
@@ -223,6 +226,9 @@ impl App {
                 }
                 if let Some(stats) = pass.stats {
                     self.stats = stats;
+                }
+                if let Some(limits) = pass.limits {
+                    self.limits = limits;
                 }
                 // Al volver de un agente pueden ser varios: que se vean todos.
                 if !pass.flashes.is_empty() {
@@ -1058,12 +1064,15 @@ impl App {
     fn draw_dashboard(&self, f: &mut Frame, area: Rect) {
         let ic = icons::get();
         let named = |icon: &str, name: &str| format!("{}{name}", pad(icon));
-        let [r1, r2, r3] = Layout::vertical([
+        let rows = self.limits.iter().map(|u| u.windows.len().max(1)).max();
+        let [r1, r2, r4, r3] = Layout::vertical([
             Constraint::Length(4),
             Constraint::Length(4),
+            Constraint::Length(rows.map_or(0, |n| n as u16 + 2)),
             Constraint::Min(0),
         ])
         .areas(area);
+        self.draw_limits(f, r4);
 
         let count = |st: Status| {
             self.state
@@ -1193,6 +1202,53 @@ impl App {
             .bar_width(10)
             .bar_gap(2);
         f.render_widget(chart, right);
+    }
+
+    /// Una caja por suscripción con lo que queda de cada ventana.
+    fn draw_limits(&self, f: &mut Frame, area: Rect) {
+        let ic = icons::get();
+        let n = self.limits.len().max(1) as u32;
+        let boxes = Layout::horizontal(vec![Constraint::Ratio(1, n); n as usize]).split(area);
+        let now = chrono::Utc::now();
+        for (u, &r) in self.limits.iter().zip(boxes.iter()) {
+            let color = kind_color(u.kind);
+            let lines: Vec<Line> = match &u.error {
+                Some(e) => vec![Line::from(format!(" {e}").dark_gray())],
+                None => u
+                    .windows
+                    .iter()
+                    .map(|w| {
+                        let left = w.left_pct();
+                        // Una que ya pasó (el dato es de hace hasta `TTL`) no dice nada.
+                        let reset = w.resets_at.filter(|t| *t > now).map_or(String::new(), |t| {
+                            format!(
+                                " · se reinicia en {}",
+                                history::human((t - now).num_seconds())
+                            )
+                        });
+                        Line::from(vec![
+                            Span::raw(format!(" {:<13}", w.name)),
+                            Span::styled(meter(left, 10), Style::default().fg(limit_color(left))),
+                            Span::styled(
+                                format!(" {left:>3.0}% libre"),
+                                Style::default().fg(limit_color(left)).bold(),
+                            ),
+                            Span::raw(reset).dark_gray(),
+                        ])
+                    })
+                    .collect(),
+            };
+            let plan = u.plan.as_ref().map_or(String::new(), |p| format!("({p}) "));
+            f.render_widget(
+                Paragraph::new(lines).block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(color))
+                        .title(format!(" {}{} {plan}", pad(ic.kind(u.kind)), u.kind)),
+                ),
+                r,
+            );
+        }
     }
 
     fn draw_history(&self, f: &mut Frame, area: Rect) {
@@ -1558,6 +1614,8 @@ struct Pass {
     snaps: Option<HashMap<String, Snapshot>>,
     /// Solo si el historial cambió.
     stats: Option<Stats>,
+    /// Solo si se volvieron a leer.
+    limits: Option<Vec<Usage>>,
     /// Avisos de agentes que terminaron o necesitan atención.
     flashes: Vec<String>,
 }
@@ -1567,6 +1625,7 @@ impl Pass {
     fn after(mut self, old: Pass) -> Pass {
         self.flashes = [old.flashes, self.flashes].concat();
         self.stats = self.stats.or(old.stats);
+        self.limits = self.limits.or(old.limits);
         self.snaps = self.snaps.or(old.snaps);
         self
     }
@@ -1578,6 +1637,7 @@ struct Watch {
     tracker: Tracker,
     status: HashMap<String, Status>,
     history: history::Tail,
+    limits: limits::Cache,
     /// Día de las últimas estadísticas: al cambiar se mueve el gráfico.
     day: Option<NaiveDate>,
     /// Si la pasada anterior no pudo preguntar a tmux: se avisa una vez.
@@ -1618,6 +1678,7 @@ impl Watch {
         Some(Pass {
             snaps: Some(snaps),
             stats,
+            limits: None,
             flashes,
         })
     }
@@ -1685,11 +1746,23 @@ impl Observer {
                         }
                     }
                     wait = true;
-                    if let Some(pass) = watch.look() {
+                    let publish = |pass: Pass| {
                         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
                         *slot = Some(match slot.take() {
                             Some(old) => pass.after(old),
                             None => pass,
+                        });
+                    };
+                    if let Some(pass) = watch.look() {
+                        publish(pass);
+                    }
+                    // Aparte y después de los paneles: puede tardar por la red
+                    // y no debe retrasar los avisos. Tampoco en `look`: la
+                    // primera pasada se hace antes del primer cuadro.
+                    if watch.limits.refresh() {
+                        publish(Pass {
+                            limits: Some(watch.limits.usage().to_vec()),
+                            ..Pass::default()
                         });
                     }
                 }
@@ -2030,6 +2103,21 @@ fn kind_color(k: Kind) -> Color {
         Kind::Claude => Color::Rgb(217, 119, 87),
         Kind::Codex => Color::Rgb(16, 163, 127),
         Kind::Opencode => Color::Cyan,
+    }
+}
+
+/// Una barra de `width` celdas llena según `pct`.
+fn meter(pct: f64, width: usize) -> String {
+    let full = ((pct / 100.0) * width as f64).round() as usize;
+    let full = full.min(width);
+    format!("{}{}", "█".repeat(full), "░".repeat(width - full))
+}
+
+fn limit_color(left_pct: f64) -> Color {
+    match left_pct {
+        p if p < 10.0 => Color::Red,
+        p if p < 30.0 => Color::Yellow,
+        _ => Color::Green,
     }
 }
 
