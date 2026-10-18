@@ -1,4 +1,5 @@
 mod agent;
+mod avisos;
 mod history;
 mod hooks;
 mod icons;
