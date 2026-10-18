@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -85,25 +86,52 @@ pub fn read_status(id: &str) -> Option<HookStatus> {
     serde_json::from_str(&fs::read_to_string(status_path(id)).ok()?).ok()
 }
 
+/// El `.lock` se queda: otro proceso puede estar esperándolo, y si se
+/// borrara, el siguiente bloquearía otro archivo. Solo lo quita `prune`, con
+/// el agente ya fuera del estado.
 pub fn clear_status(id: &str) {
     let _ = fs::remove_file(status_path(id));
-    let _ = fs::remove_file(data_dir().join("status").join(format!("{id}.lock")));
 }
 
 /// Borra los estados de hook de agentes que ya no existen. Con el candado de
 /// `state.json`: un agente entra ahí antes de lanzarse, así que uno recién
 /// creado no pierde su estado.
 pub fn prune_status() {
-    let _ = store::State::with_lock(|s| prune_status_in(&data_dir().join("status"), s));
+    let _ = store::State::with_lock(|s| {
+        prune_status_in(&data_dir().join("status"), s);
+        // Los de `state.json`: con su candado nadie lo está escribiendo. Los
+        // de otros archivos (`claude-settings.json`) con margen.
+        remove_stale_tmp(&data_dir(), "state.json.", Duration::ZERO);
+        remove_stale_tmp(&data_dir(), "", Duration::from_secs(60));
+    });
 }
 
-fn prune_status_in(dir: &Path, state: &store::State) {
+/// Borra los temporales que empiezan por `prefix` de escrituras que no
+/// terminaron (el proceso murió entre crearlo y renombrarlo) con más de `age`.
+fn remove_stale_tmp(dir: &Path, prefix: &str, age: Duration) {
     let Ok(dir) = fs::read_dir(dir) else {
         return;
     };
     for entry in dir.flatten() {
-        // Solo `<id>.json` y `<id>.lock`: los temporales de una escritura en
-        // curso (`<id>.json.<sufijo>.tmp`) son de su hook.
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e >= age));
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) && name.ends_with(".tmp") && stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn prune_status_in(dir: &Path, state: &store::State) {
+    // Un temporal reciente puede ser de una escritura en curso de su hook.
+    remove_stale_tmp(dir, "", Duration::from_secs(60));
+    let Ok(dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in dir.flatten() {
         let name = entry.file_name();
         let Some(id) = name
             .to_str()
@@ -241,6 +269,12 @@ pub fn handle(event: &str) -> Result<()> {
             &status_path(&id),
             serde_json::to_string(&status)?.as_bytes(),
         )?;
+        // Si quitaron el agente mientras, puede que `clear_status` ya pasara:
+        // que no quede su estado. Mirar después de escribir cubre los dos órdenes.
+        if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
+            clear_status(&id);
+            return Ok(());
+        }
     }
     if state != "working" {
         spawn_settle();
@@ -321,10 +355,16 @@ pub fn log_error(event: &str, e: &anyhow::Error) {
     use std::io::Write;
     let agent = std::env::var("PASTOR_AGENT").unwrap_or_default();
     let line = format!("{} {agent} {event}: {e:#}\n", Utc::now().to_rfc3339());
+    let path = data_dir().join("hooks.log");
+    let _ = fs::create_dir_all(data_dir());
+    // Que no crezca sin límite: pasado 1 MB se empieza de nuevo.
+    let full = fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20);
     let _ = fs::OpenOptions::new()
         .create(true)
-        .append(true)
-        .open(data_dir().join("hooks.log"))
+        .write(true)
+        .append(!full)
+        .truncate(full)
+        .open(&path)
         .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
@@ -444,7 +484,7 @@ fn write_claude_shim(bin: &PathBuf) -> Result<()> {
         std::env::split_paths(&p)
             .filter(|d| d != bin)
             .map(|d| d.join("claude"))
-            .find(|f| f.is_file())
+            .find(|f| agent::is_executable(f))
     });
     let Some(real) = real else {
         return Ok(());
@@ -492,9 +532,18 @@ mod tests {
             "a2.json",
             "a2.lock",
             "a1.json.9-1.tmp",
+            "a2.json.9-2.tmp",
         ] {
             fs::write(dir.0.join(f), "{}").unwrap();
         }
+        // Uno de una escritura que murió hace rato.
+        let viejo = std::time::SystemTime::now() - Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(dir.0.join("a2.json.9-2.tmp"))
+            .unwrap()
+            .set_modified(viejo)
+            .unwrap();
         let mut state = store::State::default();
         state.add_agent(agent::Kind::Claude, PathBuf::from("/tmp"), None);
         prune_status_in(&dir.0, &state);

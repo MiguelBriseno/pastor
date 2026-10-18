@@ -1,7 +1,7 @@
 //! Tipos de agente, cómo lanzarlos y cómo deducir su estado.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -93,8 +93,15 @@ pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|p| {
         std::env::split_paths(&p)
             .map(|d| d.join(bin))
-            .find(|f| f.is_file())
+            .find(|f| is_executable(f))
     })
+}
+
+/// Como lo busca el shell: un archivo sin permiso de ejecución no cuenta.
+pub(crate) fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

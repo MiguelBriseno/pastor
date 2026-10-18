@@ -85,7 +85,12 @@ fn split_panes(panes: Vec<tmux::Pane>) -> AgentPanes {
 }
 
 pub fn agent_panes(agent_id: &str) -> AgentPanes {
-    split_panes(tmux::panes().remove(agent_id).unwrap_or_default())
+    split_panes(
+        tmux::panes()
+            .unwrap_or_default()
+            .remove(agent_id)
+            .unwrap_or_default(),
+    )
 }
 
 /// Si el agente ya no corre en su panel: salió (con /exit, por ejemplo) y
@@ -106,7 +111,8 @@ fn agent_gone(pane: &tmux::Pane, procs: &Procs) -> bool {
 /// Tabla de procesos del sistema. Se pide a `ps` una sola vez, y solo si algún
 /// panel la necesita, para no lanzarlo por cada agente en cada refresco.
 #[derive(Default)]
-struct Procs(OnceCell<Vec<Proc>>);
+/// `None` si `ps` falló.
+struct Procs(OnceCell<Option<Vec<Proc>>>);
 
 struct Proc {
     pid: u32,
@@ -116,24 +122,28 @@ struct Proc {
 }
 
 impl Procs {
-    fn list(&self) -> &[Proc] {
-        self.0.get_or_init(|| {
-            std::process::Command::new("ps")
-                .args(["-A", "-o", "pid=,pgid=,tpgid=,comm="])
-                .output()
-                .map_or_else(
-                    |_| Vec::new(),
-                    |o| parse_ps(&String::from_utf8_lossy(&o.stdout)),
-                )
-        })
+    fn list(&self) -> Option<&[Proc]> {
+        self.0
+            .get_or_init(|| {
+                std::process::Command::new("ps")
+                    .args(["-A", "-o", "pid=,pgid=,tpgid=,comm="])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
+            })
+            .as_deref()
     }
 
     /// Si el agente corre en primer plano en el panel que arrancó con `pid`:
     /// algún proceso del grupo que tiene la terminal es un agente. Así se le
     /// encuentra detrás de un envoltorio como headroom, y no cuenta uno que
-    /// quedó en segundo plano.
+    /// quedó en segundo plano. Si `ps` falló no se sabe, y se da por bueno:
+    /// darlo por salido borraría su estado de hook.
     fn runs_agent(&self, pid: u32) -> bool {
-        let procs = self.list();
+        let Some(procs) = self.list() else {
+            return true;
+        };
         let Some(fg) = procs.iter().find(|p| p.pid == pid).map(|p| p.tpgid) else {
             return false;
         };
@@ -546,8 +556,9 @@ pub struct TermSnapshot {
     pub cmd: Option<String>,
 }
 
-pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot> {
-    let mut all = tmux::panes();
+/// Falla si no se pudo preguntar a tmux por los paneles.
+pub fn observe(state: &State, tracker: &mut Tracker) -> Result<HashMap<String, Snapshot>> {
+    let mut all = tmux::panes()?;
     let procs = Procs::default();
     // Primero si cada agente sigue en su panel, antes de las capturas, para que
     // `ps` vea lo mismo que acaba de reportar tmux.
@@ -563,7 +574,7 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
             (a, panes, gone)
         })
         .collect();
-    panes
+    Ok(panes
         .into_iter()
         .map(|(a, panes, gone)| {
             let pane = panes.agent.as_ref();
@@ -607,7 +618,7 @@ pub fn observe(state: &State, tracker: &mut Tracker) -> HashMap<String, Snapshot
                 },
             )
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -788,7 +799,7 @@ mod tests {
                 name: name.to_string(),
             })
             .collect();
-        Procs(OnceCell::from(list))
+        Procs(OnceCell::from(Some(list)))
     }
 
     #[test]
@@ -834,7 +845,9 @@ mod tests {
                 (4251, 4250, 4250, "Google Chrome Helper"),
             ]
         );
-        assert!(Procs(OnceCell::from(procs)).runs_agent(4242));
+        assert!(Procs(OnceCell::from(Some(procs))).runs_agent(4242));
+        // Si `ps` falló no se sabe: mejor no darlo por salido.
+        assert!(Procs(OnceCell::from(None)).runs_agent(4242));
     }
 
     #[test]
