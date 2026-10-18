@@ -355,6 +355,16 @@ sigue `pastor serve` (lo que pase en ese segundo no avisa). Como servicio de sys
 `Environment=PASTOR_NTFY_URL=…` en la unidad: no lee tu `.bashrc`. El que avisa también pasa a revisión la tarea de un agente que
 termina. Si un aviso no sale (URL o token mal puestos, sin red), el motivo queda en `hooks.log`.
 
+### Sonido
+
+Cada aviso también suena en la computadora: un sonido cuando un agente te espera y otro cuando
+termina (los de freedesktop con `pw-play` o `paplay`; en macOS, `afplay`). Lo hace el mismo
+proceso que manda los avisos, así que tampoco suena doble. Para silenciarlo, `PASTOR_SOUND=0`.
+
+La app del celular hace sonar un tono con los mismos cambios, pero solo mientras está a la vista
+y después de haberla tocado una vez (el navegador no deja sonar nada antes). Con la app en
+segundo plano, el sonido es el de la notificación de ntfy (con la app a la vista suenan los dos).
+
 ## Iconos y fuente
 
 pastor usa iconos de [Nerd Font](https://www.nerdfonts.com): una oveja como logo, un icono por

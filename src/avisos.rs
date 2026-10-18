@@ -88,9 +88,16 @@ impl Notifier {
     ) -> (Vec<String>, Vec<anyhow::Error>) {
         let lead = self.leading();
         let (mut msgs, mut errors) = (Vec::new(), Vec::new());
-        for (msg, finished) in transitions(state, &self.status, snaps) {
+        let events = transitions(state, &self.status, snaps);
+        // Una pasada suena una sola vez, como en la app del celular: si alguno
+        // te espera, gana ese.
+        let mut sound = events
+            .iter()
+            .map(|e| e.0)
+            .min_by_key(|&e| e != Event::Blocked);
+        for (_, msg, finished) in events {
             if lead {
-                notify(&msg);
+                notify(sound.take(), &msg);
                 if let Some(Err(e)) = finished.map(|id| ops::finish_turn(&id)) {
                     errors.push(e);
                 }
@@ -180,13 +187,20 @@ pub fn watch_forever() {
     }
 }
 
+/// De qué avisa: cada uno suena distinto.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Event {
+    Blocked,
+    Finished,
+}
+
 /// Avisos por los cambios de estado de `old` a `new`, cada uno con el agente
 /// cuya tarea hay que pasar a revisión, si la tiene.
 fn transitions(
     state: &State,
     old: &HashMap<String, Status>,
     new: &HashMap<String, Snapshot>,
-) -> Vec<(String, Option<String>)> {
+) -> Vec<(Event, String, Option<String>)> {
     let mut events = Vec::new();
     for a in &state.agents {
         let (Some(&old), Some(new)) = (old.get(&a.id), new.get(&a.id)) else {
@@ -194,12 +208,16 @@ fn transitions(
         };
         match (old, new.status) {
             (o, Status::Blocked) if o != Status::Blocked => {
-                events.push((format!("{} necesita tu atención", a.name), None));
+                events.push((
+                    Event::Blocked,
+                    format!("{} necesita tu atención", a.name),
+                    None,
+                ));
             }
             (Status::Working, Status::Idle | Status::Dead) => {
                 // Sin tarea no hay nada que pasar a revisión.
                 let id = a.task.is_some().then(|| a.id.clone());
-                events.push((format!("{} terminó", a.name), id));
+                events.push((Event::Finished, format!("{} terminó", a.name), id));
             }
             _ => {}
         }
@@ -207,27 +225,32 @@ fn transitions(
     events
 }
 
+/// Un aviso para el hilo que los muestra: con qué suena (o nada) y qué dice.
+type Notice = (Option<Event>, String);
+
 /// Muestra un aviso del sistema. Los lanza, de uno en uno, un único hilo que
 /// espera a cada proceso (para que no quede zombi) sin frenar al observador.
-fn notify(msg: &str) {
-    static QUEUE: Mutex<Option<Sender<String>>> = Mutex::new(None);
+fn notify(sound: Option<Event>, msg: &str) {
+    static QUEUE: Mutex<Option<Sender<Notice>>> = Mutex::new(None);
     let mut queue = QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-    let msg = match queue.as_ref().map(|tx| tx.send(msg.to_string())) {
-        Some(Ok(())) => return,
-        Some(Err(e)) => e.0,
-        None => msg.to_string(),
-    };
+    let mut notice = (sound, msg.to_string());
+    if let Some(tx) = queue.as_ref() {
+        match tx.send(notice) {
+            Ok(()) => return,
+            Err(e) => notice = e.0,
+        }
+    }
     // Sin hilo todavía, o murió: se lanza otro. Si no se puede, se intentará
     // con el próximo aviso.
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<Notice>();
     let spawned = std::thread::Builder::new()
         .name("avisos".into())
         .spawn(move || {
-            for msg in rx {
-                show_notice(&msg);
+            for (sound, msg) in rx {
+                show_notice(sound, &msg);
             }
         });
-    if spawned.is_ok() && tx.send(msg).is_ok() {
+    if spawned.is_ok() && tx.send(notice).is_ok() {
         *queue = Some(tx);
     }
 }
@@ -236,13 +259,17 @@ fn notify(msg: &str) {
 /// espera hasta 25 s si nadie atiende las notificaciones).
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn show_notice(msg: &str) {
-    // Los dos a la vez, para que uno colgado no retrase al otro.
+fn show_notice(sound: Option<Event>, msg: &str) {
+    // Todos a la vez, para que uno colgado no retrase a los demás.
     let desktop = notify_command(msg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
     let phone = ntfy::publish(msg);
+    // Mientras suena, los otros dos ya van corriendo.
+    if let Some(event) = sound {
+        play(event);
+    }
     if let Ok(child) = desktop {
         wait_or_kill(child, NOTICE_TIMEOUT);
     }
@@ -273,6 +300,56 @@ fn wait_or_kill(mut child: Child, timeout: Duration) -> Option<ExitStatus> {
             }
         }
     }
+}
+
+/// Hace sonar el aviso, salvo con `PASTOR_SOUND=0`. Si un reproductor falla
+/// (`pw-play` instalado con PulseAudio de servidor), prueba el siguiente;
+/// si se colgó no, que pudo haber sonado y sonaría dos veces.
+fn play(event: Event) {
+    if std::env::var("PASTOR_SOUND").as_deref() == Ok("0") {
+        return;
+    }
+    for mut cmd in sound_commands(event) {
+        let spawned = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(child) = spawned else { continue };
+        match wait_or_kill(child, NOTICE_TIMEOUT) {
+            Some(st) if !st.success() => continue,
+            _ => return,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sound_commands(event: Event) -> Vec<Command> {
+    let name = match event {
+        Event::Blocked => "Ping",
+        Event::Finished => "Glass",
+    };
+    let mut cmd = Command::new("afplay");
+    cmd.arg(format!("/System/Library/Sounds/{name}.aiff"));
+    vec![cmd]
+}
+
+/// Los sonidos de freedesktop, con PipeWire o, si no está, PulseAudio.
+#[cfg(not(target_os = "macos"))]
+fn sound_commands(event: Event) -> Vec<Command> {
+    let name = match event {
+        Event::Blocked => "message-new-instant",
+        Event::Finished => "complete",
+    };
+    let file = format!("/usr/share/sounds/freedesktop/stereo/{name}.oga");
+    ["pw-play", "paplay"]
+        .into_iter()
+        .map(|player| {
+            let mut cmd = Command::new(player);
+            cmd.arg(&file);
+            cmd
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -392,8 +469,12 @@ mod tests {
         assert_eq!(
             transitions(&state, &old, &new),
             [
-                (format!("{} terminó", a1.name), Some("a1".to_string())),
-                ("api necesita tu atención".to_string(), None),
+                (
+                    Event::Finished,
+                    format!("{} terminó", a1.name),
+                    Some("a1".to_string())
+                ),
+                (Event::Blocked, "api necesita tu atención".to_string(), None),
             ]
         );
         // Sin estado anterior (recién arrancado) no hay avisos.
@@ -406,6 +487,6 @@ mod tests {
         state.add_agent(Kind::Claude, PathBuf::from("/tmp/web"), None);
         let old = statuses(&[("a1", Status::Working)]);
         let new = snaps(&[("a1", Status::Dead)]);
-        assert_eq!(transitions(&state, &old, &new)[0].1, None);
+        assert_eq!(transitions(&state, &old, &new)[0].2, None);
     }
 }
