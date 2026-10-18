@@ -43,8 +43,27 @@ function toast(msg) {
 
 class Unauthorized extends Error {}
 
+/** Para `onsubmit`: ignora los envíos mientras el anterior no termine (un
+ * doble toque mandaría el mensaje o crearía el agente dos veces). */
+function once(fn) {
+  return async (e) => {
+    e.preventDefault();
+    const form = e.currentTarget;
+    if (form.dataset.busy) return;
+    form.dataset.busy = "1";
+    const buttons = form.querySelectorAll("button:not([type=button])");
+    buttons.forEach((b) => (b.disabled = true));
+    try {
+      await fn();
+    } finally {
+      delete form.dataset.busy;
+      buttons.forEach((b) => (b.disabled = false));
+    }
+  };
+}
+
 async function api(method, path, body) {
-  const res = await fetch("/api" + path, {
+  const res = await fetch("api" + path, {
     method,
     headers: {
       Authorization: "Bearer " + store.get("pastor-token"),
@@ -64,11 +83,14 @@ async function attempt(fn) {
     return await fn();
   } catch (e) {
     if (e instanceof Unauthorized) {
+      // Pueden fallar dos consultas a la vez: solo la primera vuelve al token.
+      if (!store.get("pastor-token")) return;
       store.set("pastor-token", "");
       toast(e.message);
       route();
     } else {
-      toast(e.message === "Failed to fetch" ? "sin conexión con pastor" : e.message);
+      // `fetch` rechaza con TypeError si no hay red, con otro texto en cada navegador.
+      toast(e instanceof TypeError ? "sin conexión con pastor" : e.message);
     }
   }
 }
@@ -126,7 +148,16 @@ function route() {
   document.querySelector("nav").hidden = !store.get("pastor-token");
   if (!store.get("pastor-token")) return tokenView();
   const agent = hash.match(/^\/agent\/(.+)$/);
-  if (agent) return agentView(decodeURIComponent(agent[1]));
+  if (agent) {
+    let id;
+    try {
+      id = decodeURIComponent(agent[1]);
+    } catch {
+      location.hash = "#/agents";
+      return;
+    }
+    return agentView(id);
+  }
   if (tab === "tasks") return tasksView();
   agentsView();
 }
@@ -141,13 +172,12 @@ function tokenView() {
     h("h1", { text: "Conectar con pastor" }),
     h("form", {
       class: "card",
-      onsubmit: async (e) => {
-        e.preventDefault();
+      onsubmit: once(async () => {
         store.set("pastor-token", input.value.trim());
         const ok = await attempt(() => api("GET", "/agents"));
         if (ok) route();
         else if (store.get("pastor-token")) store.set("pastor-token", "");
-      },
+      }),
     },
       h("label", { text: "Token de pastor serve" }),
       input,
@@ -188,8 +218,7 @@ function newAgentForm(done) {
   const prompt = h("textarea", { rows: 2, placeholder: "opcional" });
   const form = h("form", {
     class: "card",
-    onsubmit: async (e) => {
-      e.preventDefault();
+    onsubmit: once(async () => {
       const body = { kind: kind.value, cwd: cwd.value.trim(), name: name.value.trim() || undefined, prompt: prompt.value.trim() || undefined };
       const a = await attempt(() => api("POST", "/agents", body));
       if (!a) return;
@@ -197,7 +226,7 @@ function newAgentForm(done) {
       toast(`${a.name} creado`);
       name.value = prompt.value = "";
       done();
-    },
+    }),
   },
     h("label", { text: "Tipo" }), kind,
     h("label", { text: "Directorio (ruta absoluta)" }), cwd,
@@ -216,11 +245,16 @@ function agentView(id) {
   const status = h("span");
   const meta = h("div", { class: "meta muted" });
   const screen = h("pre", { class: "screen", text: "…" });
+  const note = h("p", { class: "muted", hidden: true });
   const text = h("textarea", { rows: 2, placeholder: "Mensaje para el agente" });
 
   every(5000, () => attempt(async () => {
     const a = (await api("GET", "/agents")).find((x) => x.id === id);
-    if (!a) return toast("ese agente ya no existe");
+    if (!a) {
+      toast("ese agente ya no existe");
+      location.hash = "#/agents";
+      return;
+    }
     title.textContent = a.name;
     status.replaceChildren(badge(a.status, a.status_label));
     meta.textContent = `${a.kind} · ${a.cwd}` + (a.task ? ` · tarea ${a.task}` : "");
@@ -229,6 +263,7 @@ function agentView(id) {
   const pollScreen = every(1500, async () => {
     try {
       const { text: t } = await api("GET", `/agents/${encodeURIComponent(id)}/screen`);
+      note.hidden = true;
       if (screen.textContent === t) return;
       // Solo baja si ya estaba abajo: si subiste a leer, no te mueve.
       const atBottom = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
@@ -236,15 +271,20 @@ function agentView(id) {
       if (atBottom) screen.scrollTop = screen.scrollHeight;
     } catch (e) {
       if (e instanceof Unauthorized) return attempt(() => { throw e; });
-      screen.textContent = e.message;
+      // Debajo, sin tapar lo último que se vio: suele ser lo que había que leer.
+      note.textContent = e instanceof TypeError ? "sin conexión con pastor" : e.message;
+      note.hidden = false;
     }
   });
 
-  const post = (path, body) => attempt(async () => {
+  // En fila: dos toques seguidos irían en paralelo y tmux podría recibirlos
+  // al revés, o Escape y la siguiente tecla como una sola (Alt+tecla).
+  let queue = Promise.resolve();
+  const post = (path, body) => (queue = queue.then(() => attempt(async () => {
     await api("POST", `/agents/${encodeURIComponent(id)}${path}`, body);
     setTimeout(pollScreen, 300);
     return true;
-  });
+  })));
 
   const keys = KEYS.map(([key, label]) => h("button", {
     type: "button",
@@ -261,14 +301,14 @@ function agentView(id) {
       title, meta,
     ),
     screen,
+    note,
     h("div", { class: "keys" }, keys),
     h("form", {
       class: "send",
-      onsubmit: async (e) => {
-        e.preventDefault();
+      onsubmit: once(async () => {
         if (!text.value.trim()) return;
         if (await post("/send", { text: text.value })) text.value = "";
-      },
+      }),
     }, text, h("button", { class: "primary", text: "Enviar" })),
     h("div", { class: "row", style: "margin-top:24px;justify-content:flex-end" },
       h("button", {
@@ -306,13 +346,12 @@ function tasksView() {
     h("h1", { text: "Tareas" }),
     h("form", {
       class: "card",
-      onsubmit: async (e) => {
-        e.preventDefault();
+      onsubmit: once(async () => {
         if (await attempt(() => api("POST", "/tasks", { title: title.value.trim(), description: desc.value.trim() }))) {
           title.value = desc.value = "";
           reload();
         }
-      },
+      }),
     }, title, h("div", { style: "height:8px" }), desc, h("div", { class: "row" }, h("button", { class: "primary", text: "Agregar" }))),
     list,
   );
@@ -345,8 +384,7 @@ function assignForm(t, agents, reload, cancel) {
   target.addEventListener("change", sync);
   sync();
   const form = h("form", {
-    onsubmit: async (e) => {
-      e.preventDefault();
+    onsubmit: once(async () => {
       const [what, val] = target.value.split(/:(.*)/);
       const body = what === "agent" ? { agent: val } : { kind: val, cwd: cwd.value.trim() };
       if (await attempt(() => api("POST", `/tasks/${encodeURIComponent(t.id)}/assign`, body))) {
@@ -354,7 +392,7 @@ function assignForm(t, agents, reload, cancel) {
         toast("tarea asignada");
         reload();
       }
-    },
+    }),
   },
     h("label", { text: "Asignar a" }), target, cwdWrap,
     h("div", { class: "row", style: "margin-top:12px;justify-content:flex-end" },
