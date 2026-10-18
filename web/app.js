@@ -793,11 +793,12 @@ const hhmm = (iso) => {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
+/** Nodos de la conversación que se guardan, como mucho, a la vista. */
+const MAX_NODES = 600;
+
 /** La conversación entera del agente, de su transcripción de Claude Code: la
  * pantalla solo tiene lo visible. Llegan los últimos mensajes; los anteriores,
  * al pedirlos. Mientras está a la vista pide solo lo nuevo. */
-/** Nodos de la conversación que se guardan, como mucho, a la vista. */
-const MAX_NODES = 600;
 
 function conversationPane(id, getAgent) {
   const list = h("div", { class: "chat" });
@@ -809,8 +810,8 @@ function conversationPane(id, getAgent) {
   let first = 0;
   let total = 0;
   let visible = false;
-  /** Cuántos nodos se guardan: `MAX_NODES`, o más si pediste los anteriores. */
-  let keep = MAX_NODES;
+  /** Si hay una petición de mensajes anteriores en camino. */
+  let loading = false;
 
   const isTools = (node) => node?.classList?.contains("tools");
 
@@ -845,13 +846,27 @@ function conversationPane(id, getAgent) {
     return out;
   };
 
-  /** Si la vista tiene más de `keep` nodos, quita los de arriba: una sesión
-   * larga con la vista abierta haría crecer la página sin fin. Lo quitado se
-   * puede volver a pedir con "Ver mensajes anteriores". */
+  /** Si la vista tiene más de `MAX_NODES` nodos, quita los de arriba: una
+   * sesión larga con la vista abierta haría crecer la página sin fin. Solo
+   * los que quedan más de una pantalla por encima de lo que se ve, y sin
+   * mover lo que tienes delante: lo que estás leyendo nunca se quita. Lo
+   * quitado se puede volver a pedir con "Ver mensajes anteriores". */
   const trim = () => {
-    const extra = list.childElementCount - keep;
+    // Con una página anterior en camino, `first` tiene que seguir siendo
+    // donde acaba esa página.
+    if (loading) return;
+    let extra = list.childElementCount - MAX_NODES;
     if (extra <= 0) return;
-    for (let i = 0; i < extra; i++) list.firstElementChild.remove();
+    const limit = scroller.getBoundingClientRect().top - scroller.clientHeight;
+    // Antes de quitar nada: al encoger, el navegador ya acerca `scrollTop`.
+    const [top, before] = [scroller.scrollTop, scroller.scrollHeight];
+    let removed = false;
+    while (extra-- > 0 && list.firstElementChild.getBoundingClientRect().bottom < limit) {
+      list.firstElementChild.remove();
+      removed = true;
+    }
+    if (!removed) return;
+    scroller.scrollTop = top - (before - scroller.scrollHeight);
     first = Number(list.firstElementChild.dataset.from);
     older.hidden = false;
   };
@@ -879,7 +894,6 @@ function conversationPane(id, getAgent) {
     if (fresh) {
       list.replaceChildren();
       session = data.session;
-      keep = MAX_NODES;
       first = data.from;
       older.hidden = first === 0;
     }
@@ -887,11 +901,8 @@ function conversationPane(id, getAgent) {
     if (data.messages.length) list.querySelector(":scope > .empty")?.remove();
     list.append(...render(data.messages, data.from, list.lastElementChild));
     if (!list.childElementCount) placeholder("Sin mensajes", "La conversación aún está vacía.");
-    // Solo al pie: recortar arriba mientras lees movería lo que tienes delante.
-    if (stick) {
-      trim();
-      scroller.scrollTop = scroller.scrollHeight;
-    }
+    if (stick) scroller.scrollTop = scroller.scrollHeight;
+    trim();
     sync();
     // Si quedaron mensajes nuevos por traer, que no esperen a la siguiente vuelta.
     if (data.to < data.total) setTimeout(tick, 0);
@@ -899,7 +910,9 @@ function conversationPane(id, getAgent) {
 
   const loadOlder = async () => {
     older.disabled = true;
+    loading = true;
     const data = await attempt(() => api("GET", url(`?session=${encodeURIComponent(session)}&before=${first}`)));
+    loading = false;
     older.disabled = false;
     if (!data?.available || data.session !== session) return tick();
     // Arriba, sin mover lo que estás leyendo.
@@ -915,8 +928,6 @@ function conversationPane(id, getAgent) {
       below.remove();
     }
     list.prepend(...nodes);
-    // Lo que pediste no se quita en la siguiente vuelta.
-    keep = Math.max(keep, list.childElementCount);
     scroller.scrollTop += scroller.scrollHeight - before;
     first = data.from;
     older.hidden = first === 0;
@@ -1180,13 +1191,15 @@ function historyView() {
   const body = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
   main.append(body);
   poll(15000, "/stats", (s) => {
-    // Con el reloj desfasado podría salir negativo.
-    const days = s.since ? Math.max(0, Math.floor((Date.now() - new Date(s.since)) / 86400000)) : 0;
-    const ago = days === 0 ? "desde hoy" : days === 1 ? "hace 1 día" : `hace ${days} días`;
+    // Días de calendario (ayer a las 23:00 es "hace 1 día"); con el reloj
+    // desfasado podría salir negativo.
+    const midnight = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const days = s.since ? Math.max(0, Math.round((midnight(new Date()) - midnight(new Date(s.since))) / 86400000)) : 0;
+    const when = days === 0 ? "hoy" : days === 1 ? "hace 1 día" : `hace ${days} días`;
     const dash = (v) => (v == null ? "—" : human(v));
     const max = Math.max(1, ...s.daily.map((d) => d.events));
     body.replaceChildren(
-      panel("history", s.since ? `Desde el ${new Date(s.since).toLocaleDateString("es")} (${ago})` : "Totales", h("div", { class: "stats" },
+      panel("history", s.since ? `Desde el ${new Date(s.since).toLocaleDateString("es")} (${when})` : "Totales", h("div", { class: "stats" },
         stat("sesiones", s.sessions),
         stat("tareas creadas", s.tasks_created),
         stat("tareas hechas", s.tasks_done, "var(--green)"),
