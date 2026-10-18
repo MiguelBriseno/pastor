@@ -793,9 +793,13 @@ const hhmm = (iso) => {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
+/** Nodos de la conversación que se guardan, como mucho, a la vista. */
+const MAX_NODES = 600;
+
 /** La conversación entera del agente, de su transcripción de Claude Code: la
  * pantalla solo tiene lo visible. Llegan los últimos mensajes; los anteriores,
  * al pedirlos. Mientras está a la vista pide solo lo nuevo. */
+
 function conversationPane(id, getAgent) {
   const list = h("div", { class: "chat" });
   const older = h("button", { type: "button", class: "btn block older", hidden: true, text: "Ver mensajes anteriores", onclick: () => loadOlder() });
@@ -806,30 +810,65 @@ function conversationPane(id, getAgent) {
   let first = 0;
   let total = 0;
   let visible = false;
+  /** Si hay una petición de mensajes anteriores en camino. */
+  let loading = false;
 
-  /** Los nodos de `messages`, con las herramientas seguidas juntas en un
-   * grupo que se abre al tocarlo. `last` es el nodo previo, por si el grupo
-   * continúa. */
-  const render = (messages, last) => {
+  const isTools = (node) => node?.classList?.contains("tools");
+
+  /** Pone en el resumen de un grupo cuántas herramientas tiene y la última. */
+  const summarize = (group) => {
+    const tools = group.querySelector(".tools-list");
+    const n = tools.childElementCount;
+    group.querySelector("summary").textContent = `${n === 1 ? "1 herramienta" : `${n} herramientas`} · ${tools.lastElementChild.textContent}`;
+  };
+
+  /** Los nodos de `messages`, que empiezan en el mensaje `start`, con las
+   * herramientas seguidas juntas en un grupo que se abre al tocarlo. `last`
+   * es el nodo previo, por si el grupo continúa. Cada nodo nuevo guarda en
+   * `data-from` su primer mensaje, para saber desde dónde pedir al recortar. */
+  const render = (messages, start, last) => {
     const out = [];
-    for (const m of messages) {
+    messages.forEach((m, i) => {
       if (m.role !== "tool") {
-        out.push(h("div", { class: "msg " + m.role },
+        out.push(h("div", { class: "msg " + m.role, "data-from": start + i },
           markdown(m.text),
           m.role === "user" && m.at && h("span", { class: "msg-time", text: hhmm(m.at) })));
-        continue;
+        return;
       }
       let group = out.length ? out[out.length - 1] : last;
-      if (!group?.classList?.contains("tools")) {
-        group = h("details", { class: "tools" }, h("summary"), h("div", { class: "tools-list" }));
+      if (!isTools(group)) {
+        group = h("details", { class: "tools", "data-from": start + i }, h("summary"), h("div", { class: "tools-list" }));
         out.push(group);
       }
-      const tools = group.querySelector(".tools-list");
-      tools.append(h("div", { class: "tool", text: m.text }));
-      const n = tools.childElementCount;
-      group.querySelector("summary").textContent = `${n === 1 ? "1 herramienta" : `${n} herramientas`} · ${m.text}`;
-    }
+      group.querySelector(".tools-list").append(h("div", { class: "tool", text: m.text }));
+      summarize(group);
+    });
     return out;
+  };
+
+  /** Si la vista tiene más de `MAX_NODES` nodos, quita los de arriba: una
+   * sesión larga con la vista abierta haría crecer la página sin fin. Solo
+   * los que quedan más de una pantalla por encima de lo que se ve, y sin
+   * mover lo que tienes delante: lo que estás leyendo nunca se quita. Lo
+   * quitado se puede volver a pedir con "Ver mensajes anteriores". */
+  const trim = () => {
+    // Con una página anterior en camino, `first` tiene que seguir siendo
+    // donde acaba esa página.
+    if (loading) return;
+    let extra = list.childElementCount - MAX_NODES;
+    if (extra <= 0) return;
+    const limit = scroller.getBoundingClientRect().top - scroller.clientHeight;
+    // Antes de quitar nada: al encoger, el navegador ya acerca `scrollTop`.
+    const [top, before] = [scroller.scrollTop, scroller.scrollHeight];
+    let removed = false;
+    while (extra-- > 0 && list.firstElementChild.getBoundingClientRect().bottom < limit) {
+      list.firstElementChild.remove();
+      removed = true;
+    }
+    if (!removed) return;
+    scroller.scrollTop = top - (before - scroller.scrollHeight);
+    first = Number(list.firstElementChild.dataset.from);
+    older.hidden = false;
   };
 
   const placeholder = (title, text) => list.replaceChildren(empty("bot", title, text));
@@ -860,9 +899,10 @@ function conversationPane(id, getAgent) {
     }
     total = data.to;
     if (data.messages.length) list.querySelector(":scope > .empty")?.remove();
-    list.append(...render(data.messages, list.lastElementChild));
+    list.append(...render(data.messages, data.from, list.lastElementChild));
     if (!list.childElementCount) placeholder("Sin mensajes", "La conversación aún está vacía.");
     if (stick) scroller.scrollTop = scroller.scrollHeight;
+    trim();
     sync();
     // Si quedaron mensajes nuevos por traer, que no esperen a la siguiente vuelta.
     if (data.to < data.total) setTimeout(tick, 0);
@@ -870,12 +910,24 @@ function conversationPane(id, getAgent) {
 
   const loadOlder = async () => {
     older.disabled = true;
+    loading = true;
     const data = await attempt(() => api("GET", url(`?session=${encodeURIComponent(session)}&before=${first}`)));
+    loading = false;
     older.disabled = false;
     if (!data?.available || data.session !== session) return tick();
     // Arriba, sin mover lo que estás leyendo.
     const before = scroller.scrollHeight;
-    list.prepend(...render(data.messages));
+    const nodes = render(data.messages, data.from);
+    // Si la página acaba en herramientas y lo de abajo empieza igual, un solo grupo.
+    const below = list.firstElementChild;
+    if (isTools(nodes[nodes.length - 1]) && isTools(below)) {
+      const group = nodes[nodes.length - 1];
+      group.querySelector(".tools-list").append(...below.querySelector(".tools-list").children);
+      group.open ||= below.open;
+      summarize(group);
+      below.remove();
+    }
+    list.prepend(...nodes);
     scroller.scrollTop += scroller.scrollHeight - before;
     first = data.from;
     older.hidden = first === 0;
@@ -1139,11 +1191,15 @@ function historyView() {
   const body = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
   main.append(body);
   poll(15000, "/stats", (s) => {
-    const days = s.since ? Math.floor((Date.now() - new Date(s.since)) / 86400000) : 0;
+    // Días de calendario (ayer a las 23:00 es "hace 1 día"); con el reloj
+    // desfasado podría salir negativo.
+    const midnight = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const days = s.since ? Math.max(0, Math.round((midnight(new Date()) - midnight(new Date(s.since))) / 86400000)) : 0;
+    const when = days === 0 ? "hoy" : days === 1 ? "hace 1 día" : `hace ${days} días`;
     const dash = (v) => (v == null ? "—" : human(v));
     const max = Math.max(1, ...s.daily.map((d) => d.events));
     body.replaceChildren(
-      panel("history", s.since ? `Desde el ${new Date(s.since).toLocaleDateString("es")} (hace ${days} días)` : "Totales", h("div", { class: "stats" },
+      panel("history", s.since ? `Desde el ${new Date(s.since).toLocaleDateString("es")} (${when})` : "Totales", h("div", { class: "stats" },
         stat("sesiones", s.sessions),
         stat("tareas creadas", s.tasks_created),
         stat("tareas hechas", s.tasks_done, "var(--green)"),
