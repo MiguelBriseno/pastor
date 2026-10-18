@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::agent::{Kind, Status};
+use crate::history;
 use crate::ops::{self, AssignTarget, Tracker};
 use crate::store::{self, Agent, State, TaskStatus};
 use crate::transcript;
@@ -33,6 +34,8 @@ struct App {
     tracker: Mutex<Tracker>,
     /// La conversación leída de cada agente, para leer solo lo nuevo.
     transcripts: Mutex<HashMap<String, Arc<Mutex<transcript::Reader>>>>,
+    /// El historial leído, para leer solo las líneas nuevas.
+    history: Mutex<history::Tail>,
 }
 
 /// El token sale de `PASTOR_TOKEN` o del archivo, nunca de un argumento:
@@ -52,6 +55,7 @@ pub fn run(bind: SocketAddr) -> Result<()> {
         token,
         tracker: Mutex::default(),
         transcripts: Mutex::default(),
+        history: Mutex::default(),
     });
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -80,6 +84,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
         .route("/tasks/{id}/done", post(task_done))
+        .route("/stats", get(stats))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no existe esa ruta") })
         .layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -526,6 +531,34 @@ async fn delete_task(Path(id): Path<String>) -> Response {
     blocking(move || ops::delete_task(&id).map(|()| ok())).await
 }
 
+// ---------- historial ----------
+
+/// Las estadísticas de la pestaña Historial. Las duraciones van en segundos.
+async fn stats(Shared(app): Shared<Arc<App>>) -> Response {
+    blocking(move || {
+        let s = {
+            let mut tail = app.history.lock().unwrap_or_else(PoisonError::into_inner);
+            tail.refresh();
+            tail.stats(chrono::Local::now().date_naive())
+        };
+        Ok(json!({
+            "since": s.since,
+            "sessions": s.sessions,
+            "tasks_created": s.tasks_created,
+            "tasks_done": s.tasks_done,
+            "messages": s.messages,
+            "turns": s.turns,
+            "avg_session_secs": s.avg_session_secs,
+            "avg_task_secs": s.avg_task_secs,
+            "agent_secs": s.agent_secs,
+            "by_kind": Kind::ALL.iter().zip(&s.by_kind).map(|(k, n)| json!({ "kind": k, "sessions": n })).collect::<Vec<_>>(),
+            "projects": s.projects.iter().map(|(p, n)| json!({ "path": p, "sessions": n })).collect::<Vec<_>>(),
+            "daily": s.daily.iter().map(|(d, n)| json!({ "day": d, "events": n })).collect::<Vec<_>>(),
+        }))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +598,7 @@ mod tests {
             token: "secreto".into(),
             tracker: Mutex::default(),
             transcripts: Mutex::default(),
+            history: Mutex::default(),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listener = rt
