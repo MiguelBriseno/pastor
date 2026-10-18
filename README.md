@@ -361,9 +361,8 @@ Cada aviso también suena en la computadora: un sonido cuando un agente te esper
 termina (los de freedesktop con `pw-play` o `paplay`; en macOS, `afplay`). Lo hace el mismo
 proceso que manda los avisos, así que tampoco suena doble. Para silenciarlo, `PASTOR_SOUND=0`.
 
-La app del celular hace sonar un tono con los mismos cambios, pero solo mientras está a la vista
-y después de haberla tocado una vez (el navegador no deja sonar nada antes). Con la app en
-segundo plano, el sonido es el de la notificación de ntfy (con la app a la vista suenan los dos).
+En el celular suena la notificación de ntfy, si la configuraste; sin ntfy, el celular no suena. La
+app de pastor no hace sonar nada aparte.
 
 ## Iconos y fuente
 
