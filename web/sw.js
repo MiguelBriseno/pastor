@@ -1,6 +1,9 @@
 // Guarda la página para que abra sin red; la API nunca se guarda.
-// Primero la red: así una versión nueva de pastor se ve al recargar.
-const CACHE = "pastor-v2";
+// Primero la red: así una versión nueva de pastor se ve al recargar. Si la
+// red no contesta en 3 s se usa lo guardado, para no esperar el timeout del
+// navegador; la respuesta que llegue después igual actualiza la caché.
+const CACHE = "pastor-v3";
+const WAIT = 3000;
 const API = new URL("api/", self.registration.scope).pathname;
 const SHELL = ["./", "app.js", "style.css", "manifest.webmanifest", "icon-192.png", "icon-512.png"];
 
@@ -19,15 +22,22 @@ self.addEventListener("activate", (e) => {
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== "GET" || url.origin !== location.origin || url.pathname.startsWith(API)) return;
-  e.respondWith(
-    fetch(e.request)
+  const net = fetch(e.request);
+  e.waitUntil(
+    net
       .then((res) => {
-        if (res.ok) {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(e.request, copy));
-        }
-        return res;
+        if (!res.ok) return;
+        const copy = res.clone();
+        return caches.open(CACHE).then((c) => c.put(e.request, copy));
       })
-      .catch(() => caches.match(e.request, { ignoreSearch: true }))
+      .catch(() => {})
   );
+  // Lo guardado solo gana si existe; si no, se sigue esperando a la red.
+  const cached = () => caches.match(e.request, { ignoreSearch: true }).then((r) => r || net);
+  let timer;
+  const slow = new Promise((ok) => (timer = setTimeout(ok, WAIT))).then(cached);
+  // Si la red contesta antes, no hace falta mirar la caché.
+  const stop = () => clearTimeout(timer);
+  net.then(stop, stop);
+  e.respondWith(Promise.race([net.catch(cached), slow]));
 });

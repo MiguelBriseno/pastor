@@ -97,7 +97,29 @@ fn router(app: Arc<App>) -> Router {
         .nest("/api", api)
         .route("/", get(|| page("index.html")))
         .route("/{file}", get(|Path(file): Path<String>| page(file)))
+        .layer(middleware::from_fn(headers))
         .with_state(app)
+}
+
+/// Defensa en profundidad: con la CSP un XSS no podría mandar el token a
+/// otro lado, nadie puede meter la app en un marco, y un enlace de tarea no
+/// le dice al sitio externo de qué máquina viene.
+async fn headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    for (name, value) in [
+        (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; \
+             base-uri 'none'; form-action 'none'; object-src 'none'",
+        ),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::REFERRER_POLICY, "no-referrer"),
+    ] {
+        h.insert(name, header::HeaderValue::from_static(value));
+    }
+    res
 }
 
 /// La PWA de `web/`, metida en el binario. No pide token: la página no
@@ -693,6 +715,19 @@ mod tests {
         assert!(get("/sw.js", None).contains("text/javascript"));
         assert!(get("/manifest.webmanifest", None).starts_with("HTTP/1.1 200"));
         assert!(get("/nada.js", None).starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn cabeceras_de_seguridad() {
+        for r in [get("/", None), get("/api/tasks", None)] {
+            let r = r.to_ascii_lowercase();
+            assert!(
+                r.contains("content-security-policy: default-src 'self'"),
+                "{r}"
+            );
+            assert!(r.contains("x-content-type-options: nosniff"), "{r}");
+            assert!(r.contains("referrer-policy: no-referrer"), "{r}");
+        }
     }
 
     #[test]

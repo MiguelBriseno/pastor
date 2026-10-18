@@ -4,7 +4,7 @@
 //! `PASTOR_NTFY_TOKEN`.
 
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 
 struct Config {
     url: String,
@@ -32,7 +32,8 @@ pub fn publish(msg: &str) -> Option<Child> {
         .args(["-fsS", "-m", "10", "-K", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Para `check`; con `-sS` es solo una línea, no llena la tubería.
+        .stderr(Stdio::piped())
         .spawn()
         .ok()?;
     let input = curl_config(&config, msg);
@@ -46,6 +47,33 @@ pub fn publish(msg: &str) -> Option<Child> {
         return None;
     }
     Some(child)
+}
+
+/// Anota en `hooks.log` un aviso que no salió: si no, un token o una URL
+/// mal puestos dan cero avisos sin ninguna pista. `status` es cómo terminó
+/// curl, o `None` si hubo que matarlo; `stderr`, lo que dijo.
+pub fn check(stderr: Option<ChildStderr>, status: Option<ExitStatus>) {
+    if let Some(why) = failure(stderr, status) {
+        crate::hooks::log_error("ntfy", &anyhow::anyhow!("no pude publicar el aviso: {why}"));
+    }
+}
+
+fn failure(stderr: Option<ChildStderr>, status: Option<ExitStatus>) -> Option<String> {
+    use std::io::Read;
+    match status {
+        Some(s) if s.success() => None,
+        None => Some("no respondió a tiempo".into()),
+        Some(_) => {
+            let mut err = String::new();
+            if let Some(mut e) = stderr {
+                let _ = e.read_to_string(&mut err);
+            }
+            Some(match err.trim() {
+                "" => "curl falló".into(),
+                e => e.into(),
+            })
+        }
+    }
 }
 
 fn curl_config(c: &Config, msg: &str) -> String {
@@ -81,6 +109,28 @@ pub(crate) fn quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dice_por_que_fallo_curl() {
+        let run = |args: &[&str]| {
+            let mut c = Command::new("curl")
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let err = c.stderr.take();
+            let status = c.wait().unwrap();
+            failure(err, Some(status))
+        };
+        let why = run(&["-fsS", "-m", "5", "http://127.0.0.1:1/"]).unwrap();
+        assert!(why.starts_with("curl: (7)"), "{why}");
+        assert_eq!(run(&["-fsS", "--version"]), None);
+        assert_eq!(
+            failure(None, None).as_deref(),
+            Some("no respondió a tiempo")
+        );
+    }
 
     #[test]
     fn cita_para_curl() {

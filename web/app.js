@@ -57,6 +57,8 @@ function h(tag, props = {}, ...kids) {
     if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (k === "class") el.className = v;
     else if (k === "text") el.textContent = v;
+    // Por CSSOM y no como atributo: la CSP del servidor bloquea los estilos inline.
+    else if (k === "style") el.style.cssText = v;
     else if (k in el && typeof v !== "string") el[k] = v;
     else el.setAttribute(k, v);
   }
