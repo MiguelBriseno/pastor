@@ -419,11 +419,27 @@ mod tests {
     fn have_tmux() -> Option<MutexGuard<'static, ()>> {
         static SERIAL: Mutex<()> = Mutex::new(());
         if Command::new("tmux").arg("-V").output().is_ok() {
-            return Some(SERIAL.lock().unwrap_or_else(PoisonError::into_inner));
+            let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+            keep_server_alive();
+            return Some(guard);
         }
         assert!(std::env::var_os("CI").is_none(), "falta tmux");
         eprintln!("sin tmux; se omite");
         None
+    }
+
+    /// Una sesión que no es de ninguna prueba: si una mata la última sesión,
+    /// el servidor se cierra mientras la siguiente se conecta («server exited
+    /// unexpectedly»). Se va sola al acabar el `sleep`.
+    fn keep_server_alive() {
+        for _ in 0..20 {
+            if run(&["has-session", "-t", "=keepalive"]).is_ok()
+                || run(&["new-session", "-d", "-s", "keepalive", "sleep", "300"]).is_ok()
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// Se mata aunque la prueba falle.
