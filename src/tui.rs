@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -167,6 +167,14 @@ struct App {
     desc_height: u16,
     flash: Option<(String, Instant)>,
     stats: Stats,
+    /// Tamaño al que debe dibujar el agente que se ve (id, columnas, filas),
+    /// y el último que se le pidió: solo se le pide otra vez si cambia, o
+    /// si vuelves a usar la TUI (el celular pudo haberlo cambiado).
+    want_fit: Option<(String, u16, u16)>,
+    fitted: Option<(String, u16, u16)>,
+    /// Desde cuándo `want_fit` tiene su valor actual, y cuándo se pidió el último.
+    want_since: Instant,
+    fit_sent: Instant,
     quit: bool,
 }
 
@@ -186,6 +194,10 @@ impl App {
             desc_height: 7,
             flash: None,
             stats: Stats::default(),
+            want_fit: None,
+            fitted: None,
+            want_since: Instant::now(),
+            fit_sent: Instant::now(),
             quit: false,
         }
     }
@@ -231,10 +243,23 @@ impl App {
                 let seen = self.snaps.iter().map(|(id, s)| (id.clone(), s.status));
                 self.observer = Observer::spawn(seen.collect(), false);
             }
+            let before = self.want_fit.clone();
             term.draw(|f| self.draw(f))?;
+            if self.want_fit != before {
+                self.want_since = Instant::now();
+            }
+            self.send_fit();
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key, term),
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // Si la usas, que el agente vuelva a tu tamaño aunque
+                        // el celular lo haya cambiado. Sin repetirlo en cada
+                        // tecla: con una flecha sostenida serían decenas.
+                        if self.fit_sent.elapsed() > Duration::from_secs(2) {
+                            self.fitted = None;
+                        }
+                        self.on_key(key, term);
+                    }
                     Event::Paste(text) => self.on_paste(&text),
                     _ => {}
                 }
@@ -311,6 +336,24 @@ impl App {
 
     fn status(&self, id: &str) -> Status {
         self.snaps.get(id).map_or(Status::Starting, |s| s.status)
+    }
+
+    /// Pide al agente que se ve que dibuje al tamaño de su vista previa. Espera
+    /// a que el tamaño se quede quieto (al arrastrar la terminal cambia en
+    /// cada cuadro y el agente se redibujaría a cada ancho), y lo hace en otro
+    /// hilo: lee el estado y llama a tmux, y el dibujo no debe trabarse.
+    fn send_fit(&mut self) {
+        if self.want_fit == self.fitted || self.want_since.elapsed() < Duration::from_millis(300) {
+            return;
+        }
+        if let Some((id, cols, rows)) = self.want_fit.clone() {
+            // Si falla (el agente ya salió), solo se ve cortado.
+            thread::spawn(move || {
+                let _ = ops::fit(&id, cols, rows);
+            });
+            self.fit_sent = Instant::now();
+        }
+        self.fitted = self.want_fit.clone();
     }
 
     fn selected_agent(&self) -> Option<&Agent> {
@@ -432,6 +475,8 @@ impl App {
             KeyCode::Enter | KeyCode::Char('a') => {
                 if let Some((id, _)) = selected {
                     let result = suspend(term, || ops::attach(&id));
+                    // Dentro tomó el tamaño de tu terminal: hay que volver a ajustarlo.
+                    self.fitted = None;
                     self.refresh();
                     result?;
                 }
@@ -732,6 +777,7 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(f.area());
+        self.want_fit = None;
         self.draw_header(f, header);
         match self.tab {
             Tab::Agents => self.draw_agents(f, body),
@@ -895,6 +941,13 @@ impl App {
         };
         let h = right.height.saturating_sub(2) as usize;
         let text = tail(screen, h);
+        // Que el agente dibuje al tamaño de su vista, sin los bordes: así sus
+        // líneas no se cortan.
+        let fit = (
+            a.id.clone(),
+            right.width.saturating_sub(2),
+            right.height.saturating_sub(2),
+        );
 
         let st = self.status(&a.id);
         let mut block = Block::bordered()
@@ -922,6 +975,7 @@ impl App {
             ));
         }
         f.render_widget(Paragraph::new(text).block(block), right);
+        self.want_fit = Some(fit);
     }
 
     fn draw_tasks(&mut self, f: &mut Frame, area: Rect) {

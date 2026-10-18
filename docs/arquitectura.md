@@ -191,6 +191,23 @@ pide la API, y la página lo guarda en `localStorage`. Los textos de los agentes
 `textContent`, nunca como HTML. El service worker solo guarda la página para que abra sin red,
 siempre pregunta primero a la red, y nunca guarda respuestas de `/api`.
 
+### El agente dibuja al tamaño de quien lo mira
+
+Las sesiones nacen de 200×50 y, sin nadie dentro, tmux no las cambia. Claude parte sus líneas a ese
+ancho, así que la vista previa de la TUI las cortaba y en el celular había que moverse de lado.
+Ajustar el texto después rompe los separadores y las tablas; en cambio, al cambiar el tamaño de su
+panel el agente se redibuja a la medida.
+
+`tmux::fit` deja el panel del agente en las columnas y filas pedidas. Cambia la ventana que lo
+contiene, pero si la terminal está al lado conserva su ancho, y luego ajusta el panel justo. La
+última vista que pidió un tamaño manda: la TUI lo pide cuando cambia su vista previa (cuando el
+tamaño se queda quieto, en otro hilo), al volver de `attach` y cuando vuelves a usarla; la app
+del celular, al abrir un agente y cuando cambia lo que cabe en su pantalla. Ninguna lo repite en
+cada consulta, para que dos pantallas abiertas en el mismo agente no se lo quiten sin parar. Si
+alguien está dentro de la sesión no se toca: manda su terminal. `resize-window` deja la ventana
+en `window-size manual`, así que después se quita la opción para que `pastor attach` siga tomando
+el tamaño de tu terminal.
+
 ### Los avisos al celular van con `curl`
 
 ntfy recibe un POST con el texto. Para eso basta el `curl` del sistema, como `notify-send` para el

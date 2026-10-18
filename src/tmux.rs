@@ -324,6 +324,45 @@ pub fn send_keys(pane: &str, keys: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Deja el panel `pane` en `cols`×`rows`, para que el agente dibuje al tamaño
+/// de quien lo mira. Cambia la ventana que lo contiene: si tiene la terminal
+/// al lado, esta conserva su ancho. Devuelve si cambió algo. Con alguien
+/// dentro (`pastor attach`) no hace nada: manda su terminal, y forzarla haría
+/// que el agente se redibujara una y otra vez.
+pub fn fit(pane: &str, cols: u16, rows: u16) -> Result<bool> {
+    let now = run(&[
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{session_attached} #{window_width} #{window_height} #{pane_width} #{pane_height}",
+    ])?;
+    let n: Vec<u32> = now
+        .split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    let [attached, ww, wh, pw, ph] = n[..] else {
+        bail!("tmux no dio el tamaño de {pane}: {}", now.trim());
+    };
+    let (cols, rows) = (u32::from(cols), u32::from(rows));
+    if attached != 0 || (pw, ph) == (cols, rows) {
+        return Ok(false);
+    }
+    // Lo que no es del panel (la terminal y el separador) se queda igual.
+    let x = (cols + ww.saturating_sub(pw)).to_string();
+    let y = (rows + wh.saturating_sub(ph)).to_string();
+    run(&["resize-window", "-t", pane, "-x", &x, "-y", &y])?;
+    // `resize-window` deja la ventana en `window-size manual`: sin quitarlo,
+    // al entrar con `pastor attach` ya no tomaría el tamaño de tu terminal.
+    // Sin nadie dentro, la ventana conserva el tamaño nuevo.
+    run(&["set-option", "-w", "-u", "-t", pane, "window-size"])?;
+    // tmux reparte el cambio entre los paneles: que el del agente quede justo.
+    if ww > pw {
+        run(&["resize-pane", "-t", pane, "-x", &cols.to_string()])?;
+    }
+    Ok(true)
+}
+
 /// Texto visible del panel.
 pub fn capture(target: &str) -> Result<String> {
     run(&["capture-pane", "-p", "-J", "-t", target])
@@ -458,7 +497,7 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg, capture, check_keys, kill_session, new_session, no_server, pane_pids, panes,
+        arg, capture, check_keys, fit, kill_session, new_session, no_server, pane_pids, panes,
         parse_version, paste_safe, run, send_keys, send_text, shell_quote, split_right, type_line,
         valid_key,
     };
@@ -549,6 +588,39 @@ mod tests {
         run(&["new-session", "-d", "-s", &s.0, "sleep", "30"]).unwrap();
         assert!(kill_session(&format!("prueba{pid}-1")).is_err());
         assert!(panes().unwrap().contains_key(&s.0));
+    }
+
+    #[test]
+    fn ajusta_la_ventana_y_sigue_tomando_el_tamano_al_entrar() {
+        let Some(_serial) = have_tmux() else {
+            return;
+        };
+        let s = Session(format!("ancho{}", std::process::id()));
+        let cmd = ["sleep".to_string(), "30".to_string()];
+        new_session(&s.0, Path::new("/"), &[], &cmd, "true").unwrap();
+        let agent = panes().unwrap().remove(&s.0).unwrap().remove(0).id;
+        let size = |fmt: &str| {
+            run(&["display-message", "-p", "-t", &agent, fmt])
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert!(fit(&agent, 48, 30).unwrap());
+        assert_eq!(size("#{pane_width}x#{pane_height}"), "48x30");
+        // Mismo tamaño: no toca nada.
+        assert!(!fit(&agent, 48, 30).unwrap());
+        // `window-size` vuelve al global, no queda en `manual`.
+        let local = run(&["show-options", "-w", "-t", &agent, "window-size"]).unwrap();
+        assert!(local.trim().is_empty(), "{local}");
+
+        // Con la terminal al lado, el panel del agente queda justo en lo
+        // pedido y la terminal conserva su ancho.
+        let term = split_right(&agent, Path::new("/")).unwrap();
+        let term_w = || run(&["display-message", "-p", "-t", &term, "#{pane_width}"]).unwrap();
+        let before = term_w();
+        assert!(fit(&agent, 40, 20).unwrap());
+        assert_eq!(size("#{pane_width}x#{pane_height}"), "40x20");
+        assert_eq!(term_w(), before);
     }
 
     #[test]

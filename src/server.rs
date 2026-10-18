@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
-use axum::extract::{FromRequest, Path, Request, State as Shared};
+use axum::extract::{FromRequest, Path, Query, Request, State as Shared};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -358,8 +358,31 @@ async fn keys(Path(id): Path<String>, Body(req): Body<Keys>) -> Response {
     blocking(move || ops::send_keys(&id, &req.keys).map(|()| ok())).await
 }
 
-async fn screen(Path(id): Path<String>) -> Response {
-    blocking(move || ops::screen(&id).map(|text| json!({ "text": text }))).await
+/// Con `cols` y `rows`, el tamaño de la pantalla de quien mira.
+#[derive(Deserialize)]
+struct Size {
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+/// Con `?cols=…&rows=…`, antes ajusta el agente a ese tamaño para que dibuje
+/// líneas que quepan en el celular.
+async fn screen(Path(id): Path<String>, Query(size): Query<Size>) -> Response {
+    blocking(move || {
+        if let Size {
+            cols: Some(cols),
+            rows: Some(rows),
+        } = size
+        {
+            // Si cambió, una pausa para que el agente alcance a redibujarse.
+            // Si falla (el agente ya salió), `screen` da el error claro.
+            if matches!(ops::fit(&id, cols, rows), Ok(true)) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+        ops::screen(&id).map(|text| json!({ "text": text }))
+    })
+    .await
 }
 
 async fn kill_agent(Path(id): Path<String>) -> Response {
