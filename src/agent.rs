@@ -182,25 +182,31 @@ const WORKING: &[(&str, usize)] = &[("esc to interrupt", 8), ("esc interrupt", 5
 fn shows_working(tail: &str) -> bool {
     WORKING.iter().any(|&(p, min)| {
         tail.contains(p)
-            || tail.match_indices('…').any(|(i, _)| {
-                let before = &tail[..i];
-                (min..p.len()).any(|n| before.ends_with(&p[..n]))
+            // El corte va al final de la línea: un «esc to i…» en medio es
+            // texto del agente.
+            || tail.lines().any(|l| {
+                l.trim_end().strip_suffix('…').is_some_and(|before| {
+                    (min..p.len()).any(|n| before.ends_with(&p[..n]))
+                })
             })
     }) || tail.lines().any(is_spinner)
 }
+
+/// Los glifos con que anima Claude Code su spinner.
+const SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '*'];
 
 /// La línea del spinner de Claude Code mientras trabaja, p. ej.
 /// «✢ Wandering… (52s · ↓ 3.1k tokens)». No depende del ancho del panel
 /// como el pie. Al acabar queda «✻ Baked for 8s», sin `…`.
 fn is_spinner(line: &str) -> bool {
-    let line = line.trim_start();
-    let mut chars = line.chars();
-    let glyph = chars.next().is_some_and(|c| !c.is_alphanumeric());
-    glyph
-        && chars.next() == Some(' ')
-        && line.split_once("… (").is_some_and(|(_, rest)| {
-            let digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-            digits.len() < rest.len() && digits.starts_with(['s', 'm', 'h'])
+    let Some(rest) = line.trim_start().strip_prefix(SPINNER) else {
+        return false;
+    };
+    rest.starts_with(' ')
+        && rest.match_indices("… (").any(|(i, m)| {
+            let timer = &rest[i + m.len()..];
+            let unit = timer.trim_start_matches(|c: char| c.is_ascii_digit());
+            unit.len() < timer.len() && unit.starts_with(['s', 'm', 'h'])
         })
 }
 
@@ -345,6 +351,15 @@ mod tests {
         assert_eq!(
             classify(&obs("· Improvising… (1m 38s)"), None),
             Status::Working
+        );
+        // Lo que se le parece en el texto del agente no cuenta.
+        assert_eq!(
+            classify(&obs("⏺ Listo… (3m de compilación)\n- paso… (2s)\n❯ "), None),
+            Status::Idle
+        );
+        assert_eq!(
+            classify(&obs("pulsa esc to i… para parar\n❯ "), None),
+            Status::Idle
         );
         // Al acabar el spinner se queda quieto, sin `…`.
         assert_eq!(
