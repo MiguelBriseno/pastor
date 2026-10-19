@@ -222,13 +222,16 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     }
     // Un hook vale mientras la pantalla no haya cambiado después de él: lo
     // dice quien la observa o, si acaba de empezar, la huella que guardó el
-    // hook (con otro tamaño de panel no se pueden comparar).
+    // hook (con otro tamaño de panel no se pueden comparar). Con trabajo de
+    // fondo la pantalla cambia sola: vale hasta el siguiente hook.
     let hook = hook.filter(|h| {
-        obs.last_change
-            .is_none_or(|c| h.at + Duration::seconds(2) >= c)
-            && h.screen
-                .as_ref()
-                .is_none_or(|s| s.size != obs.size || s.hash == obs.fingerprint)
+        h.state == "background"
+            || obs
+                .last_change
+                .is_none_or(|c| h.at + Duration::seconds(2) >= c)
+                && h.screen
+                    .as_ref()
+                    .is_none_or(|s| s.size != obs.size || s.hash == obs.fingerprint)
     });
     // Un `idle` cuya huella es la pantalla actual gana a los textos: el último
     // mensaje de Claude puede traer un «Do you want to…» o un «(y/n)» sin que
@@ -257,6 +260,7 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     match hook.map(|h| h.state.as_str()) {
         Some("blocked") if !interrupted => return Status::Blocked,
         Some("idle") => return Status::Idle,
+        Some("background") if !interrupted => return Status::Working,
         Some("working") if changed_recently => return Status::Working,
         _ => {}
     }
@@ -307,6 +311,7 @@ mod tests {
             message: String::new(),
             screen: None,
             transcript: None,
+            subagent_shells: Vec::new(),
         }
     }
 
@@ -415,6 +420,35 @@ mod tests {
         assert_eq!(classify(&activo, Some(&hook("idle", 0))), Status::Idle);
         // "working" sin cambios en pantalla no basta.
         assert_eq!(classify(&obs(""), Some(&hook("working", 30))), Status::Idle);
+    }
+
+    #[test]
+    fn esperando_a_sus_subagentes_sigue_trabajando() {
+        // Con la pantalla quieta, y también si cambió después del hook.
+        assert_eq!(
+            classify(&obs(""), Some(&hook("background", 30))),
+            Status::Working
+        );
+        let cambio = Observation {
+            last_change: Some(Utc::now() - Duration::seconds(10)),
+            ..obs("")
+        };
+        assert_eq!(
+            classify(&cambio, Some(&hook("background", 60))),
+            Status::Working
+        );
+        // Un diálogo en pantalla sigue mandando.
+        assert_eq!(
+            classify(
+                &obs("Do you want to make this edit?\n❯ 1. Yes"),
+                Some(&hook("background", 5))
+            ),
+            Status::Blocked
+        ); // Al interrumpir el turno, ya no espera a nadie.
+        assert_eq!(
+            classify(&obs(INTERRUMPIDO), Some(&hook("background", 30))),
+            Status::Idle
+        );
     }
 
     #[test]
