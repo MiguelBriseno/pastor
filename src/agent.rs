@@ -177,6 +177,16 @@ const BLOCKED: &[&str] = &[
 /// Textos que muestran los tres agentes mientras trabajan.
 const WORKING: &[&str] = &["esc to interrupt", "esc interrupt"];
 
+/// Si el panel es angosto, el pie se corta con `…` («esc to i…»). Cuenta
+/// mientras quede la «i» de «interrupt», que lo distingue de «esc to cancel».
+fn shows_working(tail: &str, p: &str) -> bool {
+    if tail.contains(p) {
+        return true;
+    }
+    let min = p.find("interrupt").map_or(p.len(), |i| i + 1);
+    (min..p.len()).any(|n| tail.contains(&format!("{}…", &p[..n])))
+}
+
 /// Lo que deja Claude Code al interrumpir un turno (p. ej. al rechazar un
 /// permiso con Esc). No lanza `Stop`, así que su último hook puede ser un
 /// `blocked` que ya no vale. Solo cuenta al final de la pantalla: un diálogo
@@ -213,7 +223,7 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     if BLOCKED.iter().any(|p| tail.contains(p)) {
         return Status::Blocked;
     }
-    if WORKING.iter().any(|p| tail.contains(p)) {
+    if WORKING.iter().any(|p| shows_working(&tail, p)) {
         return Status::Working;
     }
     let changed_recently = obs
@@ -301,6 +311,12 @@ mod tests {
             classify(&obs("✻ Pensando… (esc to interrupt)"), None),
             Status::Working
         );
+        // Con el panel angosto el pie sale cortado.
+        assert_eq!(
+            classify(&obs("· Pensando… (29s)\n  ⏵⏵ auto mode on · esc to i…"), None),
+            Status::Working
+        );
+        assert_eq!(classify(&obs("❯ 1. Sí\n  esc to c…"), None), Status::Idle);
         // Pedir permiso pesa más que estar trabajando.
         assert_eq!(
             classify(&obs("esc to interrupt\nAllow once"), None),
