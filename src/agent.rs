@@ -313,7 +313,10 @@ mod tests {
         );
         // Con el panel angosto el pie sale cortado.
         assert_eq!(
-            classify(&obs("· Pensando… (29s)\n  ⏵⏵ auto mode on · esc to i…"), None),
+            classify(
+                &obs("· Pensando… (29s)\n  ⏵⏵ auto mode on · esc to i…"),
+                None
+            ),
             Status::Working
         );
         assert_eq!(classify(&obs("❯ 1. Sí\n  esc to c…"), None), Status::Idle);
