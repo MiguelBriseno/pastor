@@ -318,6 +318,8 @@ WorkingDirectory=%h
 ExecStart=%h/.cargo/bin/pastor serve
 Restart=on-failure
 RestartSec=3
+# Que al reiniciar el servicio solo se detenga serve, no los agentes.
+KillMode=process
 
 [Install]
 WantedBy=default.target
@@ -325,6 +327,11 @@ WantedBy=default.target
 
 Ajusta `PATH` a donde tengas los agentes (`command -v claude codex opencode`). systemd no lee tu
 `.bashrc`, y si es el servidor el que arranca el tmux de pastor, los agentes heredan este entorno.
+
+`KillMode=process` es importante por lo mismo: si fue el servidor el que arrancó el tmux de pastor,
+ese tmux y todos los agentes quedan dentro del servicio, y sin esa línea `systemctl --user restart
+pastor-serve` (por ejemplo, después de reinstalar) los cierra todos. Si ya tenías el servicio sin
+ella, agrégala y corre `systemctl --user daemon-reload`; no hace falta reiniciar.
 
 ```sh
 systemctl --user daemon-reload
