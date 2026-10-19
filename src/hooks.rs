@@ -32,6 +32,10 @@ pub struct HookStatus {
     /// de ahí sale la conversación entera para la app del celular.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
+    /// Shells de fondo que lanzaron los subagentes. Un subagente que espera
+    /// el suyo deja de contar como trabajo de fondo y solo queda su shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagent_shells: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -232,10 +236,49 @@ struct Payload {
     message: Option<String>,
     notification_type: Option<String>,
     transcript_path: Option<String>,
+    /// Solo viene si el hook lo lanza un subagente, no el hilo principal.
+    agent_id: Option<String>,
+    /// En `Stop`: el trabajo de fondo que sigue en marcha y que despertará a
+    /// Claude al acabar.
+    background_tasks: Option<Vec<BackgroundTask>>,
+    tool_name: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct BackgroundTask {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+/// La respuesta de Bash, aparte: la de otras herramientas puede no ser un
+/// objeto y tumbaría el resto del aviso.
+#[derive(Deserialize)]
+struct BashHook {
+    tool_response: BashResponse,
+}
+
+#[derive(Deserialize)]
+struct BashResponse {
+    #[serde(rename = "backgroundTaskId")]
+    background_task_id: Option<String>,
+}
+
+/// Tipos de trabajo de fondo que cuentan como que el agente sigue en lo suyo.
+/// Los shells solo si los lanzó un subagente: uno de Claude puede ser un
+/// servidor de desarrollo que no acaba nunca, y el agente nunca terminaría.
+const BACKGROUND_WORK: &[&str] = &["subagent", "workflow"];
+
 /// El estado que deja `event`, o `None` si el aviso no pide nada.
-fn hook_state(event: &str, p: &Payload) -> Option<&'static str> {
+/// `background` es trabajar sin que se vea en la pantalla: Claude acabó su
+/// turno pero espera a sus subagentes, o es un subagente el que trabaja.
+fn hook_state(event: &str, p: &Payload, subagent_shells: &[String]) -> Option<&'static str> {
+    let waits = p.background_tasks.iter().flatten().any(|t| {
+        t.kind
+            .as_deref()
+            .is_some_and(|k| BACKGROUND_WORK.contains(&k))
+            || t.id.as_ref().is_some_and(|id| subagent_shells.contains(id))
+    });
     Some(match event {
         "notify" => match p.notification_type.as_deref() {
             Some("idle_prompt") => "idle",
@@ -253,7 +296,9 @@ fn hook_state(event: &str, p: &Payload) -> Option<&'static str> {
             // Otros avisos (p. ej. `auth_success`) no piden nada.
             Some(_) => return None,
         },
+        "idle" if waits => "background",
         "idle" => "idle",
+        _ if p.agent_id.is_some() => "background",
         _ => "working",
     })
 }
@@ -291,19 +336,57 @@ pub fn handle(event: &str) -> Result<()> {
     let mut input = Vec::new();
     let _ = std::io::stdin().lock().read_to_end(&mut input);
     let p: Payload = serde_json::from_slice(&input).unwrap_or_default();
-    let Some(state) = hook_state(event, &p) else {
+    // Si el aviso no pide nada, ni candado ni lectura. Que no pida nada no
+    // depende de los shells de los subagentes.
+    if hook_state(event, &p, &[]).is_none() {
         return Ok(());
-    };
+    }
     ensure_dirs()?;
-    let status = HookStatus {
-        state: state.into(),
-        at: Utc::now(),
-        message: p.message.unwrap_or_default(),
-        screen: None,
-        transcript: p.transcript_path,
-    };
-    {
+    let state = {
         let _lock = lock_status(&id)?;
+        let prev = read_status(&id);
+        let mut subagent_shells = prev
+            .as_ref()
+            .map(|s| s.subagent_shells.clone())
+            .unwrap_or_default();
+        let Some(state) = hook_state(event, &p, &subagent_shells) else {
+            return Ok(());
+        };
+        // Mientras espera a sus subagentes, el prompt está quieto y Claude
+        // Code puede avisar de que te espera; no es así.
+        if event == "notify"
+            && state == "idle"
+            && prev.as_ref().is_some_and(|s| s.state == "background")
+        {
+            return Ok(());
+        }
+        if p.agent_id.is_some() && p.tool_name.as_deref() == Some("Bash") {
+            let shell = serde_json::from_slice::<BashHook>(&input)
+                .ok()
+                .and_then(|b| b.tool_response.background_task_id);
+            subagent_shells.extend(shell);
+        }
+        // Al acabar el turno, solo siguen los que aún corren.
+        if let Some(tasks) = &p.background_tasks {
+            subagent_shells.retain(|s| tasks.iter().any(|t| t.id.as_ref() == Some(s)));
+        }
+        // Un subagente que sigue con lo suyo no quita el diálogo que el hilo
+        // principal tiene abierto: se queda tal cual, con su huella.
+        let keep = p.agent_id.is_some() && prev.as_ref().is_some_and(|s| s.state == "blocked");
+        let status = match prev {
+            Some(prev) if keep => HookStatus {
+                subagent_shells,
+                ..prev
+            },
+            _ => HookStatus {
+                state: state.into(),
+                at: Utc::now(),
+                message: p.message.unwrap_or_default(),
+                screen: None,
+                transcript: p.transcript_path,
+                subagent_shells,
+            },
+        };
         write_volatile(
             &status_path(&id),
             serde_json::to_string(&status)?.as_bytes(),
@@ -314,13 +397,18 @@ pub fn handle(event: &str) -> Result<()> {
             clear_status(&id);
             return Ok(());
         }
-    }
-    if state != "working" {
+        if keep {
+            return Ok(());
+        }
+        state
+    };
+    // El trabajo de fondo cambia la pantalla sin hooks: no hay huella que valga.
+    if state != "working" && state != "background" {
         spawn_settle();
     }
 
     // Claude terminó su turno: su tarea queda lista para revisar.
-    if event == "idle" {
+    if event == "idle" && state == "idle" {
         history::record(Event::Turn { agent: id.clone() });
         ops::finish_turn(&id)?;
     }
@@ -562,6 +650,29 @@ mod tests {
             ),
             ("idle", "{}", Some("idle")),
             (
+                "idle",
+                r#"{"background_tasks":[{"id":"a1","type":"subagent","status":"running"}]}"#,
+                Some("background"),
+            ),
+            (
+                "idle",
+                r#"{"background_tasks":[{"id":"b1","type":"workflow","status":"running"}]}"#,
+                Some("background"),
+            ),
+            // Un shell de fondo (p. ej. `npm run dev`) puede no acabar nunca.
+            (
+                "idle",
+                r#"{"background_tasks":[{"id":"b2","type":"shell","status":"running"}]}"#,
+                Some("idle"),
+            ),
+            ("idle", r#"{"background_tasks":[]}"#, Some("idle")),
+            ("working", r#"{"agent_id":"a1"}"#, Some("background")),
+            (
+                "notify",
+                r#"{"agent_id":"a1","notification_type":"permission_prompt"}"#,
+                Some("blocked"),
+            ),
+            (
                 "notify",
                 r#"{"notification_type":"idle_prompt"}"#,
                 Some("idle"),
@@ -594,8 +705,18 @@ mod tests {
             ),
         ];
         for (event, json, esperado) in casos {
-            assert_eq!(hook_state(event, &p(json)), esperado, "{event} {json}");
+            assert_eq!(hook_state(event, &p(json), &[]), esperado, "{event} {json}");
         }
+        // El shell de un subagente que espera a que acabe sí cuenta.
+        let shell = p(r#"{"background_tasks":[{"id":"b2","type":"shell","status":"running"}]}"#);
+        assert_eq!(
+            hook_state("idle", &shell, &["b2".into()]),
+            Some("background")
+        );
+        assert_eq!(hook_state("idle", &shell, &["b9".into()]), Some("idle"));
+        let bash = br#"{"tool_name":"Bash","tool_response":{"stdout":"","backgroundTaskId":"b2"}}"#;
+        let b: BashHook = serde_json::from_slice(bash).unwrap();
+        assert_eq!(b.tool_response.background_task_id.as_deref(), Some("b2"));
         let full = p(r#"{"message":"hola","transcript_path":"/t.jsonl","otro":null}"#);
         assert_eq!(full.message.as_deref(), Some("hola"));
         let nulo = p(r#"{"message":null,"transcript_path":"/t.jsonl"}"#);
