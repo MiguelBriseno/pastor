@@ -174,17 +174,34 @@ const BLOCKED: &[&str] = &[
     "yes, proceed",
 ];
 
-/// Textos que muestran los tres agentes mientras trabajan.
-const WORKING: &[&str] = &["esc to interrupt", "esc interrupt"];
+/// Textos que muestran los tres agentes mientras trabajan, con lo mínimo que
+/// tiene que quedar si el panel angosto los corta con `…`: hasta la «i» de
+/// «interrupt», que los distingue de «esc to cancel».
+const WORKING: &[(&str, usize)] = &[("esc to interrupt", 8), ("esc interrupt", 5)];
 
-/// Si el panel es angosto, el pie se corta con `…` («esc to i…»). Cuenta
-/// mientras quede la «i» de «interrupt», que lo distingue de «esc to cancel».
-fn shows_working(tail: &str, p: &str) -> bool {
-    if tail.contains(p) {
-        return true;
-    }
-    let min = p.find("interrupt").map_or(p.len(), |i| i + 1);
-    (min..p.len()).any(|n| tail.contains(&format!("{}…", &p[..n])))
+fn shows_working(tail: &str) -> bool {
+    WORKING.iter().any(|&(p, min)| {
+        tail.contains(p)
+            || tail.match_indices('…').any(|(i, _)| {
+                let before = &tail[..i];
+                (min..p.len()).any(|n| before.ends_with(&p[..n]))
+            })
+    }) || tail.lines().any(is_spinner)
+}
+
+/// La línea del spinner de Claude Code mientras trabaja, p. ej.
+/// «✢ Wandering… (52s · ↓ 3.1k tokens)». No depende del ancho del panel
+/// como el pie. Al acabar queda «✻ Baked for 8s», sin `…`.
+fn is_spinner(line: &str) -> bool {
+    let line = line.trim_start();
+    let mut chars = line.chars();
+    let glyph = chars.next().is_some_and(|c| !c.is_alphanumeric());
+    glyph
+        && chars.next() == Some(' ')
+        && line.split_once("… (").is_some_and(|(_, rest)| {
+            let digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            digits.len() < rest.len() && digits.starts_with(['s', 'm', 'h'])
+        })
 }
 
 /// Lo que deja Claude Code al interrumpir un turno (p. ej. al rechazar un
@@ -223,7 +240,7 @@ pub fn classify(obs: &Observation, hook: Option<&HookStatus>) -> Status {
     if BLOCKED.iter().any(|p| tail.contains(p)) {
         return Status::Blocked;
     }
-    if WORKING.iter().any(|p| shows_working(&tail, p)) {
+    if shows_working(&tail) {
         return Status::Working;
     }
     let changed_recently = obs
@@ -320,6 +337,20 @@ mod tests {
             Status::Working
         );
         assert_eq!(classify(&obs("❯ 1. Sí\n  esc to c…"), None), Status::Idle);
+        // Más angosto aún el pie ya no dice nada, pero queda el spinner.
+        assert_eq!(
+            classify(&obs("✢ Wandering… (52s · ↓ 3.1k tokens)\n  esc t…"), None),
+            Status::Working
+        );
+        assert_eq!(
+            classify(&obs("· Improvising… (1m 38s)"), None),
+            Status::Working
+        );
+        // Al acabar el spinner se queda quieto, sin `…`.
+        assert_eq!(
+            classify(&obs("✻ Baked for 8s · done 11:27 a.m.\n❯ "), None),
+            Status::Idle
+        );
         // Pedir permiso pesa más que estar trabajando.
         assert_eq!(
             classify(&obs("esc to interrupt\nAllow once"), None),

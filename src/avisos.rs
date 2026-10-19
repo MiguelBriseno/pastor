@@ -389,9 +389,18 @@ mod tests {
     fn serve_sabe_si_hay_una_tui_abierta() {
         let dir = std::env::temp_dir().join(format!("pastor-tui-{}", std::process::id()));
         assert!(!tui_open_in(&dir));
+        // Con reintentos: un hijo que otro test lanza en ese momento comparte
+        // hasta su `exec` el candado entero que toma `tui_open_in` al mirar.
         let take = || {
             let f = open_lock(&dir, "tui.lock").unwrap();
-            f.try_lock_shared().unwrap();
+            let start = Instant::now();
+            while f.try_lock_shared().is_err() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "no se pudo compartir"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
             f
         };
         // Dos TUI a la vez: hasta que salen las dos, sigue habiendo una.
