@@ -34,6 +34,7 @@ use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::limits::{self, Usage};
 use crate::ops::{self, AssignTarget, Place, Snapshot, Tracker};
+use crate::remote;
 use crate::store::{self, Agent, State, Task, TaskStatus, Worktree};
 use crate::text::{self, truncate};
 use crate::worktree;
@@ -194,6 +195,10 @@ struct App {
     observer_retry: Option<Instant>,
     observer_since: Instant,
     actions: Actions,
+    /// Los agentes de las otras máquinas.
+    remotes: remote::Poller,
+    /// Las máquinas que no respondían en la última recarga: se avisa una vez.
+    offline: Vec<String>,
     /// Índice en `state.agents`, que está ordenado por proyecto.
     agent_sel: ListState,
     /// La lista que se dibuja: con los encabezados de proyecto, sus filas no
@@ -235,6 +240,8 @@ impl App {
             observer_retry: None,
             observer_since: Instant::now(),
             actions: Actions::spawn(),
+            remotes: remote::Poller::spawn(REFRESH),
+            offline: Vec::new(),
             agent_sel: ListState::default(),
             agent_rows: ListState::default(),
             task_sel: TableState::default(),
@@ -393,11 +400,48 @@ impl App {
         }
     }
 
+    /// Suma a `agents` los de las otras máquinas, con su estado y, si se está
+    /// mirando uno, su pantalla. Avisa una vez de cada máquina que deja de
+    /// responder.
+    fn add_remotes(&mut self, agents: &mut Vec<Agent>) {
+        let mut offline = Vec::new();
+        {
+            let seen = self.remotes.seen();
+            for (host, result) in &seen.hosts {
+                match result {
+                    Ok(list) => {
+                        for (a, status) in list {
+                            let screen = seen.screens.get(&a.id).cloned().unwrap_or_default();
+                            let snap = Snapshot {
+                                status: *status,
+                                screen,
+                                term: None,
+                            };
+                            self.snaps.insert(a.id.clone(), snap);
+                            agents.push(a.clone());
+                        }
+                    }
+                    Err(e) => offline.push((host.clone(), e.clone())),
+                }
+            }
+        }
+        let new: Vec<String> = offline
+            .iter()
+            .filter(|(h, _)| !self.offline.contains(h))
+            .map(|(h, e)| format!("{h}: sin conexión ({e})"))
+            .collect();
+        self.offline = offline.into_iter().map(|(h, _)| h).collect();
+        if !new.is_empty() {
+            self.set_flash(new.join(" · "));
+        }
+    }
+
     /// Recarga el estado y pide al observador que mire los paneles ya, para
     /// que lo que se acaba de hacer se vea sin esperar al siguiente segundo.
     fn refresh(&mut self) {
         self.reload();
         self.observer.wake();
+        self.remotes.wake();
     }
 
     fn reload(&mut self) {
@@ -410,6 +454,7 @@ impl App {
         self.dirty = true;
         match State::load() {
             Ok(mut s) => {
+                self.add_remotes(&mut s.agents);
                 // Los de un mismo proyecto, juntos: así se ven y así se recorren.
                 store::sort_by_project(&mut s.agents);
                 self.state = s;
@@ -680,7 +725,8 @@ impl App {
                         .state
                         .agents
                         .iter()
-                        .filter(|a| self.status(&a.id) != Status::Dead)
+                        // Las tareas son de esta máquina: las de otra van con su pastor.
+                        .filter(|a| a.host.is_none() && self.status(&a.id) != Status::Dead)
                         .map(|a| AssignOpt::Agent(a.id.clone(), format!("{} ({})", a.name, a.kind)))
                         .collect();
                     options.extend(Kind::ALL.map(AssignOpt::New));
@@ -1077,19 +1123,16 @@ impl App {
         } else {
             let agents = &self.state.agents;
             // Con un solo proyecto, la lista de siempre, sin encabezados.
-            let many = agents.iter().any(|a| a.project() != agents[0].project());
+            let many = agents.iter().any(|a| !a.same_project(&agents[0]));
             let mut items: Vec<ListItem> = Vec::new();
             let mut row = None;
             // El encabezado del grupo del seleccionado, para que no quede
             // fuera de la vista al subir.
             let mut header = None;
             for (i, a) in agents.iter().enumerate() {
-                let first = many && (i == 0 || agents[i - 1].project() != a.project());
+                let first = many && (i == 0 || !agents[i - 1].same_project(a));
                 if first {
-                    let n = agents[i..]
-                        .iter()
-                        .take_while(|b| b.project() == a.project())
-                        .count();
+                    let n = agents[i..].iter().take_while(|b| b.same_project(a)).count();
                     items.push(ListItem::new(Line::from(vec![
                         Span::styled(
                             format!(" {}{}", pad(ic.folder), a.project_name()),
@@ -1152,6 +1195,9 @@ impl App {
             f.render_widget(Block::bordered().border_type(BorderType::Rounded), right);
             return;
         };
+        // De uno de otra máquina, su pantalla se trae solo mientras se mira.
+        self.remotes
+            .focus(a.host.is_some().then_some(a.id.as_str()));
         let snap = self.snaps.get(&a.id);
         let screen = snap.map_or("", |s| s.screen.as_str());
 

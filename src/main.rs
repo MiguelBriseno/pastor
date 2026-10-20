@@ -8,6 +8,7 @@ mod ntfy;
 mod ops;
 #[cfg(feature = "serve")]
 mod pty;
+mod remote;
 #[cfg(feature = "serve")]
 mod server;
 mod store;
@@ -18,6 +19,7 @@ mod transcript;
 mod tui;
 mod worktree;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -54,10 +56,18 @@ enum Cmd {
         /// Trabaja en su propio worktree de git, en una rama nueva
         #[arg(short, long)]
         worktree: bool,
+        /// Lo lanza en otra máquina (ver `pastor host`). Sin --cwd, en su
+        /// directorio personal
+        #[arg(long, value_name = "MÁQUINA")]
+        host: Option<String>,
     },
-    /// Lista los agentes y su estado
+    /// Lista los agentes y su estado, también los de otras máquinas
     #[command(alias = "ls")]
-    List,
+    List {
+        /// En JSON, solo los de esta máquina (para otro pastor)
+        #[arg(long)]
+        json: bool,
+    },
     /// Entra a la terminal de un agente (sal con Ctrl-b d)
     Attach {
         /// Id o nombre del agente
@@ -92,6 +102,11 @@ enum Cmd {
         /// Id o nombre del agente
         #[arg(value_name = "AGENTE")]
         agent: String,
+        /// Antes lo ajusta a este ancho (lo usa otro pastor)
+        #[arg(long, hide = true, requires = "rows")]
+        cols: Option<u16>,
+        #[arg(long, hide = true, requires = "cols")]
+        rows: Option<u16>,
     },
     /// Abre (o cierra) una terminal al lado del agente, p. ej. para `npm run dev`
     Term {
@@ -126,6 +141,9 @@ enum Cmd {
     /// Gestiona tareas
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Registra otras máquinas para manejar sus agentes por SSH
+    #[command(subcommand)]
+    Host(HostCmd),
     /// Sirve una API HTTP para manejar los agentes desde otro dispositivo
     #[cfg(feature = "serve")]
     Serve {
@@ -139,6 +157,28 @@ enum Cmd {
     /// Uso interno: lo llaman los hooks de Claude Code
     #[command(hide = true)]
     Hook { event: String },
+}
+
+#[derive(Subcommand)]
+enum HostCmd {
+    /// Registra una máquina. Necesita SSH sin contraseña (con llave) y
+    /// pastor instalado allá
+    Add {
+        /// Nombre corto para ella (va delante del id de sus agentes: servidor:a1)
+        #[arg(value_name = "NOMBRE")]
+        name: String,
+        /// Destino de SSH: usuario@host o un alias de ~/.ssh/config
+        #[arg(value_name = "DESTINO")]
+        dest: String,
+    },
+    /// Lista las máquinas registradas y si responden
+    #[command(alias = "ls")]
+    List,
+    /// Olvida una máquina (sus agentes siguen corriendo allá)
+    Rm {
+        #[arg(value_name = "NOMBRE")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -273,7 +313,18 @@ fn main() -> Result<()> {
                 .action(ArgAction::Version)
                 .help("Muestra la versión"),
         );
-    let cli = Cli::from_arg_matches(&cmd.get_matches())
+    // Otro pastor, por SSH, manda los argumentos en hexadecimal para que el
+    // shell de aquí no los toque.
+    let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(remote::HEX_ARGS) {
+        let decoded = args[2..]
+            .iter()
+            .map(|a| remote::unhex(a))
+            .collect::<Result<Vec<_>>>()?;
+        args.truncate(1);
+        args.extend(decoded);
+    }
+    let cli = Cli::from_arg_matches(&cmd.get_matches_from(args))
         .map_err(|e| e.exit())
         .unwrap();
     // Antes de cualquier cambio, para que la línea base cuente solo lo previo.
@@ -296,6 +347,31 @@ fn main() -> Result<()> {
             name,
             prompt,
             worktree,
+            host: Some(host),
+        }) => {
+            let mut args = vec!["new".to_string(), kind.to_string()];
+            if let Some(c) = cwd {
+                args.extend(["--cwd".into(), c.to_string_lossy().into_owned()]);
+            }
+            if let Some(n) = name {
+                args.push(format!("--name={n}"));
+            }
+            // Con `=`: si empieza por `-`, que allá no se tome como opción.
+            args.extend(prompt.map(|p| format!("--prompt={p}")));
+            if worktree {
+                args.push("--worktree".into());
+            }
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            print!("{}", remote::run(&host, &args)?);
+            Ok(())
+        }
+        Some(Cmd::New {
+            kind,
+            cwd,
+            name,
+            prompt,
+            worktree,
+            host: None,
         }) => {
             let place = if worktree {
                 Place::NewWorktree(None)
@@ -314,18 +390,55 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::List) => {
+        Some(Cmd::List { json: true }) => {
             hooks::prune_status();
-            let mut state = State::load()?;
-            if state.agents.is_empty() {
+            let state = State::load()?;
+            let snaps = ops::observe(&state, &mut ops::Tracker::default())?;
+            let listed: Vec<remote::Listed> = state
+                .agents
+                .into_iter()
+                .map(|a| {
+                    let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
+                    remote::Listed {
+                        agent: a,
+                        status: st.key().into(),
+                        status_label: st.label().into(),
+                    }
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&listed)?);
+            Ok(())
+        }
+        Some(Cmd::List { json: false }) => {
+            hooks::prune_status();
+            let state = State::load()?;
+            let snaps = ops::observe(&state, &mut ops::Tracker::default())?;
+            let mut agents: Vec<(store::Agent, Status)> = state
+                .agents
+                .into_iter()
+                .map(|a| {
+                    let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
+                    (a, st)
+                })
+                .collect();
+            let remotes = remote::all_agents(&remote::hosts()?);
+            let mut offline = Vec::new();
+            for (host, result) in remotes {
+                match result {
+                    Ok(list) => agents.extend(list),
+                    Err(e) => offline.push(format!("{host}: sin conexión ({e:#})")),
+                }
+            }
+            if agents.is_empty() && offline.is_empty() {
                 println!("No hay agentes. Lanza uno con `pastor new claude`.");
             }
-            let snaps = ops::observe(&state, &mut ops::Tracker::default())?;
-            store::sort_by_project(&mut state.agents);
-            let groups: Vec<&[store::Agent]> = state
-                .agents
-                .chunk_by(|a, b| a.project() == b.project())
-                .collect();
+            let mut sorted: Vec<store::Agent> = agents.iter().map(|(a, _)| a.clone()).collect();
+            store::sort_by_project(&mut sorted);
+            let status: HashMap<&str, Status> =
+                agents.iter().map(|(a, st)| (a.id.as_str(), *st)).collect();
+            let groups: Vec<&[store::Agent]> = sorted.chunk_by(|a, b| a.same_project(b)).collect();
+            // Los de otras máquinas llevan su nombre delante: más anchos.
+            let id_w = sorted.iter().map(|a| a.id.len()).max().unwrap_or(0).max(5);
             for (i, group) in groups.iter().enumerate() {
                 // Con un solo proyecto, sin encabezados.
                 if groups.len() > 1 {
@@ -336,9 +449,9 @@ fn main() -> Result<()> {
                     println!("{} ({})", a.project_name(), a.project().display());
                 }
                 for a in *group {
-                    let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
+                    let st = status[a.id.as_str()];
                     println!(
-                        "{:<5} {} {:<11} {} {:<9} {}",
+                        "{:<id_w$} {} {:<11} {} {:<9} {}",
                         a.id,
                         st.icon(),
                         st.label(),
@@ -347,6 +460,9 @@ fn main() -> Result<()> {
                         a.cwd.display()
                     );
                 }
+            }
+            for line in offline {
+                eprintln!("{line}");
             }
             Ok(())
         }
@@ -372,7 +488,13 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Send { agent, text }) => ops::send(&agent, &text.join(" ")),
         Some(Cmd::Keys { agent, keys }) => ops::send_keys(&agent, &keys),
-        Some(Cmd::Screen { agent }) => {
+        Some(Cmd::Screen { agent, cols, rows }) => {
+            if let (Some(cols), Some(rows)) = (cols, rows) {
+                // Si cambió, una pausa para que el agente alcance a redibujarse.
+                if ops::fit(&agent, cols, rows)? {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
             println!("{}", ops::screen(&agent)?);
             Ok(())
         }
@@ -383,6 +505,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Restore { agent: None }) => restore_lost(),
         Some(Cmd::Task(cmd)) => task_cmd(cmd),
+        Some(Cmd::Host(cmd)) => host_cmd(cmd),
     }
 }
 
@@ -436,6 +559,40 @@ fn term_command(args: &[String]) -> Option<String> {
                 .join(" "),
         ),
     }
+}
+
+fn host_cmd(cmd: HostCmd) -> Result<()> {
+    match cmd {
+        HostCmd::Add { name, dest } => {
+            remote::add_host(&name, &dest)?;
+            // Que se sepa ya si va a funcionar, no la primera vez que se use.
+            match remote::agents(&name) {
+                Ok(list) => println!(
+                    "Máquina {name} registrada: responde y tiene {} agente(s)",
+                    list.len()
+                ),
+                Err(e) => println!("Máquina {name} registrada, pero no responde: {e:#}"),
+            }
+        }
+        HostCmd::List => {
+            let hosts = remote::hosts()?;
+            if hosts.is_empty() {
+                println!(
+                    "No hay máquinas. Registra una con `pastor host add servidor usuario@host`."
+                );
+            }
+            let answers: HashMap<_, _> = remote::all_agents(&hosts).into_iter().collect();
+            for (name, dest) in &hosts {
+                let st = match &answers[name] {
+                    Ok(list) => format!("{} agente(s)", list.len()),
+                    Err(e) => format!("sin conexión: {e:#}"),
+                };
+                println!("{:<12} {:<28} {st}", name, dest);
+            }
+        }
+        HostCmd::Rm { name } => remote::remove_host(&name)?,
+    }
+    Ok(())
 }
 
 fn task_cmd(cmd: TaskCmd) -> Result<()> {

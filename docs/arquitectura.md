@@ -43,6 +43,7 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
 | `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular |
 | `src/pty.rs` | Un proceso en un pseudoterminal propio, para la terminal del celular (solo con `serve`) |
+| `src/remote.rs` | Las otras máquinas: su registro, `ssh` con conexión compartida y el hilo que pregunta por sus agentes |
 | `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
 | `web/` | La app del celular (PWA) que sirve `pastor serve` en `/`: HTML, CSS y JS sin build, metidos en el binario, con xterm.js para la terminal |
 
@@ -188,6 +189,28 @@ repositorio del que salió, y sin repositorio (o en agentes de versiones anterio
 La TUI ordena su copia de `state.json` por proyecto al recargar, con un orden estable: así la
 selección sigue siendo un índice de `agents` y solo la lista que se dibuja lleva encabezados, con su
 propio `ListState`. Con un solo proyecto no hay encabezados.
+
+### Otras máquinas: pastor le habla a pastor
+
+Cada máquina tiene su pastor, dueño de sus agentes; este solo le pregunta. Un id con el nombre de
+una máquina registrada delante (`servidor:a3`) es de allá: las funciones de `ops` que reciben un
+agente (`send`, `screen`, `kill`, `restore`, `term`, `attach`, `fit`) lo ven con `remote::split` y
+corren el mismo comando allá con `ssh servidor pastor …`. Así la CLI y la TUI no saben nada de SSH.
+`pastor ls --json` le da la lista a la otra máquina; esos agentes se ven aquí con su `id` cambiado y
+`host` puesto, un campo que nunca se guarda en `state.json`. El proyecto de un agente incluye su
+máquina, para que la misma ruta en dos máquinas no se junte.
+
+Lo que se escribe pasa por el shell de allá, que puede ser cualquiera (fish cita distinto que sh).
+Por eso el comando remoto es fijo, `sh -c '…exec pastor "$@"' pastor _hex …`, y los argumentos van
+en hexadecimal con una `x` delante: solo letras y números, que ningún shell interpreta. pastor los
+decodifica antes de que los lea clap.
+
+`ssh` va con `BatchMode` (nunca pide contraseña), `ConnectTimeout` y una conexión compartida por
+máquina (`ControlMaster`, con el socket en `~/.local/share/pastor/ssh/%C`) que dura 10 minutos: la
+TUI pregunta cada segundo, y con la conexión abierta cada pregunta tarda unos milisegundos. Lo hace
+un hilo aparte del observador (`remote::Poller`), que pregunta a todas las máquinas a la vez: una
+lenta o caída no frena lo local. De la pantalla solo trae la del agente que se está mirando. Un
+`exit 255` es de ssh (no se pudo conectar); cualquier otro error es el de pastor allá.
 
 ### Restaurar agentes
 

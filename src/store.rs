@@ -46,6 +46,11 @@ pub struct Agent {
     /// llama `project`: la API lo aplana junto a su propio `project`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<PathBuf>,
+    /// La máquina donde corre, si no es esta: un agente que se leyó de otra
+    /// por SSH. Su `id` lleva delante el nombre de la máquina (`servidor:a3`).
+    /// Nunca se guarda: lo que está en `state.json` es de esta máquina.
+    #[serde(skip)]
+    pub host: Option<String>,
 }
 
 impl Agent {
@@ -60,26 +65,39 @@ impl Agent {
             .unwrap_or(&self.cwd)
     }
 
-    /// El nombre corto del proyecto: su carpeta.
+    /// El nombre corto del proyecto: su carpeta y, si es de otra máquina,
+    /// cuál.
     pub fn project_name(&self) -> String {
         let p = self.project();
-        p.file_name().map_or_else(
+        let name = p.file_name().map_or_else(
             || p.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
-        )
+        );
+        match &self.host {
+            Some(h) => format!("{name} @ {h}"),
+            None => name,
+        }
+    }
+
+    /// Si trabaja en el mismo proyecto que `other`: la misma ruta en la
+    /// misma máquina.
+    pub fn same_project(&self, other: &Agent) -> bool {
+        self.host == other.host && self.project() == other.project()
     }
 }
 
 /// Junta a los agentes de un mismo proyecto: cada proyecto en el orden en
 /// que apareció su primer agente y, dentro, en el orden que tenían.
 pub fn sort_by_project(agents: &mut [Agent]) {
-    let mut order: Vec<PathBuf> = Vec::new();
+    let key = |a: &Agent| (a.host.clone(), a.project().to_path_buf());
+    let mut order = Vec::new();
     for a in agents.iter() {
-        if !order.iter().any(|p| p == a.project()) {
-            order.push(a.project().to_path_buf());
+        let k = key(a);
+        if !order.contains(&k) {
+            order.push(k);
         }
     }
-    agents.sort_by_key(|a| order.iter().position(|p| p == a.project()));
+    agents.sort_by_key(|a| order.iter().position(|k| *k == key(a)));
 }
 
 /// Un worktree de git que pastor creó para un agente: su propia copia del
@@ -276,6 +294,7 @@ impl State {
             worktree: None,
             session: None,
             repo: None,
+            host: None,
         };
         self.agents.push(agent.clone());
         agent
@@ -447,6 +466,17 @@ mod tests {
         sort_by_project(&mut s.agents);
         let ids: Vec<&str> = s.agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["a1", "a3", "a4", "a2", "a5"]);
+
+        // La misma ruta en otra máquina es otro proyecto.
+        let mut remoto = s.agents[0].clone();
+        remoto.id = "servidor:a1".into();
+        remoto.host = Some("servidor".into());
+        assert!(!remoto.same_project(&s.agents[0]));
+        assert_eq!(remoto.project_name(), "web @ servidor");
+        s.agents.insert(1, remoto);
+        sort_by_project(&mut s.agents);
+        let ids: Vec<&str> = s.agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["a1", "a3", "a4", "servidor:a1", "a2", "a5"]);
     }
 
     #[test]
