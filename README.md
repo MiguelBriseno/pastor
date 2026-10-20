@@ -28,6 +28,9 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   en el celular con [ntfy](https://ntfy.sh) si lo configuras.
 - **Tareas.** Crea tareas y asígnalas a un agente existente o a uno nuevo. Cuando el agente
   termina, la tarea pasa sola a *por revisar*.
+- **Un worktree de git por agente.** Varios agentes pueden trabajar en el mismo repositorio, cada
+  uno en su rama, sin pisarse. Al revisar una tarea ves su diff, la apruebas (se integra en tu
+  rama) o se la devuelves al agente con lo que hay que cambiar.
 - **Historial** desde que instalaste pastor: sesiones, tareas, mensajes, tiempos y actividad
   por día.
 - **Dashboard** con el resumen de agentes, el progreso de las tareas y lo que necesita tu
@@ -159,12 +162,45 @@ con `t`.
 | `⏎` o `a` | Asignar la tarea a un agente existente o a uno nuevo |
 | `espacio` | Avanzar el estado: pendiente → en curso → por revisar → hecha |
 | `d` | Marcar como hecha |
+| `v` | Ver lo que cambió en su worktree (con el paginador de git; sal con `q`) |
+| `A` | Aprobar: integra su rama, termina a su agente y borra el worktree (pide confirmación) |
+| `r` | Pedir cambios: le manda tu comentario al agente y la tarea vuelve a *en curso* |
 | `g` | Ir al agente que tiene la tarea |
 | `x` | Borrar la tarea (pide confirmación) |
 | `<` `>` | Agrandar / achicar el panel de descripción |
 
 Al asignar una tarea, pastor le envía al agente el título y la descripción como mensaje, y la
 marca *en curso*. Cuando el agente termina, pasa a *por revisar*.
+
+#### Worktrees
+
+Al asignar una tarea a un agente nuevo dentro de un repositorio de git, el formulario propone
+**Worktree: sí** (cámbialo con `←` `→`). pastor crea entonces una copia del repositorio en
+`~/.local/share/pastor/worktrees/` con una rama nueva, `pastor/t3-migrar-login`, que sale del
+commit actual, y el agente trabaja ahí. Tus archivos y los de los demás agentes no se tocan.
+
+Cuando la tarea está *por revisar*:
+
+- `v` muestra todo lo que cambió desde que salió la rama: commits, cambios sin commit y archivos
+  nuevos.
+- `A` guarda en un commit lo que el agente dejó sin guardar (`[t3] título`), integra la rama en la
+  rama en la que esté tu repositorio (`git merge`), termina al agente y borra el worktree y la
+  rama. Si hay conflictos, pastor deshace el merge y deja tu repositorio como estaba: pídele al
+  agente con `r` que integre tu rama en la suya y vuelve a aprobar. Si tienes cambios sin commit
+  que el merge pisaría, git se niega y pastor te muestra por qué.
+- `r` le manda tu comentario al agente.
+
+Si el agente ya no existe, vuelve a asignar la tarea a uno nuevo con **Worktree: sí** (el
+formulario ya lo propone): trabajará en el mismo worktree. Si la asignas sin worktree, o a un agente
+que ya existe, la tarea deja su worktree y se revisa en el directorio del agente.
+Al terminar un agente o borrar una tarea, su worktree se borra solo si no tiene cambios; si los
+tiene, se queda para que no se pierda trabajo (`git worktree list` en tu repositorio lo muestra).
+
+También puedes lanzar un agente suelto en su worktree con el campo **Worktree** del formulario
+de agente nuevo, o con `pastor new claude --worktree`.
+
+> Como la carpeta del worktree es nueva, Claude Code y Codex preguntan si confías en ella: el
+> agente aparece como *esperando* hasta que respondes.
 
 ### 3 · Dashboard
 
@@ -206,6 +242,7 @@ pastor new claude                                   # en el directorio actual
 pastor new codex --cwd ~/proyectos/web --name web   # con directorio y nombre
 pastor new claude -p "arregla los tests que fallan" # con un primer mensaje
 pastor new codex --prompt="-v revisa el diff"       # si el texto empieza por "-", con "="
+pastor new claude --worktree                        # en su propio worktree y rama
 
 pastor ls                     # lista agentes y su estado
 pastor attach web             # entra a su terminal (salir con Ctrl-b d)
@@ -229,6 +266,11 @@ pastor task ls
 
 pastor task assign t1 --new claude --cwd ~/proyectos/api   # con un agente nuevo
 pastor task assign t1 --agent api                          # con uno que ya existe
+pastor task assign t1 --new claude --worktree              # con uno nuevo en su worktree
+
+pastor task diff t1            # lo que cambió en su worktree (--stat para el resumen)
+pastor task reject t1 "falta cubrir el caso de contraseña vacía"
+pastor task approve t1         # integra su rama, termina al agente y borra el worktree
 
 pastor task done t1
 pastor task rm t1
@@ -254,7 +296,7 @@ IP de Tailscale (que ya cifra).
 | Método | Ruta | Cuerpo |
 |---|---|---|
 | `GET` | `/api/agents` | — (cada agente trae `status`: `starting`, `working`, `blocked`, `idle` o `dead`) |
-| `POST` | `/api/agents` | `{"kind": "claude", "cwd": "/ruta", "name"?, "prompt"?}` |
+| `POST` | `/api/agents` | `{"kind": "claude", "cwd": "/ruta", "name"?, "prompt"?, "worktree"?}` |
 | `POST` | `/api/agents/{id}/send` | `{"text": "..."}` (lo pega y pulsa Enter) |
 | `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
 | `GET` | `/api/agents/{id}/screen` | — (responde `{"text": "..."}`, lo que se ve en su panel; con `?cols=48&rows=30` antes lo ajusta a ese tamaño) |
@@ -262,8 +304,10 @@ IP de Tailscale (que ya cifra).
 | `DELETE` | `/api/agents/{id}` | — |
 | `GET` | `/api/tasks` | — |
 | `POST` | `/api/tasks` | `{"title": "...", "description"?}` |
-| `POST` | `/api/tasks/{id}/assign` | `{"agent": "web"}` o `{"kind": "claude", "cwd": "/ruta"}` |
+| `POST` | `/api/tasks/{id}/assign` | `{"agent": "web"}` o `{"kind": "claude", "cwd": "/ruta", "worktree"?: true}` |
 | `POST` | `/api/tasks/{id}/done` | — |
+| `POST` | `/api/tasks/{id}/approve` | — |
+| `POST` | `/api/tasks/{id}/reject` | `{"text": "..."}` |
 | `DELETE` | `/api/tasks/{id}` | — |
 | `GET` | `/api/stats` | — (las estadísticas de la pestaña Historial; las duraciones van en segundos) |
 
@@ -471,6 +515,7 @@ En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` e
 - `history.jsonl`: el historial de eventos para la pestaña Historial. Si lo borras con pastor
   cerrado, empieza de nuevo pero conserva los totales de agentes y tareas que ya había
 - `status/`: el último estado que reportó cada agente de Claude Code
+- `worktrees/`: los worktrees de git de los agentes
 - `claude-settings.json`: los hooks que se le pasan a Claude Code
 
 **¿Cómo desinstalo pastor?**
@@ -487,7 +532,8 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [x] Agentes sobre tmux, CLI, interfaz, estados y notificaciones
 - [x] Tareas y dashboard
 - [ ] Agrupar agentes por proyecto
-- [ ] Un worktree de git por agente, para trabajar en paralelo sobre el mismo repositorio
+- [x] Un worktree de git por agente, para trabajar en paralelo sobre el mismo repositorio, y
+  revisar e integrar las tareas
 - [ ] Restaurar agentes después de reiniciar
 - [ ] Integraciones con Slack y Asana
 - [ ] Manejar agentes en otras máquinas por SSH

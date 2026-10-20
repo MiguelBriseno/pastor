@@ -35,6 +35,22 @@ pub struct Agent {
     /// Último comando usado en la terminal secundaria (p. ej. "npm run dev").
     #[serde(default)]
     pub term_cmd: Option<String>,
+    /// Si trabaja en su propio worktree de git, cuál.
+    #[serde(default)]
+    pub worktree: Option<Worktree>,
+}
+
+/// Un worktree de git que pastor creó para un agente: su propia copia del
+/// repositorio en su propia rama.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Worktree {
+    /// El repositorio de donde salió, donde se integra la rama al aprobar.
+    pub repo: PathBuf,
+    pub path: PathBuf,
+    pub branch: String,
+    /// El commit del que salió la rama: lo que hay que revisar es lo que
+    /// cambió desde aquí.
+    pub base: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +97,9 @@ pub struct Task {
     pub source: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+    /// El worktree donde se hizo la tarea, para revisarla e integrarla.
+    #[serde(default)]
+    pub worktree: Option<Worktree>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -212,6 +231,7 @@ impl State {
             created_at: Utc::now(),
             task: None,
             term_cmd: None,
+            worktree: None,
         };
         self.agents.push(agent.clone());
         agent
@@ -237,6 +257,7 @@ impl State {
             created_at: Utc::now(),
             source: None,
             url: None,
+            worktree: None,
         };
         self.tasks.push(task.clone());
         task

@@ -39,6 +39,7 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/tmux.rs` | Capa fina sobre el binario `tmux` |
 | `src/store.rs` | Modelo de datos (`Agent`, `Task`) y persistencia en `state.json` |
 | `src/history.rs` | Historial de eventos en `history.jsonl` y las estadísticas de la pestaña Historial |
+| `src/worktree.rs` | Los worktrees de git de los agentes: crearlos, ver su diff, integrarlos y borrarlos |
 | `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
 | `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular |
 | `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
@@ -149,6 +150,17 @@ Un estado de hook se considera viejo cuando la pantalla cambió después de él;
   reconoce la lista de `BLOCKED` (p. ej. uno de MCP) puede pasar a *inactivo*. Se prefiere eso a
   un *esperando* que no se va nunca.
 
+### Un worktree por agente
+Un agente lanzado con worktree trabaja en `worktrees/<repo>-<nombre>` con la rama `pastor/<nombre>`,
+que sale del `HEAD` del repositorio. El `Worktree` (repositorio, carpeta, rama y commit base) se
+guarda en el agente y, al asignarle una tarea, también en la tarea: así la tarea se puede revisar e
+integrar aunque el agente ya no esté, y volver a asignarla lanza al nuevo agente en el mismo
+worktree. El diff es siempre contra el commit base y no contra la rama del repositorio, para ver
+solo lo que hizo el agente aunque tu rama haya avanzado; los archivos nuevos se marcan con
+`git add -N` para que salgan. Al terminar un agente o borrar una tarea, el worktree se borra solo si
+nadie más lo usa y no tiene cambios (ni archivos sin commit ni commits nuevos): pastor nunca tira
+trabajo. Aprobar hace el commit de lo pendiente, `git merge` en la rama actual del repositorio
+(con conflictos, `merge --abort`), termina al agente y borra worktree y rama.
 ### Hooks de Claude Code
 
 Al lanzar Claude Code se le pasa `--settings ~/.local/share/pastor/claude-settings.json` y la
