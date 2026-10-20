@@ -311,6 +311,19 @@ fn agent_target(agent: &Agent) -> Result<String> {
     }
 }
 
+/// La sesión de tmux del agente, para entrar en ella desde otro lado. A
+/// diferencia de `agent_target`, vale aunque el agente haya salido: entrar
+/// es justo cómo se vuelve a abrir.
+#[cfg(feature = "serve")]
+pub fn attach_session(agent_key: &str) -> Result<String> {
+    let state = State::load()?;
+    let agent = state.find_agent(agent_key)?;
+    if !tmux::panes()?.contains_key(&agent.id) {
+        bail!("{} no tiene sesión de tmux; restáuralo primero", agent.name);
+    }
+    Ok(agent.id.clone())
+}
+
 pub fn send(agent_key: &str, text: &str) -> Result<()> {
     if text.trim().is_empty() {
         bail!("el mensaje está vacío");

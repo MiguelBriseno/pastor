@@ -21,6 +21,14 @@ fn tmux() -> Command {
     c
 }
 
+/// `tmux attach` a la sesión `name`, para correrlo en un pseudoterminal.
+#[cfg(feature = "serve")]
+pub fn attach_command(name: &str) -> Command {
+    let mut c = tmux();
+    c.args(["attach-session", "-t", &session(name)]);
+    c
+}
+
 /// Destino de la sesión `name` y solo de ella: sin `=`, si no existe, tmux
 /// acepta cualquier sesión que empiece igual (`a1` llegaría a `a12`).
 fn session(name: &str) -> String {

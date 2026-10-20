@@ -15,8 +15,13 @@ const TASK_LABEL = Object.fromEntries(TASKS.map(([s, , one]) => [s, one]));
 const KEYS = [
   ["Escape", "Esc"], ["Enter", "⏎"], ["Up", "↑"], ["Down", "↓"], ["Left", "←"], ["Right", "→"],
   ["Tab", "Tab"], ["BTab", "⇧Tab"], ["Space", "Espacio"], ["1", "1"], ["2", "2"], ["3", "3"],
-  ["y", "y"], ["n", "n"], ["C-c", "Ctrl-C"],
+  ["y", "y"], ["n", "n"], ["C-c", "Ctrl-C"], ["C-b", "Ctrl-B"],
 ];
+/** Lo que manda cada tecla en la terminal en vivo, donde no pasa por tmux. */
+const SEQ = {
+  Escape: "\x1b", Enter: "\r", Up: "\x1b[A", Down: "\x1b[B", Right: "\x1b[C", Left: "\x1b[D",
+  Tab: "\t", BTab: "\x1b[Z", Space: " ", "C-c": "\x03", "C-b": "\x02",
+};
 
 // Trazos de Lucide (ISC). Texto fijo nuestro: se puede meter con innerHTML.
 const ICONS = {
@@ -58,7 +63,7 @@ function h(tag, props = {}, ...kids) {
     if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (k === "class") el.className = v;
     else if (k === "text") el.textContent = v;
-    // Por CSSOM y no como atributo: la CSP del servidor bloquea los estilos inline.
+    // Por CSSOM y no como atributo, por si la CSP vuelve a cerrar los estilos inline.
     else if (k === "style") el.style.cssText = v;
     else if (k in el && typeof v !== "string") el[k] = v;
     else el.setAttribute(k, v);
@@ -566,6 +571,123 @@ function termSize(el) {
   return cols > 0 && rows > 0 ? { cols, rows } : null;
 }
 
+// ---------- terminal en vivo ----------
+
+/** xterm.js pesa: se carga la primera vez que se abre una terminal. */
+let xtermLoad = null;
+function loadXterm() {
+  const script = (src) => new Promise((ok, fail) => document.head.append(h("script", { src, onload: ok, onerror: fail })));
+  xtermLoad ||= (async () => {
+    document.head.append(h("link", { rel: "stylesheet", href: "xterm.css" }));
+    await script("xterm.js");
+    await script("xterm-addon-fit.js");
+  })().catch((e) => { xtermLoad = null; throw e; });
+  return xtermLoad;
+}
+
+/** La sesión de tmux del agente, en vivo: lo que escribes le llega tal cual y
+ * se ve lo mismo que con `pastor attach`. La conexión solo vive mientras la
+ * vista está abierta: un cliente de tmux conectado manda en el tamaño. */
+function liveTerm(id) {
+  const box = h("div", { class: "live-box" });
+  const status = h("div", { class: "live-status", hidden: true });
+  const el = h("div", { class: "term-wrap live", hidden: true }, box, status);
+  let term = null, fit = null, ws = null, want = false, timer;
+  const say = (text, retry) => {
+    status.replaceChildren(h("span", { text }),
+      ...(retry ? [h("button", { type: "button", class: "btn", text: "Reconectar", onclick: connect })] : []));
+    status.hidden = !text;
+  };
+  const enc = new TextEncoder();
+  const send = (data) => { if (ws?.readyState === WebSocket.OPEN) ws.send(enc.encode(data)); };
+  // Lo que xterm.js da como binario (algunos reportes del ratón) son bytes
+  // sueltos: van tal cual, sin pasar por UTF-8.
+  const sendBinary = (data) => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(Uint8Array.from(data, (c) => c.charCodeAt(0)));
+  };
+  const connect = async () => {
+    if (!want) return;
+    say("Conectando…");
+    try {
+      await loadXterm();
+    } catch {
+      return say("No pude cargar la terminal", true);
+    }
+    if (!want) return;
+    if (!term) {
+      term = new Terminal({
+        fontFamily: getComputedStyle(document.body).getPropertyValue("--mono"),
+        fontSize: Math.min(18, Math.max(9, Number(store.get("pastor-font")) || 12)),
+        theme: { background: getComputedStyle(document.body).getPropertyValue("--term-bg").trim() || "#030308" },
+        cursorBlink: true,
+        scrollback: 5000,
+      });
+      fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      term.open(box);
+      term.onData(send);
+      term.onBinary(sendBinary);
+    }
+    fit.fit();
+    ws?.close();
+    const url = new URL(`api/agents/${encodeURIComponent(id)}/attach?cols=${term.cols}&rows=${term.rows}`, location.href);
+    url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    // El navegador no deja poner `Authorization` en un WebSocket: el token va
+    // como subprotocolo.
+    let sock;
+    try {
+      sock = new WebSocket(url, ["pastor", "token." + store.get("pastor-token")]);
+    } catch {
+      // Un token con espacios u otros caracteres no vale como subprotocolo.
+      return say("El token no sirve para la terminal", true);
+    }
+    sock.binaryType = "arraybuffer";
+    ws = sock;
+    let opened = false;
+    sock.onopen = () => { opened = true; say(""); term.focus(); };
+    sock.onmessage = (e) => term.write(new Uint8Array(e.data));
+    sock.onclose = (e) => {
+      if (ws !== sock) return;
+      ws = null;
+      if (want) say(e.reason || (opened ? "Se cerró la terminal" : "No pude conectar con el agente"), true);
+    };
+  };
+  // Girar el celular o abrir el teclado cambia lo que cabe.
+  const resized = new ResizeObserver(() => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (!term || el.hidden) return;
+      fit.fit();
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ cols: term.cols, rows: term.rows }));
+    }, 150);
+  });
+  resized.observe(el);
+  // En segundo plano se cierra (un cliente de tmux conectado manda en el
+  // tamaño) y el sistema igual podría cortarla: al volver, de nuevo.
+  const back = () => {
+    if (document.hidden) { ws?.close(); ws = null; say(""); }
+    else if (want && !ws) connect();
+  };
+  document.addEventListener("visibilitychange", back);
+  return {
+    el,
+    send,
+    active(on) {
+      want = on;
+      if (on && !ws) connect();
+      if (!on) { ws?.close(); ws = null; say(""); }
+    },
+    stop() {
+      want = false;
+      ws?.close();
+      clearTimeout(timer);
+      resized.disconnect();
+      document.removeEventListener("visibilitychange", back);
+      term?.dispose();
+    },
+  };
+}
+
 function agentView(id) {
   let agent = null;
   const more = h("button", { class: "icon-btn", "aria-label": "Opciones", onclick: () => agentMenu() }, icon("more"));
@@ -578,15 +700,28 @@ function agentView(id) {
   // Pantalla en vivo o conversación entera (solo de los agentes de Claude).
   const termWrap = h("div", { class: "term-wrap" }, screen, jump);
   const chat = conversationPane(id, () => agent);
-  const views = { screen: termWrap, chat: chat.el };
+  const live = liveTerm(id);
+  cleanup.push(live.stop);
+  const views = { screen: termWrap, chat: chat.el, live: live.el };
+  // La conversación solo existe en los de Claude; hasta saber de qué tipo
+  // es, se ofrece.
+  let claude = true;
+  let view = "screen";
   const switcher = h("div", { class: "view-switch", role: "tablist", "aria-label": "Vista" });
   const show = (v, remember = true) => {
     if (remember) store.set("pastor-agent-view", v);
+    view = v;
     for (const [k, el] of Object.entries(views)) el.hidden = k !== v;
     screenVisible = v === "screen";
     if (screenVisible) pollScreen();
     chat.active(v === "chat");
-    switcher.replaceChildren(...[["screen", "Pantalla"], ["chat", "Conversación"]].map(([k, label]) =>
+    live.active(v === "live");
+    // En la terminal se escribe en ella: la caja sobra, y Ctrl-B (el prefijo
+    // de tmux, para cambiar de panel) solo tiene sentido ahí.
+    form.hidden = v === "live";
+    keys.querySelector('[data-key="C-b"]').hidden = v !== "live";
+    const tabs = [["screen", "Pantalla"], claude && ["chat", "Conversación"], ["live", "Terminal"]].filter(Boolean);
+    switcher.replaceChildren(...tabs.map(([k, label]) =>
       h("button", { type: "button", role: "tab", "aria-selected": String(k === v), class: k === v ? "on" : "", text: label, onclick: () => show(k) })));
   };
 
@@ -614,10 +749,10 @@ function agentView(id) {
     agent = a;
     top.title.textContent = a.name;
     top.subtitle.replaceChildren(pill(a.status, a.status_label), h("span", { class: "ellipsis", text: shortPath(a.cwd) }));
-    if (a.kind !== "claude" && !switcher.hidden) {
-      switcher.hidden = true;
+    if (a.kind !== "claude" && claude) {
+      claude = false;
       // Después de armar la vista: esto puede correr antes de que exista `pollScreen`.
-      queueMicrotask(() => show("screen", false));
+      queueMicrotask(() => show(view === "chat" ? "screen" : view, false));
     }
   });
 
@@ -692,12 +827,14 @@ function agentView(id) {
     type: "button",
     class: key === "C-c" ? "key danger" : "key",
     text: label,
+    "data-key": key,
     // Que tocar una tecla no le quite el foco a la caja (cerraría el teclado).
     onpointerdown: (e) => e.preventDefault(),
     onclick: async () => {
       if (key === "C-c" && !(await ask("¿Mandar Ctrl-C?", "Puede cancelar lo que está haciendo o terminar al agente.", "Mandar Ctrl-C", true))) return;
       navigator.vibrate?.(8);
-      post("/keys", { keys: [key] });
+      if (view === "live") live.send(SEQ[key] ?? key);
+      else post("/keys", { keys: [key] });
     },
   })));
 
@@ -781,8 +918,9 @@ function agentView(id) {
   }
 
   main.className = "agent-main";
-  main.append(switcher, termWrap, chat.el, h("div", { class: "composer" }, note, keys, form));
-  show(store.get("pastor-agent-view") === "chat" ? "chat" : "screen");
+  main.append(switcher, termWrap, chat.el, live.el, h("div", { class: "composer" }, note, keys, form));
+  const saved = store.get("pastor-agent-view");
+  show(views[saved] ? saved : "screen");
   requestAnimationFrame(grow);
 }
 
