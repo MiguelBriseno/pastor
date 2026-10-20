@@ -314,22 +314,37 @@ fn main() -> Result<()> {
         }
         Some(Cmd::List) => {
             hooks::prune_status();
-            let state = State::load()?;
+            let mut state = State::load()?;
             if state.agents.is_empty() {
                 println!("No hay agentes. Lanza uno con `pastor new claude`.");
             }
             let snaps = ops::observe(&state, &mut ops::Tracker::default())?;
-            for a in &state.agents {
-                let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
-                println!(
-                    "{:<5} {} {:<11} {} {:<9} {}",
-                    a.id,
-                    st.icon(),
-                    st.label(),
-                    text::pad_right(&a.name, 20),
-                    a.kind,
-                    a.cwd.display()
-                );
+            store::sort_by_project(&mut state.agents);
+            let groups: Vec<&[store::Agent]> = state
+                .agents
+                .chunk_by(|a, b| a.project() == b.project())
+                .collect();
+            for (i, group) in groups.iter().enumerate() {
+                // Con un solo proyecto, sin encabezados.
+                if groups.len() > 1 {
+                    if i > 0 {
+                        println!();
+                    }
+                    let a = &group[0];
+                    println!("{} ({})", a.project_name(), a.project().display());
+                }
+                for a in *group {
+                    let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
+                    println!(
+                        "{:<5} {} {:<11} {} {:<9} {}",
+                        a.id,
+                        st.icon(),
+                        st.label(),
+                        text::pad_right(&a.name, 20),
+                        a.kind,
+                        a.cwd.display()
+                    );
+                }
             }
             Ok(())
         }

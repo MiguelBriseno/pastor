@@ -92,11 +92,18 @@ fn launch(
     // Sin saber qué sesiones hay, mejor no lanzar: la limpieza de un fallo
     // («duplicate session») mataría la de otro.
     let taken = tmux::panes()?;
+    // Fuera del candado: es un proceso de git. En un worktree manda su
+    // `repo`, y `cwd` daría la copia.
+    let repo = match wt {
+        None => worktree::toplevel(&cwd),
+        Some(_) => None,
+    };
     let agent = State::update(|s| {
         s.skip_ids(|id| taken.contains_key(id));
         s.add_agent(kind, cwd, name);
         let agent = s.agents.last_mut().expect("recién añadido");
         agent.worktree = wt;
+        agent.repo = repo;
         Ok(agent.clone())
     })?;
     if let Err(e) = start_session(&agent, cmd) {

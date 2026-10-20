@@ -444,9 +444,28 @@ function agentsView() {
     actions: [h("button", { class: "icon-btn accent", "aria-label": "Nuevo agente", onclick: newAgentSheet }, icon("plus"))],
   });
   const list = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
-  main.append(list);
-  watchAgents((agents) => {
-    const n = (...st) => agents.filter((a) => st.includes(a.status)).length;
+  // Con varios proyectos, uno a la vez si quieres: "" son todos.
+  const chips = h("div", { class: "chips", role: "tablist", hidden: true });
+  let project = store.get("pastor-project");
+  let all = null;
+  main.append(chips, list);
+  const draw = () => {
+    if (!all) return;
+    const projects = [...new Map(all.map((a) => [a.project, a.project_name])).entries()];
+    if (!projects.some(([p]) => p === project)) project = "";
+    chips.hidden = projects.length < 2;
+    const chip = (p, label, count) => h("button", {
+      type: "button", role: "tab", class: p === project ? "chip on" : "chip", "aria-selected": String(p === project),
+      onclick: () => { project = p; store.set("pastor-project", p); draw(); },
+    }, label, h("span", { class: "chip-count", text: String(count) }));
+    chips.replaceChildren(chip("", "Todos", all.length),
+      ...projects.map(([p, name]) => chip(p, name, all.filter((a) => a.project === p).length)));
+    drawAgents(project ? all.filter((a) => a.project === project) : all);
+  };
+  watchAgents((agents) => { all = agents; draw(); });
+  function drawAgents(agents) {
+    // El resumen de arriba cuenta todos: quien te espera en otro proyecto también.
+    const n = (...st) => all.filter((a) => st.includes(a.status)).length;
     const parts = [n("blocked") && `${n("blocked")} te esperan`, n("working", "starting") && `${n("working", "starting")} trabajando`];
     subtitle.textContent = parts.filter(Boolean).join(" · ") || (agents.length ? "Todo en calma" : "");
     if (!agents.length) {
@@ -463,7 +482,7 @@ function agentsView() {
             h("div", { class: "cards" }, items.map(agentCard)))]
         : [];
     }));
-  });
+  }
 }
 
 function agentCard(a) {
