@@ -236,6 +236,7 @@ struct Payload {
     message: Option<String>,
     notification_type: Option<String>,
     transcript_path: Option<String>,
+    session_id: Option<String>,
     /// Solo viene si el hook lo lanza un subagente, no el hilo principal.
     agent_id: Option<String>,
     /// En `Stop`: el trabajo de fondo que sigue en marcha y que despertará a
@@ -280,6 +281,8 @@ fn hook_state(event: &str, p: &Payload, subagent_shells: &[String]) -> Option<&'
             || t.id.as_ref().is_some_and(|id| subagent_shells.contains(id))
     });
     Some(match event {
+        // Solo trae la sesión: no dice nada del estado.
+        "session" => return None,
         "notify" => match p.notification_type.as_deref() {
             Some("idle_prompt") => "idle",
             Some("permission_prompt" | "elicitation_dialog") => "blocked",
@@ -318,7 +321,11 @@ pub fn handle(event: &str) -> Result<()> {
     // Un proceso que heredó `PASTOR_AGENT` de un agente ya cerrado (p. ej. un
     // servicio que arrancó desde él y lanza sus propios `claude`) no debe
     // revivir su estado. Si no se puede leer el estado, mejor seguir.
-    if store::State::load().is_ok_and(|s| !s.agents.iter().any(|a| a.id == id)) {
+    let loaded = store::State::load();
+    if loaded
+        .as_ref()
+        .is_ok_and(|s| !s.agents.iter().any(|a| a.id == id))
+    {
         drain();
         return Ok(());
     }
@@ -336,6 +343,19 @@ pub fn handle(event: &str) -> Result<()> {
     let mut input = Vec::new();
     let _ = std::io::stdin().lock().read_to_end(&mut input);
     let p: Payload = serde_json::from_slice(&input).unwrap_or_default();
+    // La de un subagente es la de su hilo principal, pero solo este la cambia
+    // (con `/clear` o `/resume`). Una sesión sin transcripción (recién
+    // abierta, sin mensajes) no se puede retomar: `--resume` fallaría.
+    let resumable = p
+        .transcript_path
+        .as_deref()
+        .is_some_and(|t| Path::new(t).exists());
+    if let (Ok(state), Some(session), None, true) = (&loaded, &p.session_id, &p.agent_id, resumable)
+    {
+        if let Err(e) = remember_session(state, &id, session) {
+            log_error(event, &e);
+        }
+    }
     // Si el aviso no pide nada, ni candado ni lectura. Que no pida nada no
     // depende de los shells de los subagentes.
     if hook_state(event, &p, &[]).is_none() {
@@ -413,6 +433,21 @@ pub fn handle(event: &str) -> Result<()> {
         ops::finish_turn(&id)?;
     }
     Ok(())
+}
+
+/// Guarda en el agente la sesión de Claude Code en la que va, si cambió: con
+/// ella `pastor restore` retoma la conversación.
+fn remember_session(state: &store::State, id: &str, session: &str) -> Result<()> {
+    let known = state.agents.iter().find(|a| a.id == id);
+    if session.is_empty() || known.is_none_or(|a| a.session.as_deref() == Some(session)) {
+        return Ok(());
+    }
+    store::State::update(|s| {
+        if let Some(a) = s.agents.iter_mut().find(|a| a.id == id) {
+            a.session = Some(session.to_string());
+        }
+        Ok(())
+    })
 }
 
 /// Lanza `pastor hook settle` sin esperarlo: Claude Code espera al hook, y
@@ -517,6 +552,7 @@ pub fn claude_settings() -> Result<PathBuf> {
     let tool_hook = |ev: &str| json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": format!("{exe} hook {ev}") }] }]);
     let settings = json!({
         "hooks": {
+            "SessionStart": hook("session"),
             "UserPromptSubmit": hook("working"),
             "PreToolUse": tool_hook("working"),
             "PostToolUse": tool_hook("working"),
@@ -643,6 +679,7 @@ mod tests {
         let p = |json: &str| serde_json::from_str::<Payload>(json).unwrap();
         let casos = [
             ("working", "{}", Some("working")),
+            ("session", r#"{"session_id":"abc"}"#, None),
             (
                 "working",
                 r#"{"tool_response":{"enorme":[1,2,3]}}"#,

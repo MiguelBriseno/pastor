@@ -99,19 +99,8 @@ fn launch(
         agent.worktree = wt;
         Ok(agent.clone())
     })?;
-    hooks::clear_status(&agent.id);
-    let started = hooks::relaunch_shell().and_then(|then| {
-        tmux::new_session(
-            &agent.id,
-            &agent.cwd,
-            &[("PASTOR_AGENT", &agent.id)],
-            cmd,
-            &then,
-        )
-    });
-    if let Err(e) = started {
-        // La sesión pudo crearse antes de fallar: que no quede un agente huérfano.
-        let _ = tmux::kill_session(&agent.id);
+    if let Err(e) = start_session(&agent, cmd) {
+        // Que no quede un agente huérfano.
         let _ = State::update(|s| {
             s.agents.retain(|a| a.id != agent.id);
             Ok(())
@@ -468,6 +457,93 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
         ))),
         _ => Ok(()),
     }
+}
+
+/// Vuelve a abrir un agente cuya sesión de tmux se perdió (por ejemplo, al
+/// reiniciar la máquina): con el mismo id, en su directorio y retomando su
+/// conversación. Su tarea sigue con él.
+pub fn restore_agent(agent_key: &str) -> Result<Agent> {
+    tmux::ensure_available()?;
+    // Con el candado: que nadie lo quite ni lo restaure a la vez. Otro
+    // `new-session` con el mismo nombre fallaría, y limpiar ese fallo mataría
+    // la sesión que sí se abrió.
+    State::with_lock(|s| {
+        let agent = s.find_agent(agent_key)?.clone();
+        let panes = split_panes(tmux::panes()?.remove(&agent.id).unwrap_or_default());
+        if let Some(p) = panes.agent.as_ref().filter(|p| !p.dead) {
+            if agent_gone(p, &Procs::default()) {
+                bail!(
+                    "{} salió, pero su terminal sigue abierta: entra y vuelve a abrir {}",
+                    agent.name,
+                    agent.kind
+                );
+            }
+            bail!("{} ya está corriendo", agent.name);
+        }
+        relaunch(&agent)?;
+        Ok(agent)
+    })?
+}
+
+/// Restaura todos los agentes que perdieron su sesión de tmux. Devuelve cada
+/// uno con lo que pasó al intentarlo.
+pub fn restore_lost() -> Result<Vec<(Agent, Result<()>)>> {
+    tmux::ensure_available()?;
+    let mut panes = tmux::panes()?;
+    let lost: Vec<Agent> = State::load()?
+        .agents
+        .into_iter()
+        .filter(|a| {
+            split_panes(panes.remove(&a.id).unwrap_or_default())
+                .agent
+                .is_none_or(|p| p.dead)
+        })
+        .collect();
+    Ok(lost
+        .into_iter()
+        .map(|a| {
+            let restored = restore_agent(&a.id).map(|_| ());
+            (a, restored)
+        })
+        .collect())
+}
+
+fn relaunch(agent: &Agent) -> Result<()> {
+    if !agent.cwd.is_dir() {
+        bail!("su directorio {} ya no existe", agent.cwd.display());
+    }
+    // Las versiones que no guardaban la sesión la tienen en la transcripción
+    // del último hook: `<sesión>.jsonl`.
+    let session = agent.session.clone().or_else(|| {
+        let path = PathBuf::from(hooks::read_status(&agent.id)?.transcript?);
+        Some(path.file_stem()?.to_string_lossy().into_owned())
+    });
+    let cmd = agent.kind.resume_command(session.as_deref())?;
+    // Un panel muerto o una terminal suelta: lo que quede de la sesión vieja.
+    match tmux::kill_session(&agent.id) {
+        Err(e) if !tmux::session_gone(&e) => return Err(e),
+        _ => {}
+    }
+    start_session(agent, &cmd)
+}
+
+/// Abre la sesión de tmux del agente con `cmd`. Si falla, la sesión pudo
+/// crearse antes: se cierra.
+fn start_session(agent: &Agent, cmd: &[String]) -> Result<()> {
+    hooks::clear_status(&agent.id);
+    let started = hooks::relaunch_shell().and_then(|then| {
+        tmux::new_session(
+            &agent.id,
+            &agent.cwd,
+            &[("PASTOR_AGENT", &agent.id)],
+            cmd,
+            &then,
+        )
+    });
+    if started.is_err() {
+        let _ = tmux::kill_session(&agent.id);
+    }
+    started
 }
 
 /// Si algún agente o tarea sigue usando el worktree.

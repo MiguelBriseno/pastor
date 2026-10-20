@@ -86,6 +86,7 @@ fn router(app: Arc<App>) -> Router {
     let api = Router::new()
         .route("/agents", get(list_agents).post(new_agent))
         .route("/agents/{id}", delete(kill_agent))
+        .route("/agents/{id}/restore", post(restore_agent))
         .route("/agents/{id}/send", post(send))
         .route("/agents/{id}/keys", post(keys))
         .route("/agents/{id}/screen", get(screen))
@@ -547,6 +548,10 @@ async fn conversation(
 
 async fn kill_agent(Path(id): Path<String>) -> Response {
     blocking(move || ops::kill_agent(&id).map(|()| ok())).await
+}
+
+async fn restore_agent(Path(id): Path<String>) -> Response {
+    blocking(move || ops::restore_agent(&id)).await
 }
 
 // ---------- tareas ----------

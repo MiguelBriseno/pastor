@@ -39,6 +39,7 @@ const ICONS = {
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
   dashboard: '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
   history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+  restore: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
   bell: '<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>',
 };
 
@@ -737,6 +738,14 @@ function agentView(id) {
             h("button", { type: "button", text: "A+", "aria-label": "Más grande", onclick: () => step(1) }),
           ),
         ),
+        agent?.status === "dead" && menuItem("restore", "Restaurar agente", async () => {
+          d.close();
+          // Fuera de la cola de teclas: no caduca por esperar, no es una tecla.
+          if (await attempt(() => api("POST", `/agents/${encodeURIComponent(id)}/restore`))) {
+            toast(`${agent.name} restaurado`);
+            setTimeout(pollScreen, 300);
+          }
+        }),
         menuItem("trash", "Terminar agente", async () => {
           d.close();
           const name = agent?.name || id;

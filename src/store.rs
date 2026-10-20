@@ -38,6 +38,10 @@ pub struct Agent {
     /// Si trabaja en su propio worktree de git, cuál.
     #[serde(default)]
     pub worktree: Option<Worktree>,
+    /// La sesión de Claude Code en la que va (la reportan sus hooks), para
+    /// retomar la conversación si se pierde su sesión de tmux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// Un worktree de git que pastor creó para un agente: su propia copia del
@@ -232,6 +236,7 @@ impl State {
             task: None,
             term_cmd: None,
             worktree: None,
+            session: None,
         };
         self.agents.push(agent.clone());
         agent

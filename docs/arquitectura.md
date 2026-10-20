@@ -179,6 +179,24 @@ corta o no se acaba. La TUI y `pastor ls` borran al arrancar los estados de
 agentes que ya no existen, con el candado de `state.json` tomado para no llevarse los de un agente
 recién creado.
 
+### Restaurar agentes
+
+`state.json` sobrevive a un reinicio y las sesiones de tmux no, así que un agente perdido es uno que
+sigue en el estado sin panel vivo. `pastor restore` lo vuelve a lanzar con el mismo id: sus hooks,
+su tarea y su worktree siguen valiendo sin tocar nada. Si el panel sigue vivo pero el agente salió
+(`/exit`), no se toca: la terminal que quedó puede tener algo del usuario.
+
+Para retomar la conversación, los hooks de Claude Code (también `SessionStart`, que salta con
+`/clear` y `/resume`) guardan el `session_id` del hilo principal en el agente, y se relanza con
+`--resume <sesión>`. Solo se escribe `state.json` cuando la sesión cambia. Sin sesión guardada
+(agentes de versiones anteriores) se saca del nombre de la transcripción del último hook; sin nada,
+empieza una conversación nueva en vez de adivinar con `--continue`, que podría tomar la de otro
+agente del mismo directorio. Codex y opencode no reportan su sesión: se relanzan con
+`codex resume --last` y `opencode --continue`.
+
+La restauración corre con el candado de `state.json` tomado: dos a la vez chocarían en
+`new-session`, y limpiar el fallo mataría la sesión que sí se abrió.
+
 ### Envío de mensajes
 
 `tmux::send_text` carga el texto en un buffer de tmux y lo pega con *bracketed paste*
