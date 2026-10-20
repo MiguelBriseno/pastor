@@ -137,6 +137,30 @@ pub enum Status {
 }
 
 impl Status {
+    pub const ALL: [Status; 5] = [
+        Status::Starting,
+        Status::Working,
+        Status::Blocked,
+        Status::Idle,
+        Status::Dead,
+    ];
+
+    /// Un nombre estable para los clientes (la API, otra máquina); `label`
+    /// es el texto que se muestra.
+    pub fn key(self) -> &'static str {
+        match self {
+            Status::Starting => "starting",
+            Status::Working => "working",
+            Status::Blocked => "blocked",
+            Status::Idle => "idle",
+            Status::Dead => "dead",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Status> {
+        Status::ALL.into_iter().find(|s| s.key() == key)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Status::Starting => "iniciando",

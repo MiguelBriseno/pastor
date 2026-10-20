@@ -397,18 +397,6 @@ fn ok() -> Value {
     json!({ "ok": true })
 }
 
-/// El estado con un nombre estable para los clientes; `status_label` es el
-/// texto que muestra la TUI.
-fn status_key(s: Status) -> &'static str {
-    match s {
-        Status::Starting => "starting",
-        Status::Working => "working",
-        Status::Blocked => "blocked",
-        Status::Idle => "idle",
-        Status::Dead => "dead",
-    }
-}
-
 #[derive(Serialize)]
 struct AgentView {
     #[serde(flatten)]
@@ -438,7 +426,7 @@ async fn list_agents(Shared(app): Shared<Arc<App>>) -> Response {
                     project: a.project().to_path_buf(),
                     project_name: a.project_name(),
                     agent: a,
-                    status: status_key(st),
+                    status: st.key(),
                     status_label: st.label(),
                 }
             })

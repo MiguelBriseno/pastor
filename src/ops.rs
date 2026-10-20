@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use crate::agent::{self, Kind, Observation, Status};
 use crate::history::{self, Event};
 use crate::hooks;
+use crate::remote;
 use crate::store::{self, Agent, State, Task, TaskStatus, Worktree};
 use crate::tmux;
 use crate::worktree;
@@ -328,6 +329,10 @@ pub fn send(agent_key: &str, text: &str) -> Result<()> {
     if text.trim().is_empty() {
         bail!("el mensaje está vacío");
     }
+    if let Some((host, id)) = remote::split(agent_key) {
+        // Con `--`: un mensaje como `--help` es texto, no una opción de allá.
+        return remote::run(&host, &["send", id, "--", text]).map(drop);
+    }
     let state = State::load()?;
     let agent = state.find_agent(agent_key)?;
     tmux::send_text(&agent_target(agent)?, text)?;
@@ -341,6 +346,11 @@ pub fn send(agent_key: &str, text: &str) -> Result<()> {
 /// menús que no se contestan con texto.
 pub fn send_keys(agent_key: &str, keys: &[String]) -> Result<()> {
     tmux::check_keys(keys)?;
+    if let Some((host, id)) = remote::split(agent_key) {
+        let mut args = vec!["keys", id];
+        args.extend(keys.iter().map(String::as_str));
+        return remote::run(&host, &args).map(drop);
+    }
     let state = State::load()?;
     tmux::send_keys(&agent_target(state.find_agent(agent_key)?)?, keys)
 }
@@ -349,6 +359,10 @@ pub fn send_keys(agent_key: &str, keys: &[String]) -> Result<()> {
 /// haya quedado en su lugar (el shell, por ejemplo). Sin los espacios con los
 /// que tmux rellena cada línea hasta el ancho del panel.
 pub fn screen(agent_key: &str) -> Result<String> {
+    if let Some((host, id)) = remote::split(agent_key) {
+        let out = remote::run(&host, &["screen", id])?;
+        return Ok(out.strip_suffix('\n').unwrap_or(&out).to_string());
+    }
     let state = State::load()?;
     let agent = state.find_agent(agent_key)?;
     // Con `?` y no `agent_panes`: si tmux falla, que se vea por qué.
@@ -369,6 +383,12 @@ pub fn screen(agent_key: &str) -> Result<String> {
 /// celular): el agente redibuja a ese tamaño y sus líneas no se salen de la
 /// pantalla. Devuelve si cambió algo.
 pub fn fit(agent_key: &str, cols: u16, rows: u16) -> Result<bool> {
+    if let Some((host, id)) = remote::split(agent_key) {
+        let (cols, rows) = (cols.to_string(), rows.to_string());
+        remote::run(&host, &["screen", id, "--cols", &cols, "--rows", &rows])?;
+        // Allá ya esperó a que se redibujara: aquí no hace falta otra pausa.
+        return Ok(false);
+    }
     let state = State::load()?;
     let pane = agent_target(state.find_agent(agent_key)?)?;
     tmux::fit(&pane, cols.clamp(20, 500), rows.clamp(5, 200))
@@ -376,6 +396,9 @@ pub fn fit(agent_key: &str, cols: u16, rows: u16) -> Result<bool> {
 
 /// Entra a la sesión del agente con el foco en el agente.
 pub fn attach(agent_key: &str) -> Result<()> {
+    if let Some((host, id)) = remote::split(agent_key) {
+        return remote::interactive(&host, &["attach", id]);
+    }
     let id = State::load()?.find_agent(agent_key)?.id.clone();
     let focus = agent_panes(&id).agent.map(|p| p.id);
     tmux::attach(&id, focus.as_deref())
@@ -384,6 +407,15 @@ pub fn attach(agent_key: &str) -> Result<()> {
 /// Abre una terminal a la derecha del agente, en su mismo directorio, y
 /// opcionalmente ejecuta `cmd` en ella (p. ej. "npm run dev").
 pub fn open_term(agent_key: &str, cmd: Option<&str>) -> Result<()> {
+    if let Some((host, id)) = remote::split(agent_key) {
+        let mut args = vec!["term", id];
+        // Uno solo: allá se pasa tal cual al shell, como aquí. Tras `--`, para
+        // que uno como `--close` no se tome como opción.
+        if let Some(c) = cmd.map(str::trim).filter(|c| !c.is_empty()) {
+            args.extend(["--", c]);
+        }
+        return remote::run(&host, &args).map(drop);
+    }
     let agent = State::load()?.find_agent(agent_key)?.clone();
     let panes = agent_panes(&agent.id);
     let Some(agent_pane) = panes.agent else {
@@ -412,6 +444,9 @@ pub fn open_term(agent_key: &str, cmd: Option<&str>) -> Result<()> {
 }
 
 pub fn close_term(agent_key: &str) -> Result<()> {
+    if let Some((host, id)) = remote::split(agent_key) {
+        return remote::run(&host, &["term", id, "--close"]).map(drop);
+    }
     let agent = State::load()?.find_agent(agent_key)?.clone();
     match agent_panes(&agent.id).term {
         Some(t) => tmux::kill_pane(&t.id),
@@ -424,6 +459,10 @@ pub fn close_term(agent_key: &str) -> Result<()> {
 pub fn suggest_term_cmd(agent: &Agent) -> String {
     if let Some(c) = &agent.term_cmd {
         return c.clone();
+    }
+    // Su directorio está en otra máquina: aquí no se puede mirar.
+    if agent.host.is_some() {
+        return String::new();
     }
     let dir = &agent.cwd;
     let has_dev = std::fs::read_to_string(dir.join("package.json"))
@@ -447,6 +486,9 @@ pub fn suggest_term_cmd(agent: &Agent) -> String {
 }
 
 pub fn kill_agent(agent_key: &str) -> Result<()> {
+    if let Some((host, id)) = remote::split(agent_key) {
+        return remote::run(&host, &["kill", id]).map(drop);
+    }
     // Primero fuera del estado y después la sesión: si la TUI lo mirara entre
     // medias, lo vería muerto y tomaría su tarea por terminada. Se busca dentro
     // del candado: si dos lo matan a la vez, solo uno lo encuentra, y el fin
@@ -483,6 +525,15 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
 /// reiniciar la máquina): con el mismo id, en su directorio y retomando su
 /// conversación. Su tarea sigue con él.
 pub fn restore_agent(agent_key: &str) -> Result<Agent> {
+    if let Some((host, id)) = remote::split(agent_key) {
+        remote::run(&host, &["restore", id])?;
+        // Como se ve desde aquí: con la máquina en el id.
+        return remote::agents(&host)?
+            .into_iter()
+            .map(|(a, _)| a)
+            .find(|a| a.id == format!("{host}:{id}") || a.name == id)
+            .ok_or_else(|| anyhow::anyhow!("{host} restauró {id}, pero ya no lo encuentro"));
+    }
     tmux::ensure_available()?;
     // Con el candado: que nadie lo quite ni lo restaure a la vez. Otro
     // `new-session` con el mismo nombre fallaría, y limpiar ese fallo mataría

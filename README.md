@@ -24,6 +24,8 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   aprobación o respuesta), *inactivo* o *terminado*.
 - **Restaurar después de reiniciar.** Si se reinicia la computadora, pastor vuelve a abrir los
   agentes en su directorio y retomando su conversación.
+- **Agentes en otras máquinas.** Registra otra máquina por SSH y ve y maneja sus agentes junto a
+  los tuyos, desde la interfaz o la línea de comandos.
 - **Terminal al lado de cada agente.** Abre una terminal junto al agente, en su mismo directorio,
   para correr por ejemplo `npm run dev` mientras el agente hace cambios.
 - **Notificaciones de escritorio** cuando un agente te necesita o termina su trabajo, y también
@@ -284,6 +286,38 @@ pastor task approve t1         # integra su rama, termina al agente y borra el w
 pastor task done t1
 pastor task rm t1
 ```
+
+## Otras máquinas por SSH
+
+pastor puede manejar los agentes de otra máquina (un servidor, la computadora de la oficina) como si
+fueran de aquí. La otra máquina necesita su propio pastor y es dueña de sus agentes: su tmux, sus
+hooks, su estado y sus worktrees. Si se corta la red, siguen trabajando allá.
+
+Necesitas SSH sin contraseña (con llave) hacia ella, y pastor, tmux y los agentes instalados allá:
+
+```sh
+pastor host add servidor yo@servidor.local   # o un alias de ~/.ssh/config
+pastor host ls                               # las máquinas y si responden
+pastor host rm servidor                      # la olvida (sus agentes siguen allá)
+```
+
+Sus agentes llevan el nombre de la máquina delante del id: `servidor:a1`. Todos los comandos de
+agentes funcionan igual con ellos, y en la interfaz aparecen agrupados como `proyecto @ servidor`:
+
+```sh
+pastor new --host servidor claude --cwd ~/proyectos/api   # sin --cwd, en tu carpeta personal allá
+pastor ls                                    # los de aquí y los de cada máquina
+pastor send servidor:a1 "corre las pruebas"
+pastor attach servidor:a1                    # entra por SSH (salir con Ctrl-b d)
+pastor restore servidor:a1
+```
+
+pastor busca el binario allá en el `PATH`, en `~/.cargo/bin` y en `~/.local/bin`. Usa una sola
+conexión de SSH por máquina, que dura unos minutos, para que la interfaz pueda preguntar cada
+segundo. Nunca pide contraseña: sin llave, la máquina aparece *sin conexión*.
+
+Las tareas, los avisos y la app del celular siguen siendo de cada máquina: para asignar una tarea a
+un agente de otra máquina, o recibir sus avisos, usa el pastor de allá.
 
 ## Desde el celular (`pastor serve`)
 
@@ -546,6 +580,8 @@ En `~/.local/share/pastor/` en Linux y `~/Library/Application Support/pastor/` e
 - `status/`: el último estado que reportó cada agente de Claude Code
 - `worktrees/`: los worktrees de git de los agentes
 - `claude-settings.json`: los hooks que se le pasan a Claude Code
+- `hosts.json`: las otras máquinas registradas con `pastor host add`
+- `ssh/`: los sockets de las conexiones de SSH compartidas con ellas
 
 **¿Cómo desinstalo pastor?**
 
@@ -564,7 +600,7 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [x] Un worktree de git por agente, para trabajar en paralelo sobre el mismo repositorio, y
   revisar e integrar las tareas
 - [x] Restaurar agentes después de reiniciar
-- [ ] Manejar agentes en otras máquinas por SSH
+- [x] Manejar agentes en otras máquinas por SSH
 - [x] Desde el celular: API, avisos con ntfy, pantalla en vivo, una PWA y una terminal interactiva
 
 ## Contribuir
