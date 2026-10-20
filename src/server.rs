@@ -372,6 +372,9 @@ struct AgentView {
     agent: Agent,
     status: &'static str,
     status_label: &'static str,
+    /// El repositorio en el que trabaja (o su directorio), para agruparlo.
+    project: PathBuf,
+    project_name: String,
 }
 
 // ---------- agentes ----------
@@ -389,6 +392,8 @@ async fn list_agents(Shared(app): Shared<Arc<App>>) -> Response {
             .map(|a| {
                 let st = snaps.get(&a.id).map_or(Status::Dead, |s| s.status);
                 AgentView {
+                    project: a.project().to_path_buf(),
+                    project_name: a.project_name(),
                     agent: a,
                     status: status_key(st),
                     status_label: st.label(),

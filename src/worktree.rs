@@ -36,6 +36,13 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
+/// La raíz del repositorio de git que contiene `dir`, si está en uno.
+pub fn toplevel(dir: &Path) -> Option<PathBuf> {
+    git(dir, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(PathBuf::from)
+}
+
 /// Crea un worktree con una rama nueva que sale del commit actual del
 /// repositorio de `cwd`. `name` da el nombre de la rama y de la carpeta.
 /// Devuelve el worktree y dónde debe arrancar el agente: la misma
@@ -49,9 +56,8 @@ fn create_in(dir: &Path, cwd: &Path, name: &str) -> Result<(Worktree, PathBuf)> 
     // Las dos rutas canónicas: git resuelve los enlaces simbólicos y, si no,
     // `strip_prefix` no reconocería la subcarpeta.
     let cwd = cwd.canonicalize().map_err(|_| not_repo())?;
-    let top = git(&cwd, &["rev-parse", "--show-toplevel"])
-        .ok()
-        .and_then(|t| PathBuf::from(t).canonicalize().ok())
+    let top = toplevel(&cwd)
+        .and_then(|t| t.canonicalize().ok())
         .ok_or_else(not_repo)?;
     let base = git(&top, &["rev-parse", "--verify", "HEAD"])
         .map_err(|_| anyhow!("el repositorio {} no tiene commits todavía", top.display()))?;
@@ -345,6 +351,7 @@ mod tests {
     #[test]
     fn crea_integra_y_borra() {
         let r = Repo::new("integra");
+        assert_eq!(toplevel(&r.repo().join("src")), Some(r.repo()));
         let (wt, start) = r.create(&r.repo().join("src"), "t3 Migrar login");
         assert_eq!(wt.branch, "pastor/t3-migrar-login");
         assert_eq!(wt.repo, r.repo());
@@ -419,6 +426,7 @@ mod tests {
     #[test]
     fn fuera_de_un_repositorio() {
         let dir = std::env::temp_dir().join("pastor-wt-nada");
+        assert_eq!(toplevel(Path::new("/")), None);
         let err = create_in(&dir, Path::new("/"), "x").unwrap_err();
         assert!(
             err.to_string().contains("no está en un repositorio"),

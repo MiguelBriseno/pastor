@@ -179,6 +179,15 @@ corta o no se acaba. La TUI y `pastor ls` borran al arrancar los estados de
 agentes que ya no existen, con el candado de `state.json` tomado para no llevarse los de un agente
 recién creado.
 
+### Proyectos
+
+El proyecto de un agente es la raíz del repositorio de git de su directorio (`git rev-parse
+--show-toplevel`), que se guarda al lanzarlo para no correr git en cada cuadro. Con worktree manda el
+repositorio del que salió, y sin repositorio (o en agentes de versiones anteriores), su directorio.
+La TUI ordena su copia de `state.json` por proyecto al recargar, con un orden estable: así la
+selección sigue siendo un índice de `agents` y solo la lista que se dibuja lleva encabezados, con su
+propio `ListState`. Con un solo proyecto no hay encabezados.
+
 ### Restaurar agentes
 
 `state.json` sobrevive a un reinicio y las sesiones de tmux no, así que un agente perdido es uno que

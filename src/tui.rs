@@ -34,7 +34,7 @@ use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::limits::{self, Usage};
 use crate::ops::{self, AssignTarget, Place, Snapshot, Tracker};
-use crate::store::{Agent, State, Task, TaskStatus, Worktree};
+use crate::store::{self, Agent, State, Task, TaskStatus, Worktree};
 use crate::text::{self, truncate};
 use crate::worktree;
 
@@ -194,7 +194,11 @@ struct App {
     observer_retry: Option<Instant>,
     observer_since: Instant,
     actions: Actions,
+    /// Índice en `state.agents`, que está ordenado por proyecto.
     agent_sel: ListState,
+    /// La lista que se dibuja: con los encabezados de proyecto, sus filas no
+    /// coinciden con `agent_sel`. Aparte, para que conserve su desplazamiento.
+    agent_rows: ListState,
     task_sel: TableState,
     /// Tamaños ajustables de los paneles.
     list_width: u16,
@@ -232,6 +236,7 @@ impl App {
             observer_since: Instant::now(),
             actions: Actions::spawn(),
             agent_sel: ListState::default(),
+            agent_rows: ListState::default(),
             task_sel: TableState::default(),
             list_width: 44,
             term_pct: 40,
@@ -404,7 +409,11 @@ impl App {
         let task = self.selected_task().map(|t| t.id.clone());
         self.dirty = true;
         match State::load() {
-            Ok(s) => self.state = s,
+            Ok(mut s) => {
+                // Los de un mismo proyecto, juntos: así se ven y así se recorren.
+                store::sort_by_project(&mut s.agents);
+                self.state = s;
+            }
             Err(e) => self.set_flash(format!("Error: {e:#}")),
         }
         if let Some((id, name)) = agent {
@@ -1066,11 +1075,34 @@ impl App {
                 .block(block);
             f.render_widget(p, left);
         } else {
-            let items: Vec<ListItem> = self
-                .state
-                .agents
-                .iter()
-                .map(|a| {
+            let agents = &self.state.agents;
+            // Con un solo proyecto, la lista de siempre, sin encabezados.
+            let many = agents.iter().any(|a| a.project() != agents[0].project());
+            let mut items: Vec<ListItem> = Vec::new();
+            let mut row = None;
+            // El encabezado del grupo del seleccionado, para que no quede
+            // fuera de la vista al subir.
+            let mut header = None;
+            for (i, a) in agents.iter().enumerate() {
+                let first = many && (i == 0 || agents[i - 1].project() != a.project());
+                if first {
+                    let n = agents[i..]
+                        .iter()
+                        .take_while(|b| b.project() == a.project())
+                        .count();
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!(" {}{}", pad(ic.folder), a.project_name()),
+                            Style::default().fg(ACCENT).bold(),
+                        ),
+                        Span::styled(format!(" · {n}"), Style::default().fg(Color::DarkGray)),
+                    ])));
+                }
+                if self.agent_sel.selected() == Some(i) {
+                    row = Some(items.len());
+                    header = first.then(|| items.len() - 1);
+                }
+                items.push({
                     let st = self.status(&a.id);
                     let term_open = self
                         .snaps
@@ -1103,12 +1135,17 @@ impl App {
                             Style::default().fg(Color::Cyan),
                         ),
                     ]))
-                })
-                .collect();
+                });
+            }
+            self.agent_rows.select(row);
+            if let Some(h) = header {
+                let offset = self.agent_rows.offset_mut();
+                *offset = (*offset).min(h);
+            }
             let list = List::new(items)
                 .block(block)
                 .highlight_style(Style::default().bg(SELECTED));
-            f.render_stateful_widget(list, left, &mut self.agent_sel);
+            f.render_stateful_widget(list, left, &mut self.agent_rows);
         }
 
         let Some(a) = self.selected_agent() else {

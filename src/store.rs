@@ -42,6 +42,44 @@ pub struct Agent {
     /// retomar la conversación si se pierde su sesión de tmux.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// La raíz del repositorio de git de su directorio, si es uno. No se
+    /// llama `project`: la API lo aplana junto a su propio `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<PathBuf>,
+}
+
+impl Agent {
+    /// El proyecto en el que trabaja, para agruparlo con los demás del mismo:
+    /// el repositorio de su worktree o el de su directorio. Los de versiones
+    /// que no lo guardaban, su directorio.
+    pub fn project(&self) -> &Path {
+        self.worktree
+            .as_ref()
+            .map(|wt| wt.repo.as_path())
+            .or(self.repo.as_deref())
+            .unwrap_or(&self.cwd)
+    }
+
+    /// El nombre corto del proyecto: su carpeta.
+    pub fn project_name(&self) -> String {
+        let p = self.project();
+        p.file_name().map_or_else(
+            || p.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+}
+
+/// Junta a los agentes de un mismo proyecto: cada proyecto en el orden en
+/// que apareció su primer agente y, dentro, en el orden que tenían.
+pub fn sort_by_project(agents: &mut [Agent]) {
+    let mut order: Vec<PathBuf> = Vec::new();
+    for a in agents.iter() {
+        if !order.iter().any(|p| p == a.project()) {
+            order.push(a.project().to_path_buf());
+        }
+    }
+    agents.sort_by_key(|a| order.iter().position(|p| p == a.project()));
 }
 
 /// Un worktree de git que pastor creó para un agente: su propia copia del
@@ -237,6 +275,7 @@ impl State {
             term_cmd: None,
             worktree: None,
             session: None,
+            repo: None,
         };
         self.agents.push(agent.clone());
         agent
@@ -382,6 +421,33 @@ fn replace(path: &Path, contents: &[u8], mode: Option<u32>, durable: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agrupa_por_proyecto_en_orden_de_aparicion() {
+        let mut s = State::default();
+        for (cwd, project) in [
+            ("/web", Some("/web")),
+            ("/api/src", Some("/api")),
+            ("/web/front", Some("/web")),
+            // Sin repositorio (o de una versión anterior): su directorio.
+            ("/notas", None),
+            ("/api", Some("/api")),
+        ] {
+            s.add_agent(Kind::Claude, PathBuf::from(cwd), None);
+            s.agents.last_mut().unwrap().repo = project.map(PathBuf::from);
+        }
+        // En un worktree manda el repositorio del que salió.
+        s.agents[3].worktree = Some(Worktree {
+            repo: PathBuf::from("/web"),
+            path: PathBuf::from("/wt/web-x"),
+            branch: "pastor/x".into(),
+            base: "abc".into(),
+        });
+        assert_eq!(s.agents[3].project_name(), "web");
+        sort_by_project(&mut s.agents);
+        let ids: Vec<&str> = s.agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["a1", "a3", "a4", "a2", "a5"]);
+    }
 
     #[test]
     fn no_reusa_el_id_de_una_sesion_viva() {

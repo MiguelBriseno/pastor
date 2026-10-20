@@ -124,6 +124,10 @@ Cambia de pestaña con `1`, `2`, `3`, `4` o `Tab`. Sal con `q` (los agentes sigu
 
 ### 1 · Agentes
 
+Si tienes agentes en más de un proyecto, la lista los agrupa: cada repositorio de git con su nombre
+y cuántos agentes tiene. Los que trabajan en una subcarpeta o en un worktree cuentan en el
+repositorio del que salieron; los que están fuera de un repositorio, en su carpeta.
+
 | Tecla | Acción |
 |---|---|
 | `↑` `↓` / `k` `j` | Mover la selección |
@@ -247,7 +251,7 @@ pastor new claude -p "arregla los tests que fallan" # con un primer mensaje
 pastor new codex --prompt="-v revisa el diff"       # si el texto empieza por "-", con "="
 pastor new claude --worktree                        # en su propio worktree y rama
 
-pastor ls                     # lista agentes y su estado
+pastor ls                     # lista agentes y su estado, agrupados por proyecto
 pastor attach web             # entra a su terminal (salir con Ctrl-b d)
 pastor send web "ahora agrega pruebas para el login"
 pastor screen web             # lo que se ve ahora en su panel
@@ -300,7 +304,7 @@ IP de Tailscale (que ya cifra).
 
 | Método | Ruta | Cuerpo |
 |---|---|---|
-| `GET` | `/api/agents` | — (cada agente trae `status`: `starting`, `working`, `blocked`, `idle` o `dead`) |
+| `GET` | `/api/agents` | — (cada agente trae `status`: `starting`, `working`, `blocked`, `idle` o `dead`, y `project` y `project_name`: el repositorio en el que trabaja) |
 | `POST` | `/api/agents` | `{"kind": "claude", "cwd": "/ruta", "name"?, "prompt"?, "worktree"?}` |
 | `POST` | `/api/agents/{id}/send` | `{"text": "..."}` (lo pega y pulsa Enter) |
 | `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
@@ -333,7 +337,7 @@ viniera después llegaría al shell.
 ### La app del celular
 
 `pastor serve` también sirve una app web en `/`, pensada para el celular: los agentes agrupados por
-estado (los que te esperan, primero), la pantalla de cada uno en vivo con una caja para escribirle y
+estado (los que te esperan, primero) y, con varios proyectos, un filtro para ver uno solo, la pantalla de cada uno en vivo con una caja para escribirle y
 botones para las teclas (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C), la conversación entera
 con los agentes de Claude, las tareas, y el dashboard y el historial como en la TUI. La
 primera vez pide el token y lo guarda solo en ese dispositivo.
@@ -547,7 +551,7 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 
 - [x] Agentes sobre tmux, CLI, interfaz, estados y notificaciones
 - [x] Tareas y dashboard
-- [ ] Agrupar agentes por proyecto
+- [x] Agrupar agentes por proyecto
 - [x] Un worktree de git por agente, para trabajar en paralelo sobre el mismo repositorio, y
   revisar e integrar las tareas
 - [x] Restaurar agentes después de reiniciar
