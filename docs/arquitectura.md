@@ -42,8 +42,9 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/worktree.rs` | Los worktrees de git de los agentes: crearlos, ver su diff, integrarlos y borrarlos |
 | `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
 | `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular |
+| `src/pty.rs` | Un proceso en un pseudoterminal propio, para la terminal del celular (solo con `serve`) |
 | `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
-| `web/` | La app del celular (PWA) que sirve `pastor serve` en `/`: HTML, CSS y JS sin build, metidos en el binario |
+| `web/` | La app del celular (PWA) que sirve `pastor serve` en `/`: HTML, CSS y JS sin build, metidos en el binario, con xterm.js para la terminal |
 
 ## Decisiones importantes
 
@@ -257,6 +258,25 @@ estado del agente; `transcript::Reader` recuerda hasta dónde leyó y solo lee l
 pide con `session` y `after` solo los mensajes que le faltan. El formato es interno de Claude Code:
 se toman tus mensajes, las respuestas y una línea por herramienta, y lo que no se entiende se
 ignora. Codex y OpenCode no dan transcripción por ahora.
+
+### La terminal del celular es un `tmux attach`
+
+`/api/agents/{id}/attach` abre un WebSocket y, del otro lado, corre `tmux attach` a la sesión del
+agente en un pseudoterminal propio (`src/pty.rs`, con `openpty`): lo mismo que `pastor attach`,
+paneles y barra incluidos. Lo que dibuja tmux sale en mensajes binarios, lo que se escribe entra
+igual, y un mensaje de texto `{"cols":…,"rows":…}` cambia el tamaño del pseudoterminal. Leer del
+pseudoterminal bloquea, así que va en su propio hilo. Al cerrarse el WebSocket se mata a tmux. Al
+apagarse el servidor las terminales intentan despedirse; axum no espera a los WebSocket, pero al
+soltar el runtime cada `Pty` cierra igual su tmux, así que no quedan clientes colgados.
+
+El navegador no deja poner cabeceras en un WebSocket: el token va como subprotocolo
+(`token.<token>`) y el servidor contesta con el otro, `pastor`. En la app, xterm.js 5.5.0 y su
+addon de ajuste van dentro del binario, tal cual del paquete de npm, y se cargan la primera vez que
+se abre una terminal. xterm.js arma sus estilos con elementos `<style>`, así que la CSP permite
+estilos inline; como todo lo demás sigue limitado al mismo origen, un estilo inyectado no tendría
+adónde mandar nada. Mientras la terminal está abierta hay un cliente de tmux conectado y manda en
+el tamaño de la ventana, así que la conexión solo vive mientras la vista está a la vista: se cierra
+al cambiar de vista o al pasar la app a segundo plano, y se vuelve a abrir al regresar.
 
 ### Los avisos al celular van con `curl`
 

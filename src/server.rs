@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
+use axum::extract::ws::{self, CloseFrame, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State as Shared};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
@@ -25,7 +26,9 @@ use crate::agent::{Kind, Status};
 use crate::history;
 use crate::limits;
 use crate::ops::{self, AssignTarget, Place, Tracker};
+use crate::pty::Pty;
 use crate::store::{self, Agent, State, TaskStatus};
+use crate::tmux;
 use crate::transcript;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7433";
@@ -40,6 +43,10 @@ struct App {
     history: Mutex<history::Tail>,
     /// Los límites de uso leídos, para no preguntar en cada consulta.
     limits: Mutex<limits::Cache>,
+    /// Pasa a `true` al apagarse, para que las terminales abiertas intenten
+    /// despedirse. axum no espera a los WebSocket: si no alcanzan, al soltar
+    /// el runtime el `Drop` de cada `Pty` igual cierra su tmux.
+    closing: tokio::sync::watch::Sender<bool>,
 }
 
 /// El token sale de `PASTOR_TOKEN` o del archivo, nunca de un argumento:
@@ -66,7 +73,9 @@ pub fn run(bind: SocketAddr) -> Result<()> {
         transcripts: Mutex::default(),
         history: Mutex::default(),
         limits: Mutex::default(),
+        closing: tokio::sync::watch::Sender::new(false),
     });
+    let closing = app.closing.clone();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -76,7 +85,10 @@ pub fn run(bind: SocketAddr) -> Result<()> {
                 .with_context(|| format!("no pude escuchar en {bind}"))?;
             println!("pastor serve en http://{bind} · token en {from}");
             axum::serve(listener, router(app))
-                .with_graceful_shutdown(shutdown())
+                .with_graceful_shutdown(async move {
+                    shutdown().await;
+                    closing.send_replace(true);
+                })
                 .await?;
             Ok(())
         })
@@ -91,6 +103,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/agents/{id}/keys", post(keys))
         .route("/agents/{id}/screen", get(screen))
         .route("/agents/{id}/conversation", get(conversation))
+        .route("/agents/{id}/attach", get(attach))
         .route("/tasks", get(list_tasks).post(add_task))
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
@@ -118,8 +131,11 @@ async fn headers(req: Request, next: Next) -> Response {
     for (name, value) in [
         (
             header::CONTENT_SECURITY_POLICY,
-            "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; \
-             base-uri 'none'; form-action 'none'; object-src 'none'",
+            // Estilos inline: xterm.js arma los suyos con elementos `<style>`.
+            // Con imágenes, letras y conexiones solo del mismo origen, un
+            // estilo inyectado no tiene adónde mandar nada.
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+             frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'",
         ),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::X_FRAME_OPTIONS, "DENY"),
@@ -147,6 +163,23 @@ const WEB: &[(&str, &str, &[u8])] = &[
         "style.css",
         "text/css; charset=utf-8",
         include_bytes!("../web/style.css"),
+    ),
+    // xterm.js 5.5.0 y su addon de ajuste 0.10.0, tal cual del paquete de npm
+    // (licencia MIT en `web/xterm.LICENSE`): la terminal en vivo.
+    (
+        "xterm.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/xterm.js"),
+    ),
+    (
+        "xterm-addon-fit.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/xterm-addon-fit.js"),
+    ),
+    (
+        "xterm.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../web/xterm.css"),
     ),
     (
         "sw.js",
@@ -256,11 +289,21 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn auth(Shared(app): Shared<Arc<App>>, req: Request, next: Next) -> Response {
-    let ok = req
-        .headers()
+    let h = req.headers();
+    let bearer = h
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| v.strip_prefix("Bearer "));
+    // Un WebSocket del navegador no puede mandar `Authorization`: el token va
+    // como uno de sus subprotocolos, `token.<token>`.
+    let ws = || {
+        h.get(header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok())?
+            .split(',')
+            .find_map(|p| p.trim().strip_prefix("token."))
+    };
+    let ok = bearer
+        .or_else(ws)
         .is_some_and(|t| same(t.as_bytes(), app.token.as_bytes()));
     if !ok {
         return error(StatusCode::UNAUTHORIZED, "falta el token o no es válido");
@@ -559,6 +602,109 @@ async fn restore_agent(Path(id): Path<String>) -> Response {
     blocking(move || ops::restore_agent(&id)).await
 }
 
+#[derive(Deserialize)]
+struct TermSize {
+    cols: u16,
+    rows: u16,
+}
+
+/// La terminal del agente en vivo: un `tmux attach` a su sesión en un
+/// pseudoterminal, por WebSocket. Lo que llega en binario es lo que se
+/// escribe; en texto, `{"cols":…,"rows":…}` cuando cambia el tamaño. Lo que
+/// sale, en binario, es lo que dibuja tmux.
+async fn attach(
+    Shared(app): Shared<Arc<App>>,
+    Path(id): Path<String>,
+    Params(size): Params<TermSize>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let session = match tokio::task::spawn_blocking(move || ops::attach_session(&id)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return error(StatusCode::NOT_FOUND, format!("{e:#}")),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let closing = app.closing.subscribe();
+    ws.protocols(["pastor"])
+        .on_upgrade(move |socket| bridge(socket, session, size, closing))
+}
+
+async fn bridge(
+    mut socket: WebSocket,
+    session: String,
+    size: TermSize,
+    mut closing: tokio::sync::watch::Receiver<bool>,
+) {
+    let opened = Pty::spawn(tmux::attach_command(&session), size.cols, size.rows)
+        .and_then(|pty| Ok((pty.reader()?, pty)));
+    let (mut reader, pty) = match opened {
+        Ok(p) => p,
+        Err(e) => {
+            let frame = CloseFrame {
+                code: 1011,
+                reason: format!("{e:#}").into(),
+            };
+            let _ = socket.send(ws::Message::Close(Some(frame))).await;
+            return;
+        }
+    };
+    // Leer del pseudoterminal bloquea: va en su hilo. Termina cuando sale
+    // tmux (al cerrar la terminal o si se acaba la sesión).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 16 * 1024];
+        while let Ok(n @ 1..) = reader.read(&mut buf) {
+            if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    // Si la cerró el otro lado, su cierre ya tiene respuesta en camino.
+    let mut answered = false;
+    loop {
+        tokio::select! {
+            out = rx.recv() => match out {
+                Some(bytes) => {
+                    if socket.send(ws::Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(ws::Message::Binary(data))) => {
+                    // Escribir puede bloquear si tmux no lee (un pegado largo):
+                    // que no se lleve un hilo de tokio sin avisar.
+                    if tokio::task::block_in_place(|| pty.write(&data)).is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(ws::Message::Text(text))) => {
+                    if let Ok(s) = serde_json::from_str::<TermSize>(&text) {
+                        let _ = pty.resize(s.cols, s.rows);
+                    }
+                }
+                Some(Ok(ws::Message::Close(_))) => {
+                    answered = true;
+                    break;
+                }
+                Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            _ = closing.changed() => break,
+        }
+    }
+    if !answered {
+        let _ = socket.send(ws::Message::Close(None)).await;
+    }
+    // Leer hasta el final es lo que manda la respuesta al cierre y espera la
+    // del otro lado; sin eso el navegador lo ve como una conexión cortada.
+    let drain = async { while let Some(Ok(_)) = socket.recv().await {} };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
+    // Cerrar tmux espera a que salga.
+    let _ = tokio::task::spawn_blocking(move || drop(pty)).await;
+}
+
 // ---------- tareas ----------
 
 async fn list_tasks() -> Response {
@@ -737,6 +883,7 @@ mod tests {
             transcripts: Mutex::default(),
             history: Mutex::default(),
             limits: Mutex::default(),
+            closing: tokio::sync::watch::Sender::new(false),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listener = rt
@@ -745,7 +892,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         rt.spawn(async move { axum::serve(listener, router(app)).await });
         let mut s = std::net::TcpStream::connect(addr).unwrap();
-        let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+        // Sin dos puntos, la cabecera es `Authorization`.
+        let auth = auth.map_or(String::new(), |a| match a.split_once(": ") {
+            Some((name, value)) => format!("{name}: {value}\r\n"),
+            None => format!("Authorization: {a}\r\n"),
+        });
         write!(
             s,
             "GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n"
@@ -762,6 +913,8 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         assert!(r.contains("text/html") && r.contains("app.js"), "{r}");
         assert!(get("/sw.js", None).contains("text/javascript"));
+        assert!(get("/xterm.js", None).contains("text/javascript"));
+        assert!(get("/xterm.css", None).contains("text/css"));
         assert!(get("/manifest.webmanifest", None).starts_with("HTTP/1.1 200"));
         assert!(get("/nada.js", None).starts_with("HTTP/1.1 404"));
     }
@@ -777,6 +930,23 @@ mod tests {
             assert!(r.contains("x-content-type-options: nosniff"), "{r}");
             assert!(r.contains("referrer-policy: no-referrer"), "{r}");
         }
+    }
+
+    #[test]
+    fn el_token_de_un_websocket_va_como_subprotocolo() {
+        let ok = get(
+            "/api/nada",
+            Some("Sec-WebSocket-Protocol: pastor, token.secreto"),
+        );
+        assert!(ok.starts_with("HTTP/1.1 404"), "{ok}");
+        let malo = get(
+            "/api/nada",
+            Some("Sec-WebSocket-Protocol: pastor, token.otro"),
+        );
+        assert!(malo.starts_with("HTTP/1.1 401"), "{malo}");
+        // Sin el prefijo no vale: el subprotocolo `pastor` no es el token.
+        let sin = get("/api/nada", Some("Sec-WebSocket-Protocol: secreto"));
+        assert!(sin.starts_with("HTTP/1.1 401"), "{sin}");
     }
 
     #[test]

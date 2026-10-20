@@ -7,6 +7,8 @@ mod limits;
 mod ntfy;
 mod ops;
 #[cfg(feature = "serve")]
+mod pty;
+#[cfg(feature = "serve")]
 mod server;
 mod store;
 mod text;

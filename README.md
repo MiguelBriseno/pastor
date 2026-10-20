@@ -309,6 +309,7 @@ IP de Tailscale (que ya cifra).
 | `POST` | `/api/agents/{id}/send` | `{"text": "..."}` (lo pega y pulsa Enter) |
 | `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
 | `GET` | `/api/agents/{id}/screen` | — (responde `{"text": "..."}`, lo que se ve en su panel; con `?cols=48&rows=30` antes lo ajusta a ese tamaño) |
+| `GET` | `/api/agents/{id}/attach` | — (WebSocket con su sesión de tmux en vivo, como `pastor attach`; con `?cols=…&rows=…`. El token va como subprotocolo `token.<token>`) |
 | `GET` | `/api/agents/{id}/conversation` | — (la conversación entera de un agente de Claude, de su transcripción; con `?session=…&after=N`, solo lo nuevo) |
 | `POST` | `/api/agents/{id}/restore` | — (lo vuelve a abrir si se perdió, retomando su conversación) |
 | `DELETE` | `/api/agents/{id}` | — |
@@ -337,9 +338,17 @@ viniera después llegaría al shell.
 ### La app del celular
 
 `pastor serve` también sirve una app web en `/`, pensada para el celular: los agentes agrupados por
-estado (los que te esperan, primero) y, con varios proyectos, un filtro para ver uno solo, la pantalla de cada uno en vivo con una caja para escribirle y
-botones para las teclas (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C), la conversación entera
-con los agentes de Claude, las tareas, y el dashboard y el historial como en la TUI. La
+estado (los que te esperan, primero) y, con varios proyectos, un filtro para ver uno solo. De cada
+agente puedes ver:
+
+- **Pantalla:** lo que se ve en su panel, con una caja para escribirle y botones para las teclas
+  (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C).
+- **Conversación:** la conversación entera, solo con los agentes de Claude.
+- **Terminal:** su sesión de tmux en vivo, como con `pastor attach`. Lo que escribes le llega al
+  momento, con colores, y también ves la terminal de al lado (cambia de panel con Ctrl-B y una
+  flecha). Mientras está abierta, el agente dibuja al tamaño del celular.
+
+También están las tareas, y el dashboard y el historial como en la TUI. La
 primera vez pide el token y lo guarda solo en ese dispositivo.
 
 Para instalarla como app (PWA) el navegador exige HTTPS. Con Tailscale basta con publicar el puerto
@@ -555,10 +564,8 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [x] Un worktree de git por agente, para trabajar en paralelo sobre el mismo repositorio, y
   revisar e integrar las tareas
 - [x] Restaurar agentes después de reiniciar
-- [ ] Integraciones con Slack y Asana
 - [ ] Manejar agentes en otras máquinas por SSH
-- [ ] Desde el celular: API, avisos con ntfy, pantalla en vivo y una PWA (hecho), y una terminal
-  interactiva
+- [x] Desde el celular: API, avisos con ntfy, pantalla en vivo, una PWA y una terminal interactiva
 
 ## Contribuir
 

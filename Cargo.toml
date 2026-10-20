@@ -9,12 +9,14 @@ license = "MIT"
 
 [features]
 # `pastor serve`: API HTTP para manejar los agentes desde el celular.
-serve = ["dep:axum", "dep:tokio"]
+serve = ["dep:axum", "dep:tokio", "dep:libc"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal"], optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "sync", "time"], optional = true }
+# El PTY de la terminal del celular.
+libc = { version = "0.2", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "5"

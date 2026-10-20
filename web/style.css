@@ -331,6 +331,13 @@ main.agent-main > * { max-width: none; margin: 0; }
   text-shadow: 0 0 4px rgb(0 240 255 / .35);
   white-space: pre; tab-size: 4;
 }
+.term-wrap.live { padding: 6px 4px 0; }
+.live-box { position: absolute; inset: 6px 4px 0; }
+.live-box .xterm { height: 100%; }
+.live-status {
+  position: absolute; inset: auto 12px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 14px; background: rgb(11 11 22 / .92); border: 1px solid var(--line); font: 13px var(--mono); color: var(--muted);
+}
 .term.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 .term.loading { color: var(--cyan); animation: blink 1s steps(2) infinite; }
 .jump {
