@@ -21,7 +21,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Bar, BarChart, BarGroup, Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph,
     Row, Table, TableState, Tabs, Wrap,
@@ -33,9 +33,10 @@ use crate::avisos::Notifier;
 use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::limits::{self, Usage};
-use crate::ops::{self, AssignTarget, Snapshot, Tracker};
-use crate::store::{Agent, State, Task, TaskStatus};
+use crate::ops::{self, AssignTarget, Place, Snapshot, Tracker};
+use crate::store::{Agent, State, Task, TaskStatus, Worktree};
 use crate::text::{self, truncate};
+use crate::worktree;
 
 const REFRESH: Duration = Duration::from_secs(1);
 /// Cuánto se ve un aviso en el pie.
@@ -135,6 +136,11 @@ enum Mode {
         field: usize,
     },
     Assign(AssignForm),
+    /// Pedirle cambios al agente de una tarea en revisión.
+    Reject {
+        task: String,
+        input: String,
+    },
     Confirm {
         msg: String,
         action: Pending,
@@ -144,6 +150,7 @@ enum Mode {
 enum Pending {
     KillAgent(String),
     DeleteTask(String),
+    ApproveTask(String),
 }
 
 struct NewAgentForm {
@@ -151,6 +158,7 @@ struct NewAgentForm {
     cwd: String,
     name: String,
     prompt: String,
+    worktree: bool,
     field: usize,
 }
 
@@ -164,6 +172,7 @@ struct AssignForm {
     options: Vec<AssignOpt>,
     sel: usize,
     cwd: String,
+    worktree: bool,
 }
 
 impl AssignForm {
@@ -501,7 +510,7 @@ impl App {
                 3 => (&mut f.prompt, true),
                 _ => return,
             },
-            Mode::Send { input, .. } => (input, true),
+            Mode::Send { input, .. } | Mode::Reject { input, .. } => (input, true),
             Mode::Term { input, .. } => (input, false),
             Mode::NewTask {
                 title, desc, field, ..
@@ -534,7 +543,7 @@ impl App {
             KeyCode::BackTab => self.tab = self.tab.step(Tab::ALL.len() - 1),
             _ => match self.tab {
                 Tab::Agents => self.on_agents(key, term)?,
-                Tab::Tasks => self.on_tasks(key)?,
+                Tab::Tasks => self.on_tasks(key, term)?,
                 Tab::Dashboard | Tab::History => {}
             },
         }
@@ -564,6 +573,7 @@ impl App {
                     cwd: default_cwd(),
                     name: String::new(),
                     prompt: String::new(),
+                    worktree: false,
                     field: 1,
                 })
             }
@@ -626,7 +636,7 @@ impl App {
         Ok(())
     }
 
-    fn on_tasks(&mut self, key: KeyEvent) -> Result<()> {
+    fn on_tasks(&mut self, key: KeyEvent, term: &mut DefaultTerminal) -> Result<()> {
         let n = self.state.tasks.len();
         let task = self.selected_task().cloned();
         match key.code {
@@ -656,11 +666,17 @@ impl App {
                         .map(|a| AssignOpt::Agent(a.id.clone(), format!("{} ({})", a.name, a.kind)))
                         .collect();
                     options.extend(Kind::ALL.map(AssignOpt::New));
+                    let cwd = default_cwd();
+                    // En un repositorio, cada tarea en su worktree; si ya
+                    // tiene uno, se vuelve a usar ese.
+                    let worktree =
+                        t.worktree.is_some() || expand(&cwd).is_some_and(|d| worktree::is_repo(&d));
                     self.mode = Mode::Assign(AssignForm {
                         task: t.id,
                         options,
                         sel: 0,
-                        cwd: default_cwd(),
+                        cwd,
+                        worktree,
                     });
                 }
             }
@@ -674,6 +690,36 @@ impl App {
                 if let Some(t) = task {
                     ops::set_task_status(&t.id, TaskStatus::Done)?;
                     self.refresh();
+                }
+            }
+            KeyCode::Char('v') => {
+                if let Some(t) = task {
+                    let wt = ops::task_worktree(&t.id)?;
+                    suspend(term, || show_diff(&wt))?;
+                }
+            }
+            KeyCode::Char('A') => {
+                if let Some(t) = task {
+                    let msg = match &t.worktree {
+                        Some(wt) => format!(
+                            "¿Integrar {} en {} y terminar a su agente?",
+                            wt.branch,
+                            tilde(&wt.repo)
+                        ),
+                        None => format!("¿Dar la tarea {} por hecha?", t.id),
+                    };
+                    self.mode = Mode::Confirm {
+                        msg,
+                        action: Pending::ApproveTask(t.id),
+                    };
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(t) = task {
+                    self.mode = Mode::Reject {
+                        task: t.id,
+                        input: String::new(),
+                    };
                 }
             }
             KeyCode::Char('x') => {
@@ -720,9 +766,14 @@ impl App {
                         self.mode = Mode::NewAgent(f);
                         return Ok(());
                     };
+                    let place = if f.worktree {
+                        Place::NewWorktree(None)
+                    } else {
+                        Place::Dir
+                    };
                     self.set_flash(format!("Lanzando {kind}…"));
                     self.actions.run(Some(Mode::NewAgent(f)), move || {
-                        let a = ops::new_agent(kind, Some(cwd), name, prompt.as_deref())?;
+                        let a = ops::new_agent(kind, Some(cwd), name, prompt.as_deref(), place)?;
                         Ok(Done::Agent {
                             id: a.id,
                             msg: format!("Agente {} lanzado", a.name),
@@ -730,11 +781,15 @@ impl App {
                     });
                 }
                 KeyCode::Tab | KeyCode::Down => {
-                    f.field = (f.field + 1) % 4;
+                    f.field = (f.field + 1) % 5;
                     self.mode = Mode::NewAgent(f);
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    f.field = (f.field + 3) % 4;
+                    f.field = (f.field + 4) % 5;
+                    self.mode = Mode::NewAgent(f);
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if f.field == 4 => {
+                    f.worktree = !f.worktree;
                     self.mode = Mode::NewAgent(f);
                 }
                 KeyCode::Left | KeyCode::Right if f.field == 0 => {
@@ -840,6 +895,7 @@ impl App {
                             Some(cwd) => AssignTarget::New {
                                 kind: *kind,
                                 cwd: Some(cwd),
+                                worktree: f.worktree,
                             },
                             None => {
                                 self.set_flash(NO_CWD.to_string());
@@ -852,8 +908,17 @@ impl App {
                     self.set_flash(format!("Asignando {task}…"));
                     self.actions.run(Some(Mode::Assign(f)), move || {
                         let a = ops::assign_task(&task, target)?;
-                        Ok(Done::Msg(format!("Tarea {task} asignada a {}", a.name)))
+                        Ok(Done::Msg(match &a.worktree {
+                            Some(wt) => {
+                                format!("Tarea {task} asignada a {} en {}", a.name, wt.branch)
+                            }
+                            None => format!("Tarea {task} asignada a {}", a.name),
+                        }))
                     });
+                }
+                KeyCode::Left | KeyCode::Right if f.new_selected() => {
+                    f.worktree = !f.worktree;
+                    self.mode = Mode::Assign(f);
                 }
                 _ => {
                     if f.new_selected() {
@@ -862,6 +927,25 @@ impl App {
                     self.mode = Mode::Assign(f);
                 }
             },
+            Mode::Reject { task, mut input } => {
+                if key.code == KeyCode::Enter {
+                    if input.trim().is_empty() {
+                        self.set_flash("Escribe qué hay que cambiar".to_string());
+                        self.mode = Mode::Reject { task, input };
+                    } else {
+                        let (t, text) = (task.clone(), input.clone());
+                        self.set_flash(format!("Devolviendo {task}…"));
+                        self.actions
+                            .run(Some(Mode::Reject { task, input }), move || {
+                                let a = ops::reject_task(&t, &text)?;
+                                Ok(Done::Msg(format!("Tarea {t} devuelta a {}", a.name)))
+                            });
+                    }
+                } else {
+                    edit(&mut input, &key);
+                    self.mode = Mode::Reject { task, input };
+                }
+            }
             Mode::Confirm { action, .. } => {
                 if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('s') {
                     match action {
@@ -870,6 +954,11 @@ impl App {
                             Ok(Done::Quiet)
                         }),
                         Pending::DeleteTask(id) => ops::delete_task(&id)?,
+                        Pending::ApproveTask(id) => {
+                            self.set_flash(format!("Integrando {id}…"));
+                            self.actions
+                                .run(None, move || Ok(Done::Msg(ops::approve_task(&id)?)));
+                        }
                     }
                     self.refresh();
                 }
@@ -1068,7 +1157,12 @@ impl App {
                     format!("{}{}", pad(ic.kind(a.kind)), a.kind),
                     Style::default().fg(kind_color(a.kind)),
                 ),
-                Span::raw(format!(" · {}{} ", pad(ic.folder), tilde(&a.cwd))),
+                Span::raw(match &a.worktree {
+                    Some(wt) => {
+                        format!(" · {}{} · {} ", pad(ic.folder), tilde(&wt.repo), wt.branch)
+                    }
+                    None => format!(" · {}{} ", pad(ic.folder), tilde(&a.cwd)),
+                }),
             ]));
         if let Some(t) = a.task.as_ref().and_then(|t| self.state.find_task(t).ok()) {
             block = block.title_bottom(format!(
@@ -1144,13 +1238,24 @@ impl App {
             f.render_stateful_widget(table, top, &mut self.task_sel);
         }
 
-        let desc = self.selected_task().map_or(String::new(), |t| {
-            if t.description.is_empty() {
-                "(sin descripción)".to_string()
-            } else {
-                t.description.clone()
+        let mut desc = Text::default();
+        if let Some(t) = self.selected_task() {
+            if let Some(wt) = &t.worktree {
+                desc.push_line(Line::from(vec![
+                    Span::styled(wt.branch.clone(), Style::default().fg(Color::Cyan)),
+                    format!(" en {}", tilde(&wt.path)).dark_gray(),
+                ]));
+                desc.push_line(Line::from(
+                    "v ver cambios · A aprobar e integrar · r pedir cambios".dark_gray(),
+                ));
+                desc.push_line(Line::raw(""));
             }
-        });
+            if t.description.is_empty() {
+                desc.push_line(Line::from("(sin descripción)".dark_gray()));
+            } else {
+                desc.extend(Text::raw(t.description.clone()));
+            }
+        }
         let p = Paragraph::new(desc).wrap(Wrap { trim: false }).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
@@ -1568,6 +1673,9 @@ impl App {
                 ("⏎ asignar", 0),
                 ("espacio avanzar", 1),
                 ("d hecha", 1),
+                ("v cambios", 1),
+                ("A aprobar", 1),
+                ("r pedir cambios", 2),
                 ("g ir al agente", 2),
                 ("x borrar", 1),
                 ("< > alto lista", 3),
@@ -1581,6 +1689,7 @@ impl App {
             (Mode::Assign(form), _) if form.new_selected() => &[
                 ("↑↓ elegir", 0),
                 ("escribe el directorio", 1),
+                ("← → worktree", 1),
                 ("⏎ asignar", 0),
                 ("Esc cancelar", 0),
             ],
@@ -1624,8 +1733,10 @@ impl App {
                     field_lines("Nombre", &form.name, form.field == 2, w),
                     field_lines("Mensaje", &form.prompt, form.field == 3, w),
                 ];
-                let room = modal_room(f, 2).saturating_sub(lines.len());
-                lines.extend(fields_in(fields, form.field.checked_sub(1), room));
+                let room = modal_room(f, 2).saturating_sub(lines.len() + 1);
+                let active = form.field.checked_sub(1).filter(|&i| i < 3);
+                lines.extend(fields_in(fields, active, room));
+                lines.push(worktree_line(form.worktree, form.field == 4));
                 let inner = popup(f, " Nuevo agente ", w, lines.len() as u16 + 4);
                 f.render_widget(Paragraph::new(lines), inner);
             }
@@ -1676,10 +1787,11 @@ impl App {
                 // El directorio siempre se ve; las opciones, en una ventana
                 // que sigue a la elegida si no caben todas.
                 let room = modal_room(f, 1);
-                let dir = keep_tail(
+                let mut dir = keep_tail(
                     field_lines("Directorio", &form.cwd, form.new_selected(), w),
-                    room.saturating_sub(3),
+                    room.saturating_sub(4),
                 );
+                dir.push(worktree_line(form.worktree, form.new_selected()));
                 let shown = room.saturating_sub(2 + dir.len()).max(1);
                 let first = form.sel.saturating_sub(shown - 1);
                 for (i, opt) in form.options.iter().enumerate().skip(first).take(shown) {
@@ -1705,6 +1817,19 @@ impl App {
                 );
                 f.render_widget(Paragraph::new(lines), inner);
             }
+            Mode::Reject { task, input } => {
+                let w = modal_width(f, 100);
+                let mut lines = vec![Line::raw("")];
+                let room = modal_room(f, 0).saturating_sub(lines.len());
+                lines.extend(keep_tail(field_lines("Qué cambiar", input, true, w), room));
+                let inner = popup(
+                    f,
+                    &format!(" Pedir cambios en {task} "),
+                    w,
+                    lines.len() as u16 + 2,
+                );
+                f.render_widget(Paragraph::new(lines), inner);
+            }
             Mode::Confirm { msg, .. } => {
                 let inner = popup(f, " Confirmar ", 50, 4);
                 let lines = vec![Line::raw(""), Line::from(format!(" {msg}  (y/n)").bold())];
@@ -1715,6 +1840,42 @@ impl App {
 }
 
 // ---------- utilidades ----------
+
+/// La línea del interruptor del worktree en los formularios.
+fn worktree_line(on: bool, active: bool) -> Line<'static> {
+    let opt = |text: &'static str, chosen: bool| {
+        if chosen {
+            Span::styled(
+                format!(" {text} "),
+                Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+            )
+        } else {
+            Span::styled(format!(" {text} "), Style::default().fg(Color::DarkGray))
+        }
+    };
+    let mut spans = vec![
+        Span::styled(label("Worktree"), label_style(active)),
+        opt("sí", on),
+        Span::raw(" "),
+        opt("no", !on),
+    ];
+    if active {
+        spans.push(Span::styled("  ← →", Style::default().fg(Color::DarkGray)));
+    }
+    Line::from(spans)
+}
+
+/// Muestra el diff del worktree con el paginador de git. Para un diff corto
+/// el paginador saldría solo y no se alcanzaría a ver: se le pide que espere.
+fn show_diff(wt: &Worktree) -> Result<()> {
+    worktree::diff(wt, false, |mut c| {
+        if std::env::var_os("LESS").is_none() {
+            c.env("LESS", "R");
+        }
+        c.status()?;
+        Ok(())
+    })
+}
 
 /// Sale de la TUI mientras corre `f` (p. ej. tmux attach) y vuelve después.
 fn suspend<T>(term: &mut DefaultTerminal, f: impl FnOnce() -> Result<T>) -> Result<T> {

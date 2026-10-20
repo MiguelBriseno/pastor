@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use crate::agent::{Kind, Status};
 use crate::history;
 use crate::limits;
-use crate::ops::{self, AssignTarget, Tracker};
+use crate::ops::{self, AssignTarget, Place, Tracker};
 use crate::store::{self, Agent, State, TaskStatus};
 use crate::transcript;
 
@@ -94,6 +94,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
         .route("/tasks/{id}/done", post(task_done))
+        .route("/tasks/{id}/approve", post(approve_task))
+        .route("/tasks/{id}/reject", post(reject_task))
         .route("/stats", get(stats))
         .route("/limits", get(limits))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no existe esa ruta") })
@@ -404,13 +406,30 @@ struct NewAgent {
     cwd: PathBuf,
     name: Option<String>,
     prompt: Option<String>,
+    /// En su propio worktree de git.
+    #[serde(default)]
+    worktree: bool,
 }
 
 async fn new_agent(Body(req): Body<NewAgent>) -> Response {
     if let Some(r) = not_absolute(&req.cwd) {
         return r;
     }
-    blocking(move || ops::new_agent(req.kind, Some(req.cwd), req.name, req.prompt.as_deref())).await
+    let place = if req.worktree {
+        Place::NewWorktree(None)
+    } else {
+        Place::Dir
+    };
+    blocking(move || {
+        ops::new_agent(
+            req.kind,
+            Some(req.cwd),
+            req.name,
+            req.prompt.as_deref(),
+            place,
+        )
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -553,6 +572,9 @@ struct Assign {
     agent: Option<String>,
     kind: Option<Kind>,
     cwd: Option<PathBuf>,
+    /// Solo para un agente nuevo: en su propio worktree de git.
+    #[serde(default)]
+    worktree: bool,
 }
 
 async fn assign_task(Path(id): Path<String>, Body(req): Body<Assign>) -> Response {
@@ -561,11 +583,13 @@ async fn assign_task(Path(id): Path<String>, Body(req): Body<Assign>) -> Respons
             agent: Some(a),
             kind: None,
             cwd: None,
+            worktree: false,
         } => AssignTarget::Existing(a),
         Assign {
             agent: None,
             kind: Some(kind),
             cwd: Some(cwd),
+            worktree,
         } => {
             if let Some(r) = not_absolute(&cwd) {
                 return r;
@@ -573,6 +597,7 @@ async fn assign_task(Path(id): Path<String>, Body(req): Body<Assign>) -> Respons
             AssignTarget::New {
                 kind,
                 cwd: Some(cwd),
+                worktree,
             }
         }
         _ => {
@@ -587,6 +612,15 @@ async fn assign_task(Path(id): Path<String>, Body(req): Body<Assign>) -> Respons
 
 async fn task_done(Path(id): Path<String>) -> Response {
     blocking(move || ops::set_task_status(&id, TaskStatus::Done).map(|()| ok())).await
+}
+
+/// Integra la rama de la tarea y la da por hecha. Responde con el resumen.
+async fn approve_task(Path(id): Path<String>) -> Response {
+    blocking(move || ops::approve_task(&id).map(|message| json!({ "message": message }))).await
+}
+
+async fn reject_task(Path(id): Path<String>, Body(req): Body<Message>) -> Response {
+    blocking(move || ops::reject_task(&id, &req.text)).await
 }
 
 async fn delete_task(Path(id): Path<String>) -> Response {

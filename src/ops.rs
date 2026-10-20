@@ -10,14 +10,27 @@ use chrono::{DateTime, Utc};
 use crate::agent::{self, Kind, Observation, Status};
 use crate::history::{self, Event};
 use crate::hooks;
-use crate::store::{self, Agent, State, Task, TaskStatus};
+use crate::store::{self, Agent, State, Task, TaskStatus, Worktree};
 use crate::tmux;
+use crate::worktree;
+
+/// Dónde trabaja un agente nuevo.
+pub enum Place {
+    /// En el directorio que se le da.
+    Dir,
+    /// En un worktree nuevo del repositorio del directorio. Su rama lleva
+    /// este nombre o, sin él, el del agente o su tipo.
+    NewWorktree(Option<String>),
+    /// En un worktree que ya existe: el de una tarea que se vuelve a asignar.
+    Worktree(Worktree),
+}
 
 pub fn new_agent(
     kind: Kind,
     cwd: Option<PathBuf>,
     name: Option<String>,
     prompt: Option<&str>,
+    place: Place,
 ) -> Result<Agent> {
     tmux::ensure_available()?;
     if let Some(n) = name.as_deref().map(str::trim) {
@@ -36,6 +49,44 @@ pub fn new_agent(
         bail!("{} no es un directorio", cwd.display());
     }
     let cmd = kind.launch_command(prompt)?;
+    let (cwd, wt, created) = match place {
+        Place::Dir => (cwd, None, false),
+        Place::NewWorktree(branch) => {
+            let branch = branch
+                .or_else(|| name.clone())
+                .unwrap_or_else(|| kind.to_string());
+            let (wt, start) = worktree::create(&cwd, &branch)?;
+            (start, Some(wt), true)
+        }
+        Place::Worktree(wt) => {
+            if !wt.path.is_dir() {
+                bail!("el worktree {} ya no existe", wt.path.display());
+            }
+            (wt.path.clone(), Some(wt), false)
+        }
+    };
+    // En un worktree el nombre por defecto es el del repositorio, no el de
+    // la copia.
+    let name = name.or_else(|| {
+        let wt = wt.as_ref()?;
+        Some(wt.repo.file_name()?.to_string_lossy().into_owned())
+    });
+    let launched = launch(kind, cwd, name, &cmd, wt.clone());
+    if launched.is_err() && created {
+        if let Some(wt) = &wt {
+            worktree::remove_if_unchanged(wt);
+        }
+    }
+    launched
+}
+
+fn launch(
+    kind: Kind,
+    cwd: PathBuf,
+    name: Option<String>,
+    cmd: &[String],
+    wt: Option<Worktree>,
+) -> Result<Agent> {
     // Si se perdió el estado, el contador vuelve a empezar y `a1` podría
     // seguir vivo: el nuevo chocaría con su sesión y recibiría sus hooks.
     // Sin saber qué sesiones hay, mejor no lanzar: la limpieza de un fallo
@@ -43,7 +94,10 @@ pub fn new_agent(
     let taken = tmux::panes()?;
     let agent = State::update(|s| {
         s.skip_ids(|id| taken.contains_key(id));
-        Ok(s.add_agent(kind, cwd, name))
+        s.add_agent(kind, cwd, name);
+        let agent = s.agents.last_mut().expect("recién añadido");
+        agent.worktree = wt;
+        Ok(agent.clone())
     })?;
     hooks::clear_status(&agent.id);
     let started = hooks::relaunch_shell().and_then(|then| {
@@ -51,7 +105,7 @@ pub fn new_agent(
             &agent.id,
             &agent.cwd,
             &[("PASTOR_AGENT", &agent.id)],
-            &cmd,
+            cmd,
             &then,
         )
     });
@@ -388,9 +442,18 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
     // medias, lo vería muerto y tomaría su tarea por terminada. Se busca dentro
     // del candado: si dos lo matan a la vez, solo uno lo encuentra, y el fin
     // de la sesión no queda dos veces en el historial.
-    let agent = update_recording(|s, mut record| remove_agent(s, agent_key, &mut record))?;
+    let (agent, orphan) = update_recording(|s, mut record| {
+        let agent = remove_agent(s, agent_key, &mut record)?;
+        let orphan = agent.worktree.clone().filter(|wt| !in_use(s, wt));
+        Ok((agent, orphan))
+    })?;
     let killed = tmux::kill_session(&agent.id);
     hooks::clear_status(&agent.id);
+    // Un worktree sin cambios y sin tarea que revisar no sirve para nada. Con
+    // cambios se queda: que no se pierda trabajo.
+    if let Some(wt) = &orphan {
+        worktree::remove_if_unchanged(wt);
+    }
     history::record(Event::AgentEnded {
         agent: agent.id.clone(),
         kind: agent.kind,
@@ -405,6 +468,12 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
         ))),
         _ => Ok(()),
     }
+}
+
+/// Si algún agente o tarea sigue usando el worktree.
+fn in_use(s: &State, wt: &Worktree) -> bool {
+    s.agents.iter().any(|a| a.worktree.as_ref() == Some(wt))
+        || s.tasks.iter().any(|t| t.worktree.as_ref() == Some(wt))
 }
 
 /// Saca al agente del estado y libera su tarea.
@@ -427,10 +496,12 @@ fn remove_agent(
 
 pub enum AssignTarget {
     Existing(String),
-    /// Sin `cwd`, en el directorio actual.
+    /// Sin `cwd`, en el directorio actual. Con `worktree`, en uno nuevo; si
+    /// la tarea ya tiene el suyo (se asignó antes), en ese.
     New {
         kind: Kind,
         cwd: Option<PathBuf>,
+        worktree: bool,
     },
 }
 
@@ -449,13 +520,48 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
             tmux::send_text(&agent_target(&a)?, &prompt)?;
             (a, false)
         }
-        AssignTarget::New { kind, cwd } => (new_agent(kind, cwd, None, Some(&prompt))?, true),
+        AssignTarget::New {
+            kind,
+            cwd,
+            worktree,
+        } => {
+            let place = match task.worktree.clone() {
+                _ if !worktree => Place::Dir,
+                Some(wt) if wt.path.is_dir() => {
+                    // Dos agentes en la misma copia se pisarían.
+                    if let Some(a) = state
+                        .agents
+                        .iter()
+                        .find(|a| a.worktree.as_ref() == Some(&wt))
+                    {
+                        bail!(
+                            "{} sigue trabajando en el worktree de {}; termínalo o asígnasela a él",
+                            a.name,
+                            task.id
+                        );
+                    }
+                    Place::Worktree(wt)
+                }
+                _ => Place::NewWorktree(Some(format!("{}-{}", task.id, task.title))),
+            };
+            (new_agent(kind, cwd, None, Some(&prompt), place)?, true)
+        }
     };
     // Lo que pasó entre leer la tarea y ahora (otra asignación, la tarea
     // borrada o cerrada) lo resuelve `link_task` dentro del candado.
     let linked = update_recording(|s, mut record| {
-        link_task(s, &task.id, &agent.id, task.status, &mut record)
+        link_task(s, &task.id, &agent.id, task.status, &mut record)?;
+        // La tarea recuerda el worktree del agente para revisarla aunque el
+        // agente ya no esté. Sin worktree se revisa a mano, en su directorio.
+        let t = s.find_task_mut(&task.id)?;
+        let old = std::mem::replace(&mut t.worktree, agent.worktree.clone());
+        Ok(old.filter(|wt| !in_use(s, wt)))
     });
+    // El worktree que la tarea deja, si nadie más lo usa: sin cambios se
+    // borra; con cambios se queda en disco, como al terminar un agente.
+    if let Ok(Some(old)) = &linked {
+        worktree::remove_if_unchanged(old);
+    }
     if let Err(e) = linked {
         // Un agente lanzado solo para esta tarea no tiene nada que hacer.
         if created {
@@ -597,8 +703,8 @@ pub fn add_task(title: String, description: String) -> Result<Task> {
 }
 
 pub fn delete_task(task_id: &str) -> Result<()> {
-    State::update(|s| {
-        s.find_task(task_id)?;
+    let orphan = State::update(|s| {
+        let wt = s.find_task(task_id)?.worktree.clone();
         s.tasks.retain(|t| t.id != task_id);
         for a in s
             .agents
@@ -607,12 +713,108 @@ pub fn delete_task(task_id: &str) -> Result<()> {
         {
             a.task = None;
         }
-        Ok(())
+        Ok(wt.filter(|wt| !in_use(s, wt)))
     })?;
+    if let Some(wt) = &orphan {
+        worktree::remove_if_unchanged(wt);
+    }
     history::record(Event::TaskDeleted {
         task: task_id.to_string(),
     });
     Ok(())
+}
+
+/// El worktree de una tarea, para ver lo que cambió.
+pub fn task_worktree(task_id: &str) -> Result<Worktree> {
+    let state = State::load()?;
+    let task = state.find_task(task_id)?;
+    task.worktree
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("la tarea {task_id} no tiene worktree: se asignó sin uno"))
+}
+
+/// Da la tarea por buena: guarda en un commit lo que quedó sin guardar,
+/// integra su rama en la rama actual del repositorio, termina al agente que
+/// trabajaba en el worktree y lo borra. Sin worktree solo la marca hecha.
+pub fn approve_task(task_id: &str) -> Result<String> {
+    let task = State::load()?.find_task(task_id)?.clone();
+    let Some(wt) = task.worktree.clone() else {
+        set_task_status(task_id, TaskStatus::Done)?;
+        return Ok(format!("Tarea {task_id} hecha"));
+    };
+    // Integrar el worktree también integraría el trabajo de la otra tarea.
+    if let Some(other) = State::load()?.tasks.iter().find(|t| {
+        t.id != task.id && t.status != TaskStatus::Done && t.worktree.as_ref() == Some(&wt)
+    }) {
+        bail!(
+            "el worktree de {task_id} también lo usa la tarea {}; termina esa primero o bórrala",
+            other.id
+        );
+    }
+    let msg = format!("[{}] {}", task.id, task.title);
+    // Primero con el agente vivo: si hay conflictos, todavía puede resolverlos.
+    let into = worktree::merge(&wt, &msg)?;
+    // Su carpeta está por desaparecer.
+    for a in State::load()?
+        .agents
+        .iter()
+        .filter(|a| a.worktree.as_ref() == Some(&wt))
+    {
+        kill_agent(&a.id)?;
+    }
+    // Lo que el agente alcanzó a escribir antes de terminarlo.
+    let into = worktree::merge(&wt, &msg)?.or(into);
+    worktree::remove(&wt)?;
+    update_recording(|s, record| {
+        let t = s.find_task_mut(task_id)?;
+        t.worktree = None;
+        record(t, TaskStatus::Done);
+        t.status = TaskStatus::Done;
+        Ok(())
+    })?;
+    Ok(match into {
+        Some(into) => format!("Tarea {task_id} integrada en {into}"),
+        None => format!("Tarea {task_id} hecha; no tenía cambios"),
+    })
+}
+
+/// Devuelve la tarea a su agente con lo que hay que cambiar, y vuelve a
+/// quedar en curso.
+pub fn reject_task(task_id: &str, comment: &str) -> Result<Agent> {
+    if comment.trim().is_empty() {
+        bail!("escribe qué hay que cambiar");
+    }
+    let state = State::load()?;
+    let task = state.find_task(task_id)?;
+    let agent = task
+        .agent
+        .as_deref()
+        .and_then(|id| state.agents.iter().find(|a| a.id == id))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "la tarea {task_id} ya no tiene agente; asígnala de nuevo (se usa su mismo worktree)"
+            )
+        })?;
+    let text = format!(
+        "[{}] Cambios pedidos en la revisión:\n\n{}",
+        task.id,
+        comment.trim()
+    );
+    tmux::send_text(&agent_target(agent)?, &text)?;
+    history::record(Event::MessageSent {
+        agent: agent.id.clone(),
+    });
+    update_recording(|s, record| {
+        let t = s.find_task_mut(task_id)?;
+        // Solo si sigue siendo suya: si no, el mensaje llegó pero la tarea
+        // ya es de otro.
+        if t.agent.as_deref() == Some(&agent.id) {
+            record(t, TaskStatus::InProgress);
+            t.status = TaskStatus::InProgress;
+        }
+        Ok(())
+    })?;
+    Ok(agent.clone())
 }
 
 struct Seen {

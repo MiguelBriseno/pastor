@@ -14,6 +14,7 @@ mod tmux;
 #[cfg(feature = "serve")]
 mod transcript;
 mod tui;
+mod worktree;
 
 use std::path::PathBuf;
 
@@ -21,7 +22,7 @@ use anyhow::Result;
 use clap::{Arg, ArgAction, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use agent::{Kind, Status};
-use ops::AssignTarget;
+use ops::{AssignTarget, Place};
 use store::{State, TaskStatus};
 
 /// Gestor de agentes de código (Claude Code, Codex, opencode). Sin argumentos abre la interfaz.
@@ -48,6 +49,9 @@ enum Cmd {
         /// Primer mensaje para el agente
         #[arg(short, long, value_name = "TEXTO")]
         prompt: Option<String>,
+        /// Trabaja en su propio worktree de git, en una rama nueva
+        #[arg(short, long)]
+        worktree: bool,
     },
     /// Lista los agentes y su estado
     #[command(alias = "ls")]
@@ -158,6 +162,39 @@ enum TaskCmd {
         /// Directorio del agente nuevo (por defecto el actual)
         #[arg(long, conflicts_with = "agent", value_name = "DIR")]
         cwd: Option<PathBuf>,
+        /// El agente nuevo trabaja en su propio worktree de git, en una rama nueva
+        #[arg(short, long, conflicts_with = "agent")]
+        worktree: bool,
+    },
+    /// Muestra lo que cambió en el worktree de una tarea
+    Diff {
+        /// Id de la tarea
+        #[arg(value_name = "TAREA")]
+        task: String,
+        /// Solo el resumen: qué archivos cambiaron y cuántas líneas
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Aprueba una tarea: integra su rama en la rama actual del repositorio,
+    /// termina a su agente y borra el worktree
+    Approve {
+        /// Id de la tarea
+        #[arg(value_name = "TAREA")]
+        task: String,
+    },
+    /// Devuelve una tarea a su agente con lo que hay que cambiar
+    Reject {
+        /// Id de la tarea
+        #[arg(value_name = "TAREA")]
+        task: String,
+        /// Qué hay que cambiar
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "TEXTO"
+        )]
+        text: Vec<String>,
     },
     /// Marca una tarea como hecha
     Done {
@@ -246,14 +283,23 @@ fn main() -> Result<()> {
             cwd,
             name,
             prompt,
+            worktree,
         }) => {
-            let a = ops::new_agent(kind, cwd, name, prompt.as_deref())?;
+            let place = if worktree {
+                Place::NewWorktree(None)
+            } else {
+                Place::Dir
+            };
+            let a = ops::new_agent(kind, cwd, name, prompt.as_deref(), place)?;
             println!(
                 "Agente {} ({}) lanzado en {}",
                 a.name,
                 a.id,
                 a.cwd.display()
             );
+            if let Some(wt) = &a.worktree {
+                println!("Trabaja en la rama {}", wt.branch);
+            }
             Ok(())
         }
         Some(Cmd::List) => {
@@ -348,14 +394,31 @@ fn task_cmd(cmd: TaskCmd) -> Result<()> {
             agent,
             new,
             cwd,
+            worktree,
         } => {
             let target = match (agent, new) {
                 (Some(a), _) => AssignTarget::Existing(a),
-                (None, Some(kind)) => AssignTarget::New { kind, cwd },
+                (None, Some(kind)) => AssignTarget::New {
+                    kind,
+                    cwd,
+                    worktree,
+                },
                 (None, None) => unreachable!("clap exige --agent o --new"),
             };
             let a = ops::assign_task(&task, target)?;
             println!("Tarea {task} asignada a {} ({})", a.name, a.id);
+            if let Some(wt) = &a.worktree {
+                println!("Trabaja en la rama {}, en {}", wt.branch, wt.path.display());
+            }
+        }
+        TaskCmd::Diff { task, stat } => {
+            let wt = ops::task_worktree(&task)?;
+            worktree::diff(&wt, stat, |mut c| Ok(c.status()?))?;
+        }
+        TaskCmd::Approve { task } => println!("{}", ops::approve_task(&task)?),
+        TaskCmd::Reject { task, text } => {
+            let a = ops::reject_task(&task, &text.join(" "))?;
+            println!("Tarea {task} devuelta a {}", a.name);
         }
         TaskCmd::Done { task } => ops::set_task_status(&task, TaskStatus::Done)?,
         TaskCmd::Rm { task } => ops::delete_task(&task)?,
