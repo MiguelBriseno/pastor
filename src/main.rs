@@ -114,6 +114,13 @@ enum Cmd {
         #[arg(value_name = "AGENTE")]
         agent: String,
     },
+    /// Vuelve a abrir los agentes que se perdieron (p. ej. al reiniciar la
+    /// máquina), retomando su conversación
+    Restore {
+        /// Id o nombre del agente (por defecto, todos los que se perdieron)
+        #[arg(value_name = "AGENTE")]
+        agent: Option<String>,
+    },
     /// Gestiona tareas
     #[command(subcommand)]
     Task(TaskCmd),
@@ -123,6 +130,9 @@ enum Cmd {
         /// Dirección y puerto (p. ej. la IP de Tailscale)
         #[arg(long, default_value = server::DEFAULT_BIND, value_name = "IP:PUERTO")]
         bind: std::net::SocketAddr,
+        /// Al arrancar, vuelve a abrir los agentes que se perdieron
+        #[arg(long)]
+        restore: bool,
     },
     /// Uso interno: lo llaman los hooks de Claude Code
     #[command(hide = true)]
@@ -325,7 +335,15 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Attach { agent }) => ops::attach(&agent),
         #[cfg(feature = "serve")]
-        Some(Cmd::Serve { bind }) => server::run(bind),
+        Some(Cmd::Serve { bind, restore }) => {
+            if restore {
+                // Que un agente que no se pudo abrir no deje sin API a los demás.
+                if let Err(e) = restore_lost() {
+                    eprintln!("No pude restaurar los agentes: {e:#}");
+                }
+            }
+            server::run(bind)
+        }
         Some(Cmd::Term {
             agent, close: true, ..
         }) => ops::close_term(&agent),
@@ -342,8 +360,48 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Kill { agent }) => ops::kill_agent(&agent),
+        Some(Cmd::Restore { agent: Some(agent) }) => {
+            print_restored(&ops::restore_agent(&agent)?);
+            Ok(())
+        }
+        Some(Cmd::Restore { agent: None }) => restore_lost(),
         Some(Cmd::Task(cmd)) => task_cmd(cmd),
     }
+}
+
+/// Restaura los agentes que se perdieron y dice cómo le fue con cada uno.
+/// Falla si alguno no se pudo abrir.
+fn restore_lost() -> Result<()> {
+    let results = ops::restore_lost()?;
+    if results.is_empty() {
+        println!("No hay agentes que restaurar.");
+    }
+    let mut failed = 0;
+    for (a, result) in &results {
+        match result {
+            Ok(()) => print_restored(a),
+            Err(e) => {
+                failed += 1;
+                eprintln!("No pude restaurar {} ({}): {e:#}", a.name, a.id);
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} de {} agentes no se pudieron restaurar",
+            results.len()
+        );
+    }
+    Ok(())
+}
+
+fn print_restored(a: &store::Agent) {
+    println!(
+        "Agente {} ({}) restaurado en {}",
+        a.name,
+        a.id,
+        a.cwd.display()
+    );
 }
 
 /// El comando de `pastor term` como texto para el shell. Un solo argumento va

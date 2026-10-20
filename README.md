@@ -22,6 +22,8 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   tu terminal, los agentes siguen trabajando; al volver los encuentras como los dejaste.
 - **Estado en vivo.** Cada agente aparece como *trabajando*, *esperando* (necesita tu
   aprobación o respuesta), *inactivo* o *terminado*.
+- **Restaurar después de reiniciar.** Si se reinicia la computadora, pastor vuelve a abrir los
+  agentes en su directorio y retomando su conversación.
 - **Terminal al lado de cada agente.** Abre una terminal junto al agente, en su mismo directorio,
   para correr por ejemplo `npm run dev` mientras el agente hace cambios.
 - **Notificaciones de escritorio** cuando un agente te necesita o termina su trabajo, y también
@@ -130,6 +132,7 @@ Cambia de pestaña con `1`, `2`, `3`, `4` o `Tab`. Sal con `q` (los agentes sigu
 | `s` | Enviarle un mensaje sin entrar |
 | `t` | Abrir una terminal al lado del agente (ver abajo) |
 | `T` | Cerrar esa terminal |
+| `r` | Restaurar el agente si se perdió (p. ej. al reiniciar), retomando su conversación |
 | `x` | Terminar el agente (pide confirmación) |
 | `<` `>` | Estrechar / ensanchar la lista de agentes |
 | `[` `]` | Ensanchar / estrechar la terminal de al lado |
@@ -253,6 +256,8 @@ pastor term web npm run dev   # abre una terminal al lado y ejecuta el comando
 pastor term web               # abre una terminal sin comando
 pastor term web --close       # la cierra
 pastor kill web               # lo termina (y su terminal)
+pastor restore                # vuelve a abrir los que se perdieron al reiniciar
+pastor restore web            # solo ese
 ```
 
 Puedes referirte a un agente por su **id** (`a1`, `a2`…) o por su **nombre**. Si no le das
@@ -301,6 +306,7 @@ IP de Tailscale (que ya cifra).
 | `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
 | `GET` | `/api/agents/{id}/screen` | — (responde `{"text": "..."}`, lo que se ve en su panel; con `?cols=48&rows=30` antes lo ajusta a ese tamaño) |
 | `GET` | `/api/agents/{id}/conversation` | — (la conversación entera de un agente de Claude, de su transcripción; con `?session=…&after=N`, solo lo nuevo) |
+| `POST` | `/api/agents/{id}/restore` | — (lo vuelve a abrir si se perdió, retomando su conversación) |
 | `DELETE` | `/api/agents/{id}` | — |
 | `GET` | `/api/tasks` | — |
 | `POST` | `/api/tasks` | `{"title": "...", "description"?}` |
@@ -359,7 +365,8 @@ Description=pastor serve: API y app del celular
 # encontrar claude, codex u opencode (y node, si lo usan).
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h
-ExecStart=%h/.cargo/bin/pastor serve
+# Con --restore, al encender vuelve a abrir los agentes que había.
+ExecStart=%h/.cargo/bin/pastor serve --restore
 Restart=on-failure
 RestartSec=3
 # Que al reiniciar el servicio solo se detenga serve, no los agentes.
@@ -376,6 +383,10 @@ Ajusta `PATH` a donde tengas los agentes (`command -v claude codex opencode`). s
 ese tmux y todos los agentes quedan dentro del servicio, y sin esa línea `systemctl --user restart
 pastor-serve` (por ejemplo, después de reinstalar) los cierra todos. Si ya tenías el servicio sin
 ella, agrégala y corre `systemctl --user daemon-reload`; no hace falta reiniciar.
+
+Con `--restore`, al arrancar el servidor vuelve a abrir los agentes que perdieron su sesión de tmux
+(ver [¿Y si reinicio la computadora?](#preguntas-frecuentes)). Los que siguen corriendo no se tocan,
+así que reiniciar el servicio no los duplica.
 
 ```sh
 systemctl --user daemon-reload
@@ -475,8 +486,13 @@ muestra con un spinner animado.
 Nada. Los agentes siguen corriendo en tmux. Al abrir `pastor` otra vez aparecen como los dejaste.
 
 **¿Y si reinicio la computadora?**
-Los agentes se pierden (tmux no sobrevive a un reinicio). Aparecerán como *terminados*; quítalos
-con `x`. Restaurarlos automáticamente está en el plan.
+tmux no sobrevive a un reinicio, así que los agentes aparecerán como *terminados*. Restáuralos con
+`pastor restore` (todos) o con `r` en la interfaz (el seleccionado), o haz que `pastor serve --restore`
+lo haga solo al encender. Cada uno vuelve con el mismo id y nombre, en su directorio o worktree y con
+su tarea. Claude Code retoma su conversación (`--resume`); Codex y opencode retoman la última de su
+directorio (`codex resume --last`, `opencode --continue`), así que si había dos en la misma carpeta
+pueden quedar con la misma. La terminal de al lado no se vuelve a abrir: ábrela con `t`. Si no los
+quieres de vuelta, quítalos con `x`.
 
 **¿Interfiere con mi tmux?**
 No. pastor usa su propio servidor (`tmux -L pastor`). Puedes verlo con `tmux -L pastor ls`. Ese
@@ -534,7 +550,7 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [ ] Agrupar agentes por proyecto
 - [x] Un worktree de git por agente, para trabajar en paralelo sobre el mismo repositorio, y
   revisar e integrar las tareas
-- [ ] Restaurar agentes después de reiniciar
+- [x] Restaurar agentes después de reiniciar
 - [ ] Integraciones con Slack y Asana
 - [ ] Manejar agentes en otras máquinas por SSH
 - [ ] Desde el celular: API, avisos con ntfy, pantalla en vivo y una PWA (hecho), y una terminal

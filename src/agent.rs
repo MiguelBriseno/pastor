@@ -30,6 +30,17 @@ impl Kind {
     }
 
     pub fn launch_command(self, prompt: Option<&str>) -> Result<Vec<String>> {
+        self.command(prompt, Vec::new())
+    }
+
+    /// El comando para retomar la conversación de un agente que se perdió.
+    /// Claude Code retoma su sesión; sin ella empieza una nueva. Codex y
+    /// opencode no la reportan: retoman la última de su directorio.
+    pub fn resume_command(self, session: Option<&str>) -> Result<Vec<String>> {
+        self.command(None, self.resume_args(session))
+    }
+
+    fn command(self, prompt: Option<&str>, extra: Vec<String>) -> Result<Vec<String>> {
         if !in_path(self.bin()) {
             bail!("no encuentro `{}` en el PATH", self.bin());
         }
@@ -59,7 +70,19 @@ impl Kind {
                 }
             }
         }
+        cmd.extend(extra);
         Ok(cmd)
+    }
+
+    /// Lo que se agrega al comando para retomar la conversación. En Codex es
+    /// un subcomando: va justo después del binario, sin nada más.
+    fn resume_args(self, session: Option<&str>) -> Vec<String> {
+        match (self, session) {
+            (Kind::Claude, Some(s)) => vec!["--resume".into(), s.into()],
+            (Kind::Claude, None) => vec![],
+            (Kind::Codex, _) => vec!["resume".into(), "--last".into()],
+            (Kind::Opencode, _) => vec!["--continue".into()],
+        }
     }
 }
 
@@ -281,6 +304,18 @@ fn tail_lower(screen: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retomar_la_conversacion() {
+        assert_eq!(
+            Kind::Claude.resume_args(Some("abc-123")),
+            ["--resume", "abc-123"]
+        );
+        // Sin sesión conocida, una conversación nueva y no la de otro agente.
+        assert!(Kind::Claude.resume_args(None).is_empty());
+        assert_eq!(Kind::Codex.resume_args(None), ["resume", "--last"]);
+        assert_eq!(Kind::Opencode.resume_args(None), ["--continue"]);
+    }
 
     #[test]
     fn el_prompt_no_se_toma_como_opcion() {

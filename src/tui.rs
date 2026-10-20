@@ -623,6 +623,15 @@ impl App {
                     });
                 }
             }
+            KeyCode::Char('r') => {
+                if let Some((id, name)) = selected {
+                    self.set_flash(format!("Restaurando {name}…"));
+                    self.actions.run(None, move || {
+                        ops::restore_agent(&id)?;
+                        Ok(Done::Msg(format!("{name} restaurado")))
+                    });
+                }
+            }
             KeyCode::Char('x') => {
                 if let Some((id, name)) = selected {
                     self.mode = Mode::Confirm {
@@ -1661,6 +1670,7 @@ impl App {
                 ("s mensaje", 0),
                 ("t terminal", 1),
                 ("T cerrar terminal", 2),
+                ("r restaurar", 2),
                 ("x terminar", 1),
                 ("< > ancho lista", 3),
                 ("[ ] ancho terminal", 3),
