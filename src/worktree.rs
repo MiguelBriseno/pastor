@@ -291,15 +291,11 @@ fn in_heavy_dir(rel: &str) -> bool {
 /// repositorio y los nuevos, más los ignorados, sin los que estén en una
 /// carpeta pesada aunque no esté ignorada. Así sale el `.env`, pero no
 /// `node_modules`. Los del repositorio sí salen siempre: alguien los subió.
-pub fn files(dir: &Path, max: usize) -> Result<Vec<String>> {
+/// `untracked` son los nuevos, de `untracked`.
+pub fn files(dir: &Path, untracked: &[String], max: usize) -> Result<Vec<String>> {
     let cached = git(dir, &["ls-files", "-z", "--cached"])?;
     let mut files: Vec<String> = nul_split(&cached).map(String::from).collect();
-    let others = git(dir, &["ls-files", "-z", "--others", "--exclude-standard"])?;
-    files.extend(
-        nul_split(&others)
-            .filter(|p| !in_heavy_dir(p))
-            .map(String::from),
-    );
+    files.extend(untracked.iter().filter(|p| !in_heavy_dir(p)).cloned());
     let ignored = git(
         dir,
         &[
@@ -360,7 +356,8 @@ pub fn walk(dir: &Path, sub: &Path, max: usize, out: &mut Vec<String>) {
 /// Lo que cambió en `dir`, relativo a él: con `wt`, todo lo del agente desde
 /// que salió su rama (commits incluidos); sin él, lo que no está en un
 /// commit. `true` si el archivo es nuevo. Sin los borrados: ya no se abren.
-pub fn changes(dir: &Path, wt: Option<&Worktree>) -> Result<Vec<(String, bool)>> {
+/// `untracked` son los nuevos, de `untracked`.
+pub fn changes(dir: &Path, wt: Option<&Worktree>, untracked: &[String]) -> Vec<(String, bool)> {
     let base = wt.map_or_else(|| "HEAD".to_string(), diff_base);
     let mut out = Vec::new();
     // Sin commits todavía no hay contra qué comparar: solo los nuevos.
@@ -384,9 +381,15 @@ pub fn changes(dir: &Path, wt: Option<&Worktree>) -> Result<Vec<(String, bool)>>
             }
         }
     }
-    let new = git(dir, &["ls-files", "-z", "--others", "--exclude-standard"])?;
-    out.extend(nul_split(&new).map(|p| (p.to_string(), true)));
-    Ok(out)
+    out.extend(untracked.iter().map(|p| (p.clone(), true)));
+    out
+}
+
+/// Los archivos de `dir` que no están en el repositorio ni ignorados,
+/// relativos a él.
+pub fn untracked(dir: &Path) -> Result<Vec<String>> {
+    let out = git(dir, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    Ok(nul_split(&out).map(String::from).collect())
 }
 
 /// Guarda en un commit lo que el agente dejó sin guardar e integra la rama

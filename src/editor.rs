@@ -27,7 +27,7 @@ use crate::files::{Change, Listing, Opened, Source};
 use crate::icons::{self, pad};
 use crate::syntax::{self, Colors, Painted};
 use crate::text;
-use crate::tui::{fit_help, ACCENT, FLASH, SELECTED};
+use crate::tui::{edit, fit_help, ACCENT, FLASH, SELECTED};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
@@ -98,8 +98,9 @@ pub struct Editor {
     opening: Option<String>,
     prompt: Option<Prompt>,
     search: String,
-    /// Al guardar, lo que se hace después (si se guardó para salir).
-    after_save: Option<Then>,
+    /// Al guardar, lo que se hace después (si se guardó para salir), con el
+    /// `gen` del buffer que se guarda: el guardado de otro no lo toca.
+    after_save: Option<(u64, Then)>,
     flash: Option<(String, Instant)>,
     list_width: u16,
     /// Las líneas de texto que caben, del último cuadro: para avanzar páginas.
@@ -272,8 +273,15 @@ impl Editor {
         // Si se volvió a abrir mientras, el buffer de ahora no es el que se
         // guardó: su hash y su historia no se tocan.
         let current = self.file.as_ref().is_some_and(|f| f.gen == gen);
+        // Lo que se pidió hacer al guardar este buffer, y solo eso.
+        let then = match self.after_save.take() {
+            Some((g, then)) if g == gen => Some(then),
+            other => {
+                self.after_save = other;
+                None
+            }
+        };
         let Some(f) = self.file.as_mut().filter(|f| current && f.path == path) else {
-            self.after_save = None;
             match result {
                 Ok(_) => {
                     self.set_flash(format!("{path} guardado"));
@@ -293,19 +301,16 @@ impl Editor {
                 self.set_flash(format!("{path} guardado"));
                 // Las marcas de lo que cambió también.
                 self.load_list();
-                if let Some(then) = self.after_save.take() {
+                if let Some(then) = then {
                     if more {
-                        self.after_save = Some(then);
+                        self.after_save = Some((gen, then));
                         self.save();
                     } else {
                         self.then(then);
                     }
                 }
             }
-            Err(e) => {
-                self.after_save = None;
-                self.set_flash(format!("Error: {e:#}"));
-            }
+            Err(e) => self.set_flash(format!("Error: {e:#}")),
         }
     }
 
@@ -391,11 +396,18 @@ impl Editor {
 
     fn open(&mut self, path: String) {
         // Lo que había al pedirlo: perderlo ya se aceptó (o no había cambios).
-        self.open_from = self.file.as_ref().map(|f| (f.gen, f.buf.version()));
+        // Con `checkpoint`, lo que se escriba mientras es un cambio aparte (no
+        // se suma al último) y la versión deja de ser esta.
+        self.open_from = self.file.as_mut().map(|f| (f.gen, f.buf.checkpoint()));
         self.file_gen += 1;
         self.opening = Some(path.clone());
         let (n, source) = (self.file_gen, self.source.clone());
-        self.spawn(move || Loaded::File(n, source.read(&path)));
+        self.spawn(move || {
+            let read = source.read(&path);
+            // Las gramáticas, en este hilo: cargarlas traba un momento.
+            syntax::preload();
+            Loaded::File(n, read)
+        });
     }
 
     fn save(&mut self) {
@@ -518,7 +530,7 @@ impl Editor {
                         return;
                     }
                     _ => {
-                        if !edit_line(&mut self.filter, &key) {
+                        if !edit(&mut self.filter, &key) {
                             return;
                         }
                         self.prompt = Some(Prompt::Filter);
@@ -537,7 +549,7 @@ impl Editor {
                     self.find(false);
                 }
                 _ => {
-                    edit_line(&mut s, &key);
+                    edit(&mut s, &key);
                     self.prompt = Some(Prompt::Search(s));
                 }
             },
@@ -557,14 +569,14 @@ impl Editor {
                     self.prompt = Some(Prompt::Goto(s));
                 }
                 _ => {
-                    edit_line(&mut s, &key);
+                    edit(&mut s, &key);
                     self.prompt = Some(Prompt::Goto(s));
                 }
             },
             Prompt::Discard(then) => match key.code {
                 KeyCode::Char('y') => self.then(then),
                 KeyCode::Char('s') => {
-                    self.after_save = Some(then);
+                    self.after_save = self.file.as_ref().map(|f| (f.gen, then));
                     self.save();
                 }
                 _ => {}
@@ -884,7 +896,10 @@ impl Editor {
         f.render_widget(block, area);
 
         let height = inner.height as usize;
-        self.page = height.saturating_sub(1).max(1);
+        // Con la lista al lado, su página es la suya.
+        if self.focus == Focus::File {
+            self.page = height.saturating_sub(1).max(1);
+        }
         let gutter = file.buf.len().to_string().len() + 1;
         let width = (inner.width as usize).saturating_sub(gutter + 1);
         if height == 0 || width == 0 {
@@ -1059,24 +1074,6 @@ fn changed(f: &mut FileView, row: usize) {
     }
 }
 
-/// Edita un campo de una línea con `key`. `false` si la tecla no era para él.
-fn edit_line(s: &mut String, key: &KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Backspace => {
-            s.pop();
-        }
-        KeyCode::Char('u') if ctrl => s.clear(),
-        KeyCode::Char('w') if ctrl => {
-            let keep = s.trim_end().rfind(' ').map_or(0, |i| i + 1);
-            s.truncate(keep);
-        }
-        KeyCode::Char(c) if !ctrl => s.push(c),
-        _ => return false,
-    }
-    true
-}
-
 /// Si `path` tiene las letras de `q` en orden (sin mayúsculas: `q` ya viene
 /// en minúsculas). Lo que contiene `q` seguido va primero, y entre esos los
 /// más cortos.
@@ -1248,6 +1245,23 @@ mod tests {
         // Un guardado de a ya no toca a b.
         ed.saved(1, "a.txt".into(), None, Ok("h".into()));
         assert_ne!(ed.file.as_ref().unwrap().hash, "h");
+    }
+
+    #[test]
+    fn lo_que_sigues_escribiendo_tras_descartar_no_se_pierde() {
+        let dir = std::env::temp_dir().join(format!("pastor-ed2-{}", std::process::id()));
+        let mut ed = Editor::new(Source::dir(dir), "x".into(), None);
+        ed.file_gen = 1;
+        ed.opened(1, opened("a.txt", "uno"));
+        ed.on_key(key(KeyCode::Char('i')));
+        ed.on_key(key(KeyCode::Char('x')));
+        // Con cambios, se acepta perderlos y, mientras llega b, se sigue
+        // escribiendo la misma palabra: eso ya no se aceptó perder.
+        ed.open("b.txt".into());
+        let b = ed.file_gen;
+        ed.on_key(key(KeyCode::Char('y')));
+        ed.opened(b, opened("b.txt", "dos"));
+        assert_eq!(ed.file.as_ref().unwrap().path, "a.txt");
     }
 
     #[test]

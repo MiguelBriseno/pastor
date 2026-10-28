@@ -901,8 +901,8 @@ impl App {
                         1 => edit(&mut f.cwd, &key),
                         2 => edit(&mut f.name, &key),
                         3 => edit(&mut f.prompt, &key),
-                        _ => {}
-                    }
+                        _ => false,
+                    };
                     self.mode = Mode::NewAgent(f);
                 }
             },
@@ -2517,7 +2517,8 @@ fn keep_head(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn edit(s: &mut String, key: &KeyEvent) {
+/// Edita un campo de una línea con `key`. `false` si la tecla no era para él.
+pub(crate) fn edit(s: &mut String, key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
@@ -2535,8 +2536,9 @@ fn edit(s: &mut String, key: &KeyEvent) {
         KeyCode::Backspace => {
             s.pop();
         }
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 fn step(cur: Option<usize>, n: usize, d: isize) -> Option<usize> {

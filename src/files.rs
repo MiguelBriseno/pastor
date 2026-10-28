@@ -160,10 +160,7 @@ fn parse<T: serde::de::DeserializeOwned>(host: &str, out: &str) -> Result<T> {
 /// FNV-1a, como la huella de las pantallas: estable entre versiones, y quien
 /// lee y quien guarda pueden ser los pastor de dos máquinas.
 pub fn hash(bytes: &[u8]) -> String {
-    let h = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-    });
-    format!("{h:016x}")
+    format!("{:016x}", crate::hooks::fnv1a(bytes))
 }
 
 pub fn list(root: &Path, wt: Option<&Worktree>) -> Result<Listing> {
@@ -172,8 +169,10 @@ pub fn list(root: &Path, wt: Option<&Worktree>) -> Result<Listing> {
     }
     let repo = worktree::toplevel(root).is_some();
     let mut files = Vec::new();
+    let mut untracked = Vec::new();
     if repo {
-        files = worktree::files(root, MAX_FILES + 1)?;
+        untracked = worktree::untracked(root)?;
+        files = worktree::files(root, &untracked, MAX_FILES + 1)?;
     } else {
         worktree::walk(root, Path::new(""), MAX_FILES + 1, &mut files);
     }
@@ -182,8 +181,7 @@ pub fn list(root: &Path, wt: Option<&Worktree>) -> Result<Listing> {
     let truncated = files.len() > MAX_FILES;
     files.truncate(MAX_FILES);
     let changes: HashMap<String, Change> = if repo {
-        worktree::changes(root, wt)
-            .unwrap_or_default()
+        worktree::changes(root, wt, &untracked)
             .into_iter()
             .map(|(p, new)| (p, if new { Change::Added } else { Change::Modified }))
             .collect()

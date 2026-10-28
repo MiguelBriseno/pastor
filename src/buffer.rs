@@ -161,13 +161,13 @@ impl Buffer {
         self.undo.last().map(|e| e.id) != self.saved
     }
 
-    /// El punto que se va a guardar: lo que se escriba mientras se guarda
-    /// (por SSH tarda) queda como cambio aparte, sin guardar.
     /// El último cambio: si es otro, el texto cambió (o se deshizo algo).
     pub fn version(&self) -> Option<u64> {
         self.undo.last().map(|e| e.id)
     }
 
+    /// El punto que se va a guardar: lo que se escriba mientras se guarda
+    /// (por SSH tarda) queda como cambio aparte, sin guardar.
     pub fn checkpoint(&mut self) -> Option<u64> {
         self.joinable = false;
         self.undo.last().map(|e| e.id)
@@ -482,17 +482,11 @@ impl Buffer {
                 (c.row + step) % n
             };
             let found = matches(&self.lines[row], query);
+            // En la vuelta completa (`step == n`) vale cualquiera de la línea.
             let hit = if back {
-                found
-                    .iter()
-                    .rev()
-                    .find(|r| step > 0 || r.start < c.col)
-                    .or(if step == n { found.last() } else { None })
+                found.iter().rev().find(|r| step > 0 || r.start < c.col)
             } else {
-                found
-                    .iter()
-                    .find(|r| step > 0 || r.start > c.col)
-                    .or(if step == n { found.first() } else { None })
+                found.iter().find(|r| step > 0 || r.start > c.col)
             };
             if let Some(r) = hit {
                 return Some(Pos { row, col: r.start });

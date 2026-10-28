@@ -34,6 +34,12 @@ fn loaded() -> &'static Loaded {
     })
 }
 
+/// Carga las gramáticas y el tema si no se habían cargado: para hacerlo en
+/// un hilo aparte y no en el de la interfaz.
+pub fn preload() {
+    loaded();
+}
+
 /// Un color con negrita o no.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Paint {

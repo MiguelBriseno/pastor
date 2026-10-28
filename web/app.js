@@ -381,6 +381,7 @@ tabs.append(...TABS.map(([tab, label, ic]) =>
 
 function route() {
   leaveGuard = null;
+  if (location.hash !== currentHash) previousHash = currentHash;
   currentHash = location.hash;
   cleanup.forEach((f) => f());
   cleanup = [];
@@ -430,17 +431,30 @@ function route() {
  * pone y `route` lo quita. */
 let leaveGuard = null;
 let currentHash = location.hash;
+/** La pantalla de antes: si se va a ella, casi seguro fue «atrás». */
+let previousHash = "";
+/** El siguiente cambio de hash es el de deshacer una salida: no se dibuja. */
+let restoring = false;
 
 // Cualquier salida (el botón de volver, el gesto o el botón atrás del
-// celular, un enlace) pasa por aquí. El hash ya cambió: se regresa sin
-// redibujar y, si se acepta perder los cambios, se va adonde iba.
+// celular, un enlace) pasa por aquí. El hash ya cambió: se deshace el paso
+// en el historial (adelante si fue «atrás», atrás si fue un enlace) para no
+// dejar entradas repetidas y, si se acepta perder los cambios, se rehace.
 window.addEventListener("hashchange", async () => {
+  if (restoring) {
+    restoring = false;
+    return;
+  }
   if (leaveGuard?.()) {
     const target = location.hash;
-    history.replaceState(null, "", currentHash || "#");
+    const wentBack = target === previousHash;
+    restoring = true;
+    if (wentBack) history.forward();
+    else history.back();
     if (!(await ask("¿Salir sin guardar?", "Lo que cambiaste no se guarda.", "Salir", true))) return;
     leaveGuard = null;
-    location.hash = target;
+    if (wentBack) history.back();
+    else location.hash = target;
     return;
   }
   route();
