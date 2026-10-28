@@ -831,7 +831,7 @@ pub fn set_task_status(task_id: &str, status: TaskStatus) -> Result<()> {
 /// Como `State::update`, pero `f` recibe con qué anotar los cambios de
 /// estado de las tareas, y solo pasan al historial si el estado se guardó
 /// (con el candado aún tomado, para que queden en el mismo orden).
-fn update_recording<T>(
+pub(crate) fn update_recording<T>(
     f: impl FnOnce(&mut State, &mut dyn FnMut(&Task, TaskStatus)) -> Result<T>,
 ) -> Result<T> {
     let (out, _) = State::update_then(

@@ -103,7 +103,12 @@ pub fn run(task_id: &str, give_back: bool, mut echo: impl FnMut(&str)) -> Result
     let (dir, cmd) = command(&State::load()?, task_id)?;
     let started = Utc::now();
     State::update(|s| {
-        s.find_task_mut(task_id)?.check = Some(Check {
+        let t = s.find_task_mut(task_id)?;
+        // Dos a la vez correrían en la misma copia y se pisarían el log.
+        if t.check.as_ref().is_some_and(Check::running) {
+            bail!("la revisión de {task_id} ya está corriendo");
+        }
+        t.check = Some(Check {
             state: CheckState::Running,
             cmd: cmd.clone(),
             started,
@@ -116,13 +121,19 @@ pub fn run(task_id: &str, give_back: bool, mut echo: impl FnMut(&str)) -> Result
     let log = log_path(task_id);
     fs::create_dir_all(log.parent().unwrap_or(Path::new(".")))?;
     let result = execute(&dir, &cmd, &log, TIMEOUT, &mut echo);
-    let (passed, output) = match result {
-        Ok((ok, tail)) => (ok, tail),
-        Err(e) => (false, format!("pastor no pudo correr la revisión: {e:#}")),
+    // Si falló pastor (no pudo correr `sh`, ni escribir el log), el agente
+    // no tiene nada que arreglar: no se le devuelve.
+    let (passed, output, give_back) = match result {
+        Ok((ok, tail)) => (ok, tail, give_back),
+        Err(e) => (
+            false,
+            format!("pastor no pudo correr la revisión: {e:#}"),
+            false,
+        ),
     };
     // Solo si sigue siendo la misma revisión: si mientras se lanzó otra, o
     // se borró la tarea, este resultado ya no dice nada.
-    let returned = State::update(|s| {
+    let returned = crate::ops::update_recording(|s, record| {
         let Ok(t) = s.find_task_mut(task_id) else {
             return Ok(None);
         };
@@ -156,14 +167,14 @@ pub fn run(task_id: &str, give_back: bool, mut echo: impl FnMut(&str)) -> Result
         };
         let t = s.find_task_mut(task_id)?;
         t.check_returns += 1;
+        record(t, TaskStatus::InProgress);
         t.status = TaskStatus::InProgress;
         if let Some(c) = &mut t.check {
             c.returned = true;
         }
-        let secs = (Utc::now() - t.created_at).num_seconds();
-        Ok(Some((agent, t.check_returns, secs)))
+        Ok(Some((agent, t.check_returns)))
     })?;
-    let Some((agent, n, secs)) = returned else {
+    let Some((agent, n)) = returned else {
         return Ok(Outcome {
             passed,
             returned_to: None,
@@ -174,33 +185,21 @@ pub fn run(task_id: &str, give_back: bool, mut echo: impl FnMut(&str)) -> Result
          Arréglalo. Las últimas líneas de la salida (la completa está en {}):\n\n{output}",
         log.display()
     );
-    history::record(Event::TaskStatus {
-        task: task_id.to_string(),
-        to: TaskStatus::InProgress,
-        secs,
-    });
     let sent = crate::ops::agent_target(&agent).and_then(|pane| tmux::send_text(&pane, &text));
     if let Err(e) = sent {
         // No le llegó: que quede por revisar, para ti.
-        let back = State::update(|s| {
+        let _ = crate::ops::update_recording(|s, record| {
             let t = s.find_task_mut(task_id)?;
-            let back = t.status == TaskStatus::InProgress;
-            if back {
+            if t.status == TaskStatus::InProgress {
+                record(t, TaskStatus::Review);
                 t.status = TaskStatus::Review;
                 t.check_returns = t.check_returns.saturating_sub(1);
             }
             if let Some(c) = t.check.as_mut().filter(|c| c.started == started) {
                 c.returned = false;
             }
-            Ok(back)
+            Ok(())
         });
-        if matches!(back, Ok(true)) {
-            history::record(Event::TaskStatus {
-                task: task_id.to_string(),
-                to: TaskStatus::Review,
-                secs,
-            });
-        }
         return Err(e.context(format!("no pude devolverle la tarea a {}", agent.name)));
     }
     history::record(Event::MessageSent {
@@ -244,11 +243,20 @@ fn execute(
     // Leer la salida bloquea: va en su hilo, y el de aquí vigila el tiempo.
     let (tx, rx) = mpsc::channel::<String>();
     let reader = std::thread::spawn(move || {
-        for line in BufReader::new(out).lines() {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
+        // Por bytes: una línea que no es UTF-8 (un nombre de archivo raro)
+        // no debe cortar la lectura, o el comando moriría por SIGPIPE.
+        let mut out = BufReader::new(out);
+        let mut buf = Vec::new();
+        while matches!(out.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.strip_suffix('\n').unwrap_or(&line);
+            if tx
+                .send(line.strip_suffix('\r').unwrap_or(line).to_string())
+                .is_err()
+            {
                 break;
             }
+            buf.clear();
         }
     });
     let mut tail: Vec<String> = Vec::new();
@@ -263,17 +271,26 @@ fn execute(
                 tail.remove(0);
             }
         }
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
-        }
-        if start.elapsed() > timeout {
-            timed_out = true;
-            // Al grupo entero: `sh` y lo que lanzó.
+        // Al grupo entero: `sh` y lo que lanzó.
+        let kill = |child: &mut std::process::Child| {
             let _ = Command::new("kill")
                 .args(["-KILL", &format!("-{pid}")])
                 .status();
             let _ = child.wait();
-            break None;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            // Sin poder vigilarlo, no se deja corriendo: es fallo de pastor.
+            Err(e) => {
+                kill(&mut child);
+                return Err(e).context("no pude vigilar el comando");
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                timed_out = true;
+                kill(&mut child);
+                break None;
+            }
+            Ok(None) => {}
         }
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -335,6 +352,13 @@ mod tests {
         assert_eq!(full.lines().count(), 100);
         assert_eq!(tail.lines().count(), TAIL_LINES);
         assert!(tail.ends_with("\n100"));
+    }
+
+    #[test]
+    fn una_linea_que_no_es_utf8_no_corta_la_lectura() {
+        let (ok, tail, _) = run_in("printf 'a\\377b\\n'; seq 1 3", TIMEOUT);
+        assert!(ok);
+        assert_eq!(tail, "a\u{fffd}b\n1\n2\n3");
     }
 
     #[test]

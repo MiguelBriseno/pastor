@@ -166,12 +166,31 @@ fn starts_with_word(option: &str, words: &[&str]) -> bool {
     words.contains(&first.as_str())
 }
 
+/// Lo que convierte un sí en un sí con algo más.
+const EXTRA: &[&str] = &[
+    " and ",
+    ", and",
+    " y ",
+    "always",
+    "siempre",
+    "don't ask",
+    "no preguntes",
+    "bypass",
+    "auto",
+    "session",
+    "sesión",
+];
+
 impl Dialog {
-    /// La opción de aprobar: la primera que empieza con sí.
+    /// La opción de aprobar: la primera que dice sí y nada más. Un sí con
+    /// algo más («Yes, and bypass permissions», «Yes, and don't ask again»)
+    /// da permisos que no ves en el aviso: si solo hay de esos, no hay botón.
     pub fn approve(&self) -> Option<usize> {
-        self.options
-            .iter()
-            .position(|o| starts_with_word(o, &["yes", "sí", "si", "allow", "approve", "proceed"]))
+        self.options.iter().position(|o| {
+            let rest = bare(o).to_lowercase();
+            starts_with_word(o, &["yes", "sí", "si", "allow", "approve", "proceed"])
+                && !EXTRA.iter().any(|w| rest.contains(w))
+        })
     }
 
     /// La de rechazar: la primera que empieza con no.
@@ -195,25 +214,12 @@ impl Dialog {
 }
 
 /// La huella del diálogo con la que se compara al usar el botón: lo que
-/// pregunta, sus opciones y dónde está el cursor (pudo moverse). No la de la
-/// pantalla entera: el pie cambia solo (pistas, la línea de estado) y el
-/// botón no serviría nunca. `None` si la pantalla ya no muestra un menú.
-fn dialog_hash(screen: &str) -> Option<u64> {
-    let d = parse(screen)?;
-    let text = format!(
-        "{}\n--\n{}\n--\n{}",
-        d.question.join("\n"),
-        d.options.join("\n"),
-        d.cursor
-    );
-    Some(hooks::fnv1a(text.as_bytes()))
-}
-
-/// Compara sin cortar en el primer byte distinto, para no dar pistas por el
-/// tiempo de respuesta.
-fn same(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+/// pregunta y sus opciones. No la de la pantalla entera: el pie cambia solo
+/// (pistas, la línea de estado) y el botón no serviría nunca. Tampoco el
+/// cursor: las flechas se calculan al pulsar, desde donde esté.
+fn hash_of(d: &Dialog) -> u64 {
+    let text = format!("{}\n--\n{}", d.question.join("\n"), d.options.join("\n"));
+    hooks::fnv1a(text.as_bytes())
 }
 
 /// Un botón pendiente.
@@ -225,8 +231,10 @@ struct Pending {
     agent: String,
     /// Lo que se eligió, para decirlo al contestar.
     label: String,
-    keys: Vec<String>,
-    screen: u64,
+    /// Cuál de las opciones.
+    option: usize,
+    /// La huella del diálogo (`hash_of`).
+    dialog: u64,
     expires: DateTime<Utc>,
 }
 
@@ -279,7 +287,7 @@ fn buttons_in(dir: &Path, agent: &str, screen: &str) -> Option<(Dialog, Vec<Butt
         return None;
     }
     let group = token().ok()?;
-    let hash = dialog_hash(screen)?;
+    let hash = hash_of(&dialog);
     let expires = Utc::now() + Duration::minutes(TTL_MINUTES);
     let mut buttons = Vec::new();
     let pending: Vec<Pending> = choices
@@ -295,8 +303,8 @@ fn buttons_in(dir: &Path, agent: &str, screen: &str) -> Option<(Dialog, Vec<Butt
                 group: group.clone(),
                 agent: agent.to_string(),
                 label: bare(&dialog.options[i]).to_string(),
-                keys: dialog.keys_for(i),
-                screen: hash,
+                option: i,
+                dialog: hash,
                 expires,
             })
         })
@@ -331,7 +339,10 @@ fn act_in(
     send: impl FnOnce(&str, &[String]) -> Result<()>,
 ) -> Result<String> {
     let found = update(dir, |list| {
-        let p = list.iter().find(|p| same(&p.token, token)).cloned()?;
+        let p = list
+            .iter()
+            .find(|p| store::same(p.token.as_bytes(), token.as_bytes()))
+            .cloned()?;
         list.retain(|q| q.group != p.group);
         Some(p)
     })?;
@@ -339,10 +350,10 @@ fn act_in(
         bail!("este botón ya se usó o caducó");
     };
     let now = screen(&p.agent)?;
-    if dialog_hash(&now) != Some(p.screen) {
+    let Some(d) = parse(&now).filter(|d| hash_of(d) == p.dialog) else {
         bail!("el diálogo ya cambió; ábrelo en la app para ver qué pide ahora");
-    }
-    send(&p.agent, &p.keys)?;
+    };
+    send(&p.agent, &d.keys_for(p.option))?;
     Ok(format!("Elegido: {}", p.label))
 }
 
@@ -419,6 +430,19 @@ mod tests {
     }
 
     #[test]
+    fn no_aprueba_un_si_que_da_mas_permisos() {
+        let plan = " Would you like to proceed?\n ❯ 1. Yes, and bypass permissions\n   2. Yes, and manually approve edits\n   3. No, keep planning";
+        let d = parse(plan).unwrap();
+        assert_eq!(d.approve(), None);
+        assert_eq!(d.reject(), Some(2));
+        let codex = " Allow command?\n › 1. Yes, and don't ask again for this command\n   2. Yes, proceed\n   3. No, and tell Codex what to do differently";
+        assert_eq!(parse(codex).unwrap().approve(), Some(1));
+        // En el permiso de Claude, solo «1. Yes»: las demás guardan permisos.
+        let d = parse(PERMISSION).unwrap();
+        assert_eq!(d.approve(), Some(0));
+    }
+
+    #[test]
     fn sin_menu_no_hay_botones() {
         assert_eq!(parse("❯ \n────\n  ? for shortcuts"), None);
         assert_eq!(parse("hola\n❯ una sola opción"), None);
@@ -457,12 +481,18 @@ mod tests {
         assert!(act_in(&dir, reject, |_| Ok(PERMISSION.into()), send).is_err());
         assert!(act_in(&dir, &b[0].token, |_| Ok(PERMISSION.into()), send).is_err());
 
-        // Si la pantalla cambió (p. ej. el cursor), no pulsa nada.
+        // Si el cursor se movió, las flechas salen de donde está ahora.
         let (_, b) = buttons_in(&dir, "a1", PERMISSION).unwrap();
         let moved = PERMISSION
             .replace(" ❯ 1. Yes", "   1. Yes")
             .replace("   4. No", " ❯ 4. No");
-        let err = act_in(&dir, &b[0].token, |_| Ok(moved.clone()), send).unwrap_err();
+        act_in(&dir, &b[0].token, |_| Ok(moved.clone()), send).unwrap();
+        assert_eq!(sent.borrow()[1].1, ["Up", "Up", "Up", "Enter"]);
+        sent.borrow_mut().pop();
+        // Si pregunta otra cosa, no pulsa nada.
+        let (_, b) = buttons_in(&dir, "a1", PERMISSION).unwrap();
+        let other = PERMISSION.replace("rm hola.txt &&", "rm -rf / &&");
+        let err = act_in(&dir, &b[0].token, |_| Ok(other.clone()), send).unwrap_err();
         assert!(err.to_string().contains("ya cambió"), "{err}");
         // Lo que cambia solo en el pie no cuenta.
         let (_, b) = buttons_in(&dir, "a1", PERMISSION).unwrap();

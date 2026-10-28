@@ -31,7 +31,7 @@ use crate::history;
 use crate::limits;
 use crate::ops::{self, AssignTarget, Place, Tracker};
 use crate::pty::Pty;
-use crate::store::{self, Agent, State, TaskStatus};
+use crate::store::{self, same, Agent, State, TaskStatus};
 use crate::syntax::{self, Colors};
 use crate::tmux;
 use crate::transcript;
@@ -299,12 +299,6 @@ fn saved_token() -> Result<String> {
 
 fn new_token() -> Result<String> {
     store::random_hex(24)
-}
-
-/// Compara sin cortar en el primer byte distinto, para no dar pistas por el
-/// tiempo de respuesta.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn auth(Shared(app): Shared<Arc<App>>, req: Request, next: Next) -> Response {

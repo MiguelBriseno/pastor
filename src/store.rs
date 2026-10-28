@@ -436,6 +436,12 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     write_atomic_mode(path, contents, None)
 }
 
+/// Compara sin cortar en el primer byte distinto, para no dar pistas por el
+/// tiempo de respuesta.
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// `bytes` bytes al azar en hexadecimal, para tokens.
 pub fn random_hex(bytes: usize) -> Result<String> {
     use std::io::Read;

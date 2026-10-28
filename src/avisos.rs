@@ -256,7 +256,9 @@ fn transitions(
 }
 
 /// Cómo estaba la revisión de una tarea: su estado y cuándo empezó.
-type CheckSeen = (CheckState, chrono::DateTime<chrono::Utc>);
+/// Con si se le devolvió al agente: si devolverla falla, se deshace, y eso
+/// también avisa («revísala tú»).
+type CheckSeen = (CheckState, chrono::DateTime<chrono::Utc>, bool);
 
 fn checks_seen(state: &State) -> HashMap<String, CheckSeen> {
     state
@@ -265,7 +267,7 @@ fn checks_seen(state: &State) -> HashMap<String, CheckSeen> {
         .filter_map(|t| {
             Some((
                 t.id.clone(),
-                t.check.as_ref().map(|c| (c.state, c.started))?,
+                t.check.as_ref().map(|c| (c.state, c.started, c.returned))?,
             ))
         })
         .collect()
@@ -280,10 +282,10 @@ fn check_results(
 ) -> Vec<(Event, String)> {
     let mut out = Vec::new();
     for t in &state.tasks {
-        let Some(&(now, started)) = new.get(&t.id) else {
+        let Some(&seen @ (now, ..)) = new.get(&t.id) else {
             continue;
         };
-        if now == CheckState::Running || old.get(&t.id) == Some(&(now, started)) {
+        if now == CheckState::Running || old.get(&t.id) == Some(&seen) {
             continue;
         }
         let agent = t
@@ -607,9 +609,17 @@ mod tests {
         });
         t.status = crate::store::TaskStatus::InProgress;
         t.check_returns = 2;
+        let (msgs, returned) = run(&t, &seen);
         assert_eq!(
-            run(&t, &seen).0,
+            msgs,
             ["t1 no pasó la revisión; se la devolví a su agente (2 de 3)"]
+        );
+        // No le llegó y se deshizo: ahora es para ti.
+        t.check = Some(check(CheckState::Failed));
+        t.status = crate::store::TaskStatus::Review;
+        assert_eq!(
+            run(&t, &returned).0,
+            ["t1 no pasó la revisión; revísala tú: Arreglar"]
         );
         // Fallida sin devolverla (la corriste tú, o ya no quedan intentos):
         // aunque siga en curso, no dice que se la devolvió.
