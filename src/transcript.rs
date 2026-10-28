@@ -21,6 +21,10 @@ pub struct Message {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    /// De una herramienta, su entrada entera (el comando, la ruta, el
+    /// texto que escribió…), para buscar en ella: `text` es solo un resumen.
+    #[serde(skip)]
+    pub input: Option<String>,
 }
 
 /// Comienzos de lo que Claude Code inyecta como mensaje del usuario.
@@ -37,21 +41,25 @@ const INJECTED: [&str; 7] = [
 /// Los mensajes de una línea del JSONL: los tuyos, las respuestas del agente
 /// y una línea por herramienta. Fuera el razonamiento, los resultados de las
 /// herramientas, los subagentes y los registros internos.
+// Sin `serve`, solo la búsqueda lee transcripciones, con `parse_line_of`.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
 pub fn parse_line(line: &str) -> Vec<Message> {
+    parse_line_of(line, false)
+}
+
+/// Como `parse_line`; con `subagent`, la línea es de la transcripción de un
+/// subagente, donde todas van marcadas como `isSidechain`.
+pub fn parse_line_of(line: &str, subagent: bool) -> Vec<Message> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
     };
     // Subagentes, registros internos y el resumen que Claude Code escribe al
     // compactar (llega como un mensaje tuyo).
     let flag = |k: &str| v[k].as_bool() == Some(true);
-    if [
-        "isSidechain",
-        "isMeta",
-        "isCompactSummary",
-        "isVisibleInTranscriptOnly",
-    ]
-    .iter()
-    .any(|k| flag(k))
+    if (!subagent && flag("isSidechain"))
+        || ["isMeta", "isCompactSummary", "isVisibleInTranscriptOnly"]
+            .iter()
+            .any(|k| flag(k))
     {
         return Vec::new();
     }
@@ -60,6 +68,7 @@ pub fn parse_line(line: &str) -> Vec<Message> {
         role,
         text,
         at: at.clone(),
+        input: None,
     };
     let content = &v["message"]["content"];
     match v["type"].as_str() {
@@ -94,12 +103,30 @@ pub fn parse_line(line: &str) -> Vec<Message> {
                     let t = b["text"].as_str()?.trim();
                     (!t.is_empty()).then(|| msg("assistant", t.to_string()))
                 }
-                "tool_use" => Some(msg("tool", tool_summary(b))),
+                "tool_use" => Some(Message {
+                    input: Some(input_text(&b["input"])),
+                    ..msg("tool", tool_summary(b))
+                }),
                 _ => None,
             })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Los textos de la entrada de una herramienta, uno por línea.
+fn input_text(input: &Value) -> String {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(input, &mut out);
+    out.join("\n")
 }
 
 /// `Bash · lo que hace`: el nombre y lo más claro de su entrada.
@@ -134,6 +161,7 @@ pub fn path_for(id: &str) -> Option<PathBuf> {
 /// Lee una transcripción por partes: recuerda hasta dónde llegó y solo lee
 /// lo nuevo. Una de una sesión larga pasa de 10 MB.
 #[derive(Default)]
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
 pub struct Reader {
     path: PathBuf,
     offset: u64,
@@ -144,6 +172,7 @@ pub struct Reader {
     pub resets: u32,
 }
 
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
 impl Reader {
     pub fn update(&mut self, path: &Path) -> Result<()> {
         let mut f = File::open(path)

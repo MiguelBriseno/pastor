@@ -17,6 +17,7 @@ use crate::history::{self, Event};
 use crate::ops;
 use crate::store::{self, data_dir, ensure_dirs, write_atomic, write_atomic_mode, write_volatile};
 use crate::tmux::{self, shell_quote};
+use crate::usage;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct HookStatus {
@@ -112,6 +113,7 @@ pub fn clear_status(id: &str) {
 pub fn prune_status() {
     let _ = store::State::with_lock(|s| {
         prune_status_in(&data_dir().join("status"), s);
+        usage::prune(s);
         // Los de `state.json`: con su candado nadie lo está escribiendo. Los
         // de otros archivos (`claude-settings.json`) con margen.
         remove_stale_tmp(&data_dir(), "state.json.", Duration::ZERO);
@@ -339,6 +341,13 @@ pub fn handle(event: &str) -> Result<()> {
     if event == "settle" {
         return settle(&id);
     }
+    if event == "usage" {
+        let current = std::env::var_os(TRANSCRIPT_VAR).map(PathBuf::from);
+        if let Some(agent) = loaded.ok().and_then(|s| s.find_agent(&id).ok().cloned()) {
+            usage::flush(&agent, current)?;
+        }
+        return Ok(());
+    }
     if !from_agent(&id) {
         drain();
         return Ok(());
@@ -357,9 +366,20 @@ pub fn handle(event: &str) -> Result<()> {
         .is_some_and(|t| Path::new(t).exists());
     if let (Ok(state), Some(session), None, true) = (&loaded, &p.session_id, &p.agent_id, resumable)
     {
-        if let Err(e) = remember_session(state, &id, session) {
+        let transcript = Path::new(p.transcript_path.as_deref().unwrap_or_default());
+        if let Err(e) = remember_session(state, &id, session, transcript) {
             log_error(event, &e);
         }
+    }
+    // Al acabar un turno del hilo principal, lo que gastó. Aparte y sin
+    // esperarlo: la primera vez puede leer una transcripción de muchos MB, y
+    // Claude Code espera al hook.
+    if event == "idle" && p.agent_id.is_none() {
+        let transcript = p
+            .transcript_path
+            .as_deref()
+            .filter(|t| Path::new(t).is_absolute());
+        spawn_detached("usage", transcript.map(|t| (TRANSCRIPT_VAR, t)));
     }
     // Si el aviso no pide nada, ni candado ni lectura. Que no pida nada no
     // depende de los shells de los subagentes.
@@ -442,28 +462,61 @@ pub fn handle(event: &str) -> Result<()> {
 
 /// Guarda en el agente la sesión de Claude Code en la que va, si cambió: con
 /// ella `pastor restore` retoma la conversación.
-fn remember_session(state: &store::State, id: &str, session: &str) -> Result<()> {
-    let known = state.agents.iter().find(|a| a.id == id);
-    if session.is_empty() || known.is_none_or(|a| a.session.as_deref() == Some(session)) {
+/// Cada sesión nueva queda en el historial con su transcripción, para buscar
+/// en ella aunque el agente ya no exista.
+fn remember_session(
+    state: &store::State,
+    id: &str,
+    session: &str,
+    transcript: &Path,
+) -> Result<()> {
+    let Some(known) = state.agents.iter().find(|a| a.id == id) else {
+        return Ok(());
+    };
+    if session.is_empty() || known.session.as_deref() == Some(session) {
         return Ok(());
     }
-    store::State::update(|s| {
-        if let Some(a) = s.agents.iter_mut().find(|a| a.id == id) {
-            a.session = Some(session.to_string());
-        }
-        Ok(())
-    })
+    let changed = store::State::update(|s| {
+        let Some(a) = s.agents.iter_mut().find(|a| a.id == id) else {
+            return Ok(false);
+        };
+        // Otro hook del mismo agente pudo guardarla mientras.
+        let changed = a.session.as_deref() != Some(session);
+        a.session = Some(session.to_string());
+        Ok(changed)
+    })?;
+    if changed {
+        history::record(Event::Session {
+            agent: id.to_string(),
+            name: known.name.clone(),
+            cwd: known.cwd.clone(),
+            transcript: transcript.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Lanza `pastor hook settle` sin esperarlo: Claude Code espera al hook, y
 /// la pantalla aún no tiene su forma final (el diálogo, el resumen del turno).
 fn spawn_settle() {
+    spawn_detached("settle", None);
+}
+
+/// Con qué transcripción va `pastor hook usage`.
+const TRANSCRIPT_VAR: &str = "PASTOR_TRANSCRIPT";
+
+/// Lanza `pastor hook <event>` sin esperarlo, con `env` si se da.
+fn spawn_detached(event: &str, env: Option<(&str, &str)>) {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let Ok(exe) = pastor_exe() else { return };
+    let mut c = Command::new(exe);
+    c.args(["hook", event]);
+    if let Some((k, v)) = env {
+        c.env(k, v);
+    }
     // Sin heredar stdout: Claude Code esperaría a que se cierre.
-    let _ = Command::new(exe)
-        .args(["hook", "settle"])
+    let _ = c
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

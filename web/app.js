@@ -938,6 +938,7 @@ function agentView(id) {
         row("Estado", agent.status_label),
         row("Directorio", agent.cwd),
         agent.task && row("Tarea", agent.task),
+        agent.usage && row("Gasto", spendLabel(agent.usage)),
         row("Creado", since(agent.created_at)),
       ),
       h("div", { class: "menu" },
@@ -1489,7 +1490,9 @@ function tasksView() {
       t.description && h("div", { class: "desc", text: t.description }),
       h("div", { class: "card-meta" },
         h("span", { class: "tag", text: t.id }),
+        t.overlaps && h("span", { class: "tag warn", text: "⚠ archivos en común" }),
         t.agent && [icon("bot"), h("span", { class: "ellipsis", text: agentName(t.agent) })],
+        t.usage && h("span", { class: "cost", text: costLabel(t.usage) }),
         h("span", { class: "time", text: ago(t.created_at) }),
       ),
     ),
@@ -1540,10 +1543,12 @@ function taskSheet(t, agentName, reload) {
   const path = `/tasks/${encodeURIComponent(t.id)}`;
   const d = sheet(t.title,
     t.description && h("p", { class: "sheet-text", text: t.description }),
+    (t.overlaps || []).map((o) => h("p", { class: "sheet-text warn", text: `⚠ También los cambia ${o.label}: ${o.files.join(", ")}` })),
     h("dl", { class: "info" },
       row("Estado", TASK_LABEL[t.status] || t.status),
       row("Id", t.id),
       t.agent && row("Agente", agentName(t.agent)),
+      t.usage && row("Gasto", spendLabel(t.usage)),
       row("Creada", since(t.created_at)),
       /^https?:\/\//.test(t.url || "") && row("Enlace", h("a", { href: t.url, target: "_blank", rel: "noopener", text: t.url })),
     ),
@@ -1609,6 +1614,24 @@ function human(secs) {
   secs = Math.max(0, secs);
   const d = Math.floor(secs / 86400), hr = Math.floor(secs / 3600) % 24, m = Math.floor(secs / 60) % 60;
   return d ? `${d}d ${hr}h` : hr ? `${hr}h ${m}m` : m ? `${m}m` : `${secs}s`;
+}
+
+/** `850`, `12.3k`, `1.2M`, como `usage::tokens`. */
+function fmtTokens(n) {
+  return n < 1e3 ? String(n) : n < 1e6 ? (n / 1e3).toFixed(1) + "k" : n < 1e9 ? (n / 1e6).toFixed(1) + "M" : (n / 1e9).toFixed(2) + "B";
+}
+
+/** `≈ $3.40`, con `+` si hay tokens de un modelo sin precio conocido. */
+function costLabel(u) {
+  const usd = u.cost >= 1000 ? Math.round(u.cost).toLocaleString("en-US") : u.cost.toFixed(2);
+  return `≈ $${usd}${u.unpriced ? "+" : ""}`;
+}
+
+/** Todos los tokens de un `usage::Tokens`. */
+const allTokens = (t) => t.input + t.output + t.cache_write_5m + t.cache_write_1h + t.cache_read;
+
+function spendLabel(u) {
+  return `${fmtTokens(allTokens(u.tokens))} tokens · ${costLabel(u)} (precio de la API)`;
 }
 
 const stat = (label, value, color) =>
@@ -1685,6 +1708,12 @@ function dashboardView() {
           h("div", { class: "card-main" }, h("span", { class: "name", text: x.title }),
             h("div", { class: "card-meta" }, h("span", { class: "tag", text: x.id }), h("span", { text: "Por revisar" }))),
           h("span", { class: "chev" }, icon("forward")))),
+      ...tasks.filter((x) => x.overlaps).map((x) =>
+        h("a", { class: "card task", href: "#/tasks", onclick: () => store.set("pastor-task-filter", x.status) },
+          h("div", { class: "card-main" }, h("span", { class: "name", text: x.title }),
+            h("div", { class: "card-meta" }, h("span", { class: "tag warn", text: x.id }),
+              h("span", { class: "ellipsis", text: x.overlaps.map((o) => `${o.files.join(", ")} con ${o.label}`).join("; ") }))),
+          h("span", { class: "chev" }, icon("forward")))),
     ];
     body.replaceChildren(
       panel("bot", "Agentes", h("div", { class: "stats" },
@@ -1710,10 +1739,41 @@ function dashboardView() {
   watchAgents(draw);
 }
 
+/** Buscar en las conversaciones de los agentes de Claude. */
+function searchPanel() {
+  const input = h("input", { type: "search", placeholder: "Qué buscar (p. ej. auth.rs)", enterkeyhint: "search" });
+  const results = h("div", { class: "cards" });
+  const when = (iso) => new Date(iso).toLocaleString("es", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  const WHO = { user: "tú", parent: "agente principal", assistant: "agente", tool: "herramienta" };
+  const hit = (x) => h(x.alive ? "a" : "div", { class: "card hit", href: x.alive ? "#/agent/" + encodeURIComponent(x.agent) : undefined },
+    h("div", { class: "card-main" },
+      h("div", { class: "card-meta" },
+        h("span", { class: "name", text: x.name }),
+        h("span", { class: "tag", text: WHO[x.role] || x.role }),
+        x.at && h("span", { class: "time", text: when(x.at) }),
+        !x.alive && h("span", { class: "time", text: "terminado" })),
+      h("div", { class: "desc", text: x.snippet })));
+  const form = h("form", {
+    class: "search",
+    onsubmit: async (e) => {
+      e.preventDefault();
+      const q = input.value.trim();
+      if (!q) return;
+      results.replaceChildren(...skeleton(2));
+      const hits = await attempt(() => api("GET", "/search?q=" + encodeURIComponent(q)));
+      results.replaceChildren(...(!hits ? [] : hits.length
+        ? hits.map(hit)
+        : [h("p", { class: "quiet", text: "No hay mensajes con eso." })]));
+    },
+  }, input, h("button", { class: "btn primary" }, "Buscar"));
+  return panel("history", "Buscar en las conversaciones", form, results);
+}
+
 function historyView() {
   setTop({ title: "Historial" });
   const body = h("div", {}, h("div", { class: "cards" }, skeleton(3)));
-  main.append(body);
+  // La búsqueda va aparte: el sondeo de las estadísticas no la borra.
+  main.append(searchPanel(), body);
   poll(15000, "/stats", (s) => {
     // Días de calendario (ayer a las 23:00 es "hace 1 día"); con el reloj
     // desfasado podría salir negativo.
@@ -1730,6 +1790,12 @@ function historyView() {
         stat("mensajes enviados", s.messages, "var(--cyan)"),
         stat("turnos de Claude", s.turns, KIND.claude.color),
         stat("sesiones por día", (s.sessions / Math.max(1, days)).toFixed(1)),
+      )),
+      s.usage && panel("gauge", "Gasto de los agentes de Claude (precio de la API)", h("div", { class: "stats" },
+        stat("tokens", fmtTokens(allTokens(s.usage.tokens)), KIND.claude.color),
+        stat("costo total", costLabel(s.usage), "var(--yellow)"),
+        stat("costo de hoy", costLabel(s.usage_today), "var(--yellow)"),
+        stat("costo medio por tarea", s.avg_task_cost == null ? "—" : costLabel({ cost: s.avg_task_cost }), "var(--yellow)"),
       )),
       panel("history", "Tiempos", h("div", { class: "stats" },
         stat("duración media de sesión", dash(s.avg_session_secs)),

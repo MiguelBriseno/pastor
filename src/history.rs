@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::Kind;
 use crate::store::{data_dir, ensure_dirs, State, TaskStatus};
+use crate::usage::{Spend, Tokens};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -52,6 +53,24 @@ pub enum Event {
     /// Claude Code terminó un turno (hook `Stop`).
     Turn {
         agent: String,
+    },
+    /// Tokens que gastó un agente de Claude Code con un modelo desde el
+    /// último evento suyo, y la tarea que tenía (ver `usage`).
+    Usage {
+        agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        model: String,
+        tokens: Tokens,
+    },
+    /// Un agente de Claude Code empezó a escribir en otra transcripción (al
+    /// lanzarlo, con `/clear` o `/resume`): para buscar en sus conversaciones
+    /// aunque ya no exista.
+    Session {
+        agent: String,
+        name: String,
+        cwd: PathBuf,
+        transcript: PathBuf,
     },
 }
 
@@ -188,12 +207,19 @@ impl Tail {
         // Del día a día solo hacen falta los del gráfico; la ventana solo avanza.
         let first_day = Local::now().date_naive() - Duration::days(DAYS as i64 - 1);
         self.totals.daily.retain(|d, _| *d >= first_day);
+        self.totals.spend_daily.retain(|d, _| *d >= first_day);
         self.offset += end as u64 + 1;
         true
     }
 
     pub fn stats(&self, today: NaiveDate) -> Stats {
         self.totals.stats(today)
+    }
+
+    /// Lo que lleva gastado el agente `id`, sin armar todas las estadísticas.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn agent_spend(&self, id: &str) -> Option<Spend> {
+        self.totals.spend_by_agent.get(id).copied()
     }
 }
 
@@ -218,6 +244,14 @@ pub struct Stats {
     pub projects: Vec<(PathBuf, u64)>,
     /// Eventos por día, del más antiguo a hoy (hora local).
     pub daily: Vec<(NaiveDate, u64)>,
+    /// Lo que gastaron los agentes de Claude Code, en total y hoy.
+    pub spend: Spend,
+    pub spend_today: Spend,
+    /// Por agente y por tarea (con su id).
+    pub spend_by_agent: HashMap<String, Spend>,
+    pub spend_by_task: HashMap<String, Spend>,
+    /// El costo medio de las tareas hechas que gastaron algo.
+    pub avg_task_cost: Option<f64>,
 }
 
 /// Lo acumulado de las entradas leídas: lo que hace falta para las
@@ -238,6 +272,10 @@ struct Totals {
     task_secs: (i64, i64),
     /// Eventos por día (hora local), solo de los días del gráfico.
     daily: HashMap<NaiveDate, u64>,
+    spend: Spend,
+    spend_daily: HashMap<NaiveDate, Spend>,
+    spend_by_agent: HashMap<String, Spend>,
+    spend_by_task: HashMap<String, Spend>,
 }
 
 impl Totals {
@@ -276,6 +314,29 @@ impl Totals {
             Event::TaskDeleted { .. } => activity = false,
             Event::MessageSent { .. } => self.messages += 1,
             Event::Turn { .. } => self.turns += 1,
+            Event::Usage {
+                agent,
+                task,
+                model,
+                tokens,
+            } => {
+                let mut s = Spend::default();
+                s.add(model, tokens);
+                self.spend.merge(&s);
+                self.spend_daily
+                    .entry(e.ts.with_timezone(&Local).date_naive())
+                    .or_default()
+                    .merge(&s);
+                self.spend_by_agent
+                    .entry(agent.clone())
+                    .or_default()
+                    .merge(&s);
+                if let Some(t) = task {
+                    self.spend_by_task.entry(t.clone()).or_default().merge(&s);
+                }
+                activity = false;
+            }
+            Event::Session { .. } => activity = false,
         }
         self.since = Some(self.since.map_or(e.ts, |d| d.min(e.ts)));
         if activity {
@@ -291,6 +352,13 @@ impl Totals {
         let mut projects: Vec<_> = self.projects.iter().map(|(p, n)| (p.clone(), *n)).collect();
         projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let first_day = today - Duration::days(DAYS as i64 - 1);
+        let done_costs: Vec<f64> = self
+            .done
+            .iter()
+            .filter_map(|t| self.spend_by_task.get(t))
+            .filter(|s| !s.tokens.is_empty())
+            .map(|s| s.cost)
+            .collect();
         Stats {
             since: self.since,
             sessions: self.sessions,
@@ -309,6 +377,12 @@ impl Totals {
                     (day, self.daily.get(&day).copied().unwrap_or(0))
                 })
                 .collect(),
+            spend: self.spend,
+            spend_today: self.spend_daily.get(&today).copied().unwrap_or_default(),
+            spend_by_agent: self.spend_by_agent.clone(),
+            spend_by_task: self.spend_by_task.clone(),
+            avg_task_cost: (!done_costs.is_empty())
+                .then(|| done_costs.iter().sum::<f64>() / done_costs.len() as f64),
         }
     }
 }
@@ -444,6 +518,50 @@ mod tests {
         assert_eq!(s.daily[DAYS - 1], (today, 3));
         assert_eq!(s.daily[DAYS - 2].1, 2);
         assert_eq!(s.daily.iter().map(|d| d.1).sum::<u64>(), 5);
+    }
+
+    #[test]
+    fn gasto_por_agente_tarea_y_dia() {
+        let today = Local::now().date_naive();
+        let usage = |agent: &str, task: Option<&str>, output| Event::Usage {
+            agent: agent.into(),
+            task: task.map(String::from),
+            model: "claude-opus-5-5".into(),
+            tokens: Tokens {
+                output,
+                ..Tokens::default()
+            },
+        };
+        let mut t = Totals::default();
+        for (days_ago, event) in [
+            (3, usage("a1", None, 1_000_000)),
+            (0, usage("a1", Some("t1"), 500_000)),
+            (0, usage("a2", Some("t1"), 500_000)),
+            (0, usage("a2", Some("t2"), 100_000)),
+            (
+                0,
+                Event::TaskStatus {
+                    task: "t1".into(),
+                    to: TaskStatus::Done,
+                    secs: 10,
+                },
+            ),
+        ] {
+            t.add(&Entry {
+                ts: Utc::now() - Duration::days(days_ago),
+                event,
+            });
+        }
+        let s = t.stats(today);
+        assert_eq!(s.spend.tokens.output, 2_100_000);
+        assert_eq!(s.spend.cost, 42.0);
+        assert_eq!(s.spend_today.tokens.output, 1_100_000);
+        assert_eq!(s.spend_by_agent["a1"].tokens.output, 1_500_000);
+        assert_eq!(s.spend_by_task["t1"].cost, 20.0);
+        // Solo t1 está hecha.
+        assert_eq!(s.avg_task_cost, Some(20.0));
+        // El gasto no cuenta como actividad.
+        assert_eq!(s.daily.iter().map(|d| d.1).sum::<u64>(), 1);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::hooks;
 use crate::remote;
 use crate::store::{self, Agent, State, Task, TaskStatus, Worktree};
 use crate::tmux;
+use crate::usage;
 use crate::worktree;
 
 /// Dónde trabaja un agente nuevo.
@@ -489,6 +490,10 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
     if let Some((host, id)) = remote::split(agent_key) {
         return remote::run(&host, &["kill", id]).map(drop);
     }
+    // Lo que gastó desde su último turno, todavía con su tarea.
+    if let Ok(a) = State::load().and_then(|s| s.find_agent(agent_key).cloned()) {
+        usage::flush_quietly(&a, None);
+    }
     // Primero fuera del estado y después la sesión: si la TUI lo mirara entre
     // medias, lo vería muerto y tomaría su tarea por terminada. Se busca dentro
     // del candado: si dos lo matan a la vez, solo uno lo encuentra, y el fin
@@ -500,6 +505,7 @@ pub fn kill_agent(agent_key: &str) -> Result<()> {
     })?;
     let killed = tmux::kill_session(&agent.id);
     hooks::clear_status(&agent.id);
+    usage::forget(&agent.id);
     // Un worktree sin cambios y sin tarea que revisar no sirve para nada. Con
     // cambios se queda: que no se pierda trabajo.
     if let Some(wt) = &orphan {
@@ -664,6 +670,8 @@ pub fn assign_task(task_id: &str, target: AssignTarget) -> Result<Agent> {
     let (agent, created) = match target {
         AssignTarget::Existing(key) => {
             let a = state.find_agent(&key)?.clone();
+            // Lo que gastó hasta ahora es de la tarea que tenía.
+            usage::flush_quietly(&a, None);
             tmux::send_text(&agent_target(&a)?, &prompt)?;
             (a, false)
         }
@@ -869,6 +877,135 @@ pub fn delete_task(task_id: &str) -> Result<()> {
         task: task_id.to_string(),
     });
     Ok(())
+}
+
+/// Con quién comparte archivos cambiados el trabajo de una tarea o agente.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum With {
+    Task(String),
+    /// Un agente con worktree que no tiene tarea.
+    Agent(String),
+    /// La rama actual del repositorio y lo que tienes sin guardar en él.
+    Repo,
+}
+
+impl With {
+    /// `t4 (web)`, `el agente web` o `tu rama`.
+    pub fn label(&self, state: &State) -> String {
+        let name = |id: &str| {
+            state
+                .agents
+                .iter()
+                .find(|a| a.id == id)
+                .map_or_else(|| id.to_string(), |a| a.name.clone())
+        };
+        match self {
+            With::Task(t) => match state.find_task(t).ok().and_then(|t| t.agent.as_deref()) {
+                Some(a) => format!("{t} ({})", name(a)),
+                None => t.clone(),
+            },
+            With::Agent(a) => format!("el agente {}", name(a)),
+            With::Repo => "tu rama".to_string(),
+        }
+    }
+}
+
+/// Archivos que cambió también otro.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct Overlap {
+    pub with: With,
+    pub files: Vec<String>,
+}
+
+/// Los archivos que cada tarea en curso (por su id) o agente con worktree y
+/// sin tarea (por el suyo) cambió y que también cambió otra tarea, otro
+/// agente o tu rama del mismo repositorio. Al integrar, ahí puede haber
+/// conflictos. Solo los que tienen alguno.
+pub fn overlaps(state: &State) -> HashMap<String, Vec<Overlap>> {
+    // Cada worktree una vez, con quién lo usa.
+    let tasks = state
+        .tasks
+        .iter()
+        .filter(|t| t.status != TaskStatus::Done)
+        .filter_map(|t| Some((With::Task(t.id.clone()), t.worktree.as_ref()?)));
+    let agents = state
+        .agents
+        .iter()
+        .filter(|a| a.host.is_none())
+        .filter_map(|a| Some((With::Agent(a.id.clone()), a.worktree.as_ref()?)));
+    let mut owners: Vec<(With, Worktree)> = Vec::new();
+    for (w, wt) in tasks.chain(agents) {
+        if !owners.iter().any(|(_, seen)| seen == wt) {
+            owners.push((w, wt.clone()));
+        }
+    }
+    // La base se calcula una vez por worktree: la usan los dos lados.
+    let touched: Vec<(With, Worktree, String, Vec<String>)> = owners
+        .into_iter()
+        .filter(|(_, wt)| wt.path.is_dir())
+        .filter_map(|(w, wt)| {
+            let base = worktree::diff_base(&wt);
+            let files = worktree::touched(&wt, &base).ok()?;
+            (!files.is_empty()).then_some((w, wt, base, files))
+        })
+        .collect();
+    let mut out: HashMap<String, Vec<Overlap>> = HashMap::new();
+    let key = |w: &With| match w {
+        With::Task(id) | With::Agent(id) => id.clone(),
+        With::Repo => String::new(),
+    };
+    let common = |a: &[String], b: &[String]| -> Vec<String> {
+        a.iter()
+            .filter(|f| b.binary_search(f).is_ok())
+            .cloned()
+            .collect()
+    };
+    for (i, (w, wt, base, files)) in touched.iter().enumerate() {
+        for (w2, wt2, _, files2) in touched.iter().skip(i + 1) {
+            if wt.repo != wt2.repo {
+                continue;
+            }
+            let both = common(files, files2);
+            if both.is_empty() {
+                continue;
+            }
+            out.entry(key(w)).or_default().push(Overlap {
+                with: w2.clone(),
+                files: both.clone(),
+            });
+            out.entry(key(w2)).or_default().push(Overlap {
+                with: w.clone(),
+                files: both,
+            });
+        }
+        if let Ok(repo) = worktree::repo_touched(wt, base) {
+            let both = common(files, &repo);
+            if !both.is_empty() {
+                out.entry(key(w)).or_default().push(Overlap {
+                    with: With::Repo,
+                    files: both,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `src/a.rs y src/b.rs con t4 (web); src/c.rs con tu rama`, para avisar.
+pub fn describe_overlaps(state: &State, list: &[Overlap]) -> String {
+    list.iter()
+        .map(|o| {
+            let files = match o.files.as_slice() {
+                [one] => one.clone(),
+                [a, b] => format!("{a} y {b}"),
+                [a, rest @ ..] => format!("{a} y {} más", rest.len()),
+                [] => String::new(),
+            };
+            format!("{files} con {}", o.with.label(state))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// El worktree de una tarea, para ver lo que cambió.

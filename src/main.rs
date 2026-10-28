@@ -12,15 +12,16 @@ mod ops;
 #[cfg(feature = "serve")]
 mod pty;
 mod remote;
+mod search;
 #[cfg(feature = "serve")]
 mod server;
 mod store;
 mod syntax;
 mod text;
 mod tmux;
-#[cfg(feature = "serve")]
 mod transcript;
 mod tui;
+mod usage;
 mod worktree;
 
 use std::collections::HashMap;
@@ -166,6 +167,22 @@ enum Cmd {
         /// Id o nombre del agente (por defecto, todos los que se perdieron)
         #[arg(value_name = "AGENTE")]
         agent: Option<String>,
+    },
+    /// Busca en las conversaciones de los agentes de Claude, también de los
+    /// que ya terminaron
+    Search {
+        /// Lo que buscar: los mensajes que tengan todas las palabras
+        #[arg(required = true, value_name = "TEXTO")]
+        text: Vec<String>,
+        /// Solo desde hace tanto (30m, 12h, 7d, 2w) o desde una fecha (AAAA-MM-DD)
+        #[arg(long, value_name = "CUÁNDO")]
+        desde: Option<String>,
+        /// Cuántos mensajes mostrar como máximo
+        #[arg(long, default_value_t = search::MAX, value_name = "N")]
+        max: usize,
+        /// En JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Gestiona tareas
     #[command(subcommand)]
@@ -558,6 +575,36 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Restore { agent: None }) => restore_lost(),
+        Some(Cmd::Search {
+            text,
+            desde,
+            max,
+            json,
+        }) => {
+            let since = desde.as_deref().map(search::parse_since).transpose()?;
+            let hits = search::run(&search::Query::new(&text.join(" "), since, max)?)?;
+            if json {
+                println!("{}", serde_json::to_string(&hits)?);
+                return Ok(());
+            }
+            if hits.is_empty() {
+                println!("No hay mensajes con eso.");
+            }
+            for h in &hits {
+                let when = h.at.map_or_else(
+                    || "—".to_string(),
+                    |t| {
+                        t.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    },
+                );
+                let gone = if h.alive { "" } else { ", terminado" };
+                println!("{when}  {} ({}{gone}) · {}", h.name, h.agent, h.who());
+                println!("  {}", h.snippet);
+            }
+            Ok(())
+        }
         Some(Cmd::Task(cmd)) => task_cmd(cmd),
         Some(Cmd::Host(cmd)) => host_cmd(cmd),
     }
@@ -688,19 +735,31 @@ fn task_cmd(cmd: TaskCmd) -> Result<()> {
             if state.tasks.is_empty() {
                 println!("No hay tareas. Crea una con `pastor task add \"título\"`.");
             }
+            let mut tail = history::Tail::default();
+            tail.refresh();
+            let stats = tail.stats(chrono::Local::now().date_naive());
+            let overlaps = ops::overlaps(&state);
             for t in &state.tasks {
                 let agent = t
                     .agent
                     .as_ref()
                     .and_then(|id| state.agents.iter().find(|a| &a.id == id))
                     .map_or("-", |a| a.name.as_str());
+                let cost = stats
+                    .spend_by_task
+                    .get(&t.id)
+                    .map_or_else(|| "-".to_string(), usage::Spend::cost_label);
                 println!(
-                    "{:<5} {:<12} {} {}",
+                    "{:<5} {:<12} {} {:>9}  {}",
                     t.id,
                     t.status.label(),
                     text::pad_right(agent, 16),
+                    cost,
                     t.title
                 );
+                if let Some(list) = overlaps.get(&t.id) {
+                    println!("      ⚠ cambia {}", ops::describe_overlaps(&state, list));
+                }
             }
         }
         TaskCmd::Assign {

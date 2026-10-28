@@ -249,7 +249,7 @@ pub fn diff<T>(wt: &Worktree, stat: bool, run: impl FnOnce(Command) -> Result<T>
 /// Desde dónde se compara: el commit del que salió la rama o, si el agente
 /// integró después la rama del repositorio en la suya, ese punto. Así no se
 /// ven como del agente los cambios que llegaron de tu rama.
-fn diff_base(wt: &Worktree) -> String {
+pub fn diff_base(wt: &Worktree) -> String {
     git(&wt.repo, &["rev-parse", "HEAD"])
         .and_then(|head| git(&wt.path, &["merge-base", "HEAD", &head]))
         .unwrap_or_else(|_| wt.base.clone())
@@ -383,6 +383,33 @@ pub fn changes(dir: &Path, wt: Option<&Worktree>, untracked: &[String]) -> Vec<(
     }
     out.extend(untracked.iter().map(|p| (p.clone(), true)));
     out
+}
+
+/// Los archivos que tocó el agente en su worktree desde que salió su rama
+/// (commits, cambios sin guardar, nuevos y borrados), relativos a la raíz
+/// del repositorio. `base` es la de `diff_base`.
+pub fn touched(wt: &Worktree, base: &str) -> Result<Vec<String>> {
+    if !wt.path.is_dir() {
+        return Ok(Vec::new());
+    }
+    changed_since(&wt.path, base)
+}
+
+/// Lo que cambió en el repositorio (tu rama y lo que tienes sin guardar)
+/// desde el punto del que parte lo del agente: si también lo tocó él, al
+/// integrar puede haber conflicto. `base` es la de `diff_base`.
+pub fn repo_touched(wt: &Worktree, base: &str) -> Result<Vec<String>> {
+    changed_since(&wt.repo, base)
+}
+
+/// Lo que cambió en la copia de `dir` desde `base`, más los archivos nuevos.
+fn changed_since(dir: &Path, base: &str) -> Result<Vec<String>> {
+    let diff = git(dir, &["diff", "-z", "--name-only", "--no-renames", base])?;
+    let mut out: Vec<String> = nul_split(&diff).map(String::from).collect();
+    out.extend(untracked(dir)?);
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Los archivos de `dir` que no están en el repositorio ni ignorados,
@@ -558,6 +585,29 @@ mod tests {
             .is_empty());
         // Lo del agente quedó en un commit de su rama: no se pierde.
         assert!(has_changes(&wt).unwrap());
+    }
+
+    #[test]
+    fn archivos_que_tocaron_el_agente_y_tu_rama() {
+        let r = Repo::new("tocados");
+        let (wt, _) = r.create(&r.repo(), "uno");
+        let touched = |wt: &Worktree| touched(wt, &diff_base(wt));
+        let repo_touched = |wt: &Worktree| repo_touched(wt, &diff_base(wt));
+        assert!(touched(&wt).unwrap().is_empty());
+        // Un cambio sin guardar, uno en un commit y uno nuevo.
+        fs::write(wt.path.join("src/a.txt"), "del agente\n").unwrap();
+        fs::write(wt.path.join("b.txt"), "b\n").unwrap();
+        git(&wt.path, &["add", "b.txt"]).unwrap();
+        git(&wt.path, &["commit", "-qm", "b"]).unwrap();
+        fs::write(wt.path.join("nuevo.txt"), "n\n").unwrap();
+        assert_eq!(touched(&wt).unwrap(), ["b.txt", "nuevo.txt", "src/a.txt"]);
+        // Lo tuyo: un commit en main y algo sin guardar.
+        assert!(repo_touched(&wt).unwrap().is_empty());
+        fs::write(r.repo().join("b.txt"), "tuyo\n").unwrap();
+        git(&r.repo(), &["add", "b.txt"]).unwrap();
+        git(&r.repo(), &["commit", "-qm", "mío"]).unwrap();
+        fs::write(r.repo().join("src/a.txt"), "sin guardar\n").unwrap();
+        assert_eq!(repo_touched(&wt).unwrap(), ["b.txt", "src/a.txt"]);
     }
 
     #[test]
