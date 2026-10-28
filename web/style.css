@@ -519,7 +519,8 @@ main.agent-main > * { max-width: none; margin: 0; }
 .files-head .chips { margin-bottom: 8px; }
 .files { display: flex; flex-direction: column; }
 .file-row {
-  display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 4px;
+  display: flex; align-items: center; gap: 10px; min-height: 44px;
+  padding: 8px 4px 8px calc(4px + var(--depth, 0) * 18px);
   border-bottom: 1px solid var(--line); font: 13px var(--mono); color: var(--text);
 }
 .file-row:active { background: var(--surface-2); }
@@ -528,6 +529,15 @@ main.agent-main > * { max-width: none; margin: 0; }
 .file-row.added .file-mark, .file-row.added .file-name { color: var(--green); }
 .file-path { min-width: 0; overflow-wrap: anywhere; }
 .file-dir { color: var(--muted); }
+/* En el árbol, el nombre del archivo a la altura del de sus carpetas
+   hermanas: después de la flecha y la carpeta, con sus huecos. */
+.file-row.in-tree .file-path { margin-left: 52px; }
+.file-folder { width: 100%; border: 0; border-bottom: 1px solid var(--line); background: none; text-align: left; }
+.file-folder .icon { flex: none; width: 16px; height: 16px; color: var(--cyan); }
+.file-folder .icon:first-of-type { transition: transform .15s; color: var(--muted); }
+.file-folder.open .icon:first-of-type { transform: rotate(90deg); }
+.file-folder .file-mark { color: var(--yellow); }
+.file-folder .file-name { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 700; }
 
 main.code-main { display: flex; flex-direction: column; padding: 0; overflow: hidden; background: var(--term-bg); }
 main.code-main > * { max-width: none; margin: 0; }

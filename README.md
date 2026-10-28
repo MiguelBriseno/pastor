@@ -417,9 +417,10 @@ agente puedes ver:
 - **Pantalla:** lo que se ve en su panel, con una caja para escribirle y botones para las teclas
   (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C).
 - **Conversación:** la conversación entera, solo con los agentes de Claude.
-- **Archivos:** con el botón de la carpeta, arriba. Los que cambió el agente, marcados (y un
-  filtro para ver solo esos); al abrir uno se ve con colores, se busca dentro y, con el lápiz, se
-  edita y se guarda. Si el agente lo cambió mientras, no se guarda encima.
+- **Archivos:** con el botón de la carpeta, arriba. Se ven en carpetas, que se abren al tocarlas;
+  al buscar, la lista con la ruta entera. Los que cambió el agente, marcados (y un filtro para ver
+  solo esos, con sus carpetas abiertas); al abrir uno se ve con colores, se busca dentro y, con el
+  lápiz, se edita y se guarda. Si el agente lo cambió mientras, no se guarda encima.
 - **Terminal:** su sesión de tmux en vivo, como con `pastor attach`. Lo que escribes le llega al
   momento, con colores, y también ves la terminal de al lado (cambia de panel con Ctrl-B y una
   flecha). Mientras está abierta, el agente dibuja al tamaño del celular.

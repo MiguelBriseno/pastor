@@ -34,6 +34,7 @@ const ICONS = {
   send: '<path d="m5 12 7-7 7 7M12 19V5"/>',
   down: '<path d="M12 5v14M19 12l-7 7-7-7"/>',
   more: '<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>',
+  chevron: '<path d="m9 18 6-6-6-6"/>',
   folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
   wrap: '<path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-4"/><path d="m16 16-2 2 2 2"/><path d="M3 18h7"/>',
   type: '<path d="M4 7V4h16v3M9 20h6M12 4v16"/>',
@@ -1189,6 +1190,51 @@ function fuzzy(path, q) {
   return [lower.includes(q) ? 0 : 1, path.length];
 }
 
+/** Las carpetas abiertas de cada agente (`open`), y con «Cambiados», las que
+ * estaban abiertas antes (`before`): siguen igual al volver de un archivo. */
+const filesOpen = new Map();
+
+/** Abre las carpetas que contienen `path`. */
+function openParents(open, path) {
+  for (let i = path.indexOf("/"); i >= 0; i = path.indexOf("/", i + 1)) open.add(path.slice(0, i));
+}
+
+/** Por nombre sin mayúsculas, y si empatan, tal cual: el orden no cambia. */
+const byName = (a, b) => {
+  const la = a.toLowerCase(), lb = b.toLowerCase();
+  return la < lb ? -1 : la > lb ? 1 : a < b ? -1 : a > b ? 1 : 0;
+};
+
+/** `files` en árbol, como filas: en cada carpeta, primero las carpetas y
+ * luego los archivos, por nombre. De las cerradas no sale lo de adentro. */
+function fileTree(files, open) {
+  const root = { dirs: new Map(), files: [], changed: 0 };
+  for (const f of files) {
+    let node = root;
+    const parts = f.path.split("/");
+    parts.pop();
+    for (const d of parts) {
+      if (!node.dirs.has(d)) node.dirs.set(d, { dirs: new Map(), files: [], changed: 0 });
+      node = node.dirs.get(d);
+      if (f.change) node.changed++;
+    }
+    node.files.push(f);
+  }
+  const rows = [];
+  const walk = (node, prefix, depth) => {
+    for (const name of [...node.dirs.keys()].sort(byName)) {
+      const sub = node.dirs.get(name);
+      const path = prefix + name;
+      rows.push({ dir: true, path, name, depth, open: open.has(path), changed: sub.changed });
+      if (open.has(path)) walk(sub, path + "/", depth + 1);
+    }
+    const files = node.files.map((f) => ({ file: f, name: f.path.slice(f.path.lastIndexOf("/") + 1), depth }));
+    for (const row of files.sort((a, b) => byName(a.name, b.name))) rows.push(row);
+  };
+  walk(root, "", 0);
+  return rows;
+}
+
 function filesView(id) {
   const top = setTop({ title: "Archivos", back: "#/agent/" + encodeURIComponent(id) });
   watchAgents((agents) => {
@@ -1198,6 +1244,21 @@ function filesView(id) {
   const filterKey = "pastor-files-changed";
   let onlyChanged = store.get(filterKey) === "1";
   let listing = null;
+  if (!filesOpen.has(id)) filesOpen.set(id, { open: new Set(), before: null });
+  const folders = filesOpen.get(id);
+  const open = folders.open;
+  // Al pasar a «Cambiados» se abren las carpetas de lo cambiado; al volver a
+  // «Todos», las que estaban abiertas antes.
+  const syncOpen = () => {
+    if (onlyChanged && !folders.before) {
+      folders.before = new Set(open);
+      for (const f of listing.files) if (f.change) openParents(open, f.path);
+    } else if (!onlyChanged && folders.before) {
+      open.clear();
+      for (const p of folders.before) open.add(p);
+      folders.before = null;
+    }
+  };
   const input = h("input", {
     type: "search", placeholder: "Buscar archivo…", "aria-label": "Buscar archivo",
     autocapitalize: "off", autocorrect: "off", spellcheck: "false", enterkeyhint: "search",
@@ -1210,14 +1271,27 @@ function filesView(id) {
     chips.replaceChildren(...[[false, "Todos", listing.files.length], [true, "Cambiados", changed]].map(([on, label, n]) =>
       h("button", {
         type: "button", class: "chip" + (on === onlyChanged ? " on" : ""),
-        onclick: () => { onlyChanged = on; store.set(filterKey, on ? "1" : ""); draw(); },
+        onclick: () => {
+          if (on === onlyChanged) return;
+          onlyChanged = on;
+          store.set(filterKey, on ? "1" : "");
+          syncOpen();
+          draw();
+        },
       }, label, h("span", { class: "chip-count", text: String(n) }))));
     const q = input.value.trim().toLowerCase();
-    let shown = listing.files
-      .filter((f) => !onlyChanged || f.change)
-      .map((f) => [f, q ? fuzzy(f.path, q) : [0, 0]])
-      .filter(([, rank]) => rank);
-    if (q) shown.sort(([, a], [, b]) => a[0] - b[0] || a[1] - b[1]);
+    const picked = listing.files.filter((f) => !onlyChanged || f.change);
+    let shown;
+    if (q) {
+      // Buscando, la lista con la ruta entera: lo que mejor coincide primero.
+      shown = picked
+        .map((f) => [f, fuzzy(f.path, q)])
+        .filter(([, rank]) => rank)
+        .sort(([, a], [, b]) => a[0] - b[0] || a[1] - b[1])
+        .map(([file]) => ({ file, flat: true }));
+    } else {
+      shown = fileTree(picked, open);
+    }
     const rest = shown.length - MAX_FILES_SHOWN;
     shown = shown.slice(0, MAX_FILES_SHOWN);
     if (!shown.length) {
@@ -1226,20 +1300,40 @@ function filesView(id) {
         : empty("folder", "Sin archivos", q ? "Ningún archivo coincide." : "Este directorio está vacío."));
       return;
     }
-    list.replaceChildren(...shown.map(([f]) => {
+    list.replaceChildren(...shown.map((row) => {
+      const indent = `--depth:${row.depth || 0}`;
+      if (row.dir) {
+        return h("button", {
+          type: "button", class: "file-row file-folder" + (row.open ? " open" : ""), style: indent,
+          "aria-expanded": String(row.open),
+          onclick: () => {
+            if (row.open) open.delete(row.path);
+            else open.add(row.path);
+            draw();
+          },
+        },
+        h("span", { class: "file-mark", text: row.changed ? "•" : "" }),
+        icon("chevron"), icon("folder"),
+        h("span", { class: "file-name", text: row.name + "/" }),
+        row.changed > 0 && h("span", { class: "chip-count", text: String(row.changed) }));
+      }
+      const f = row.file;
       const slash = f.path.lastIndexOf("/");
-      return h("a", { class: "file-row" + (f.change ? " " + f.change : ""), href: filesHash(id, f.path) },
+      return h("a", { class: "file-row" + (row.flat ? "" : " in-tree") + (f.change ? " " + f.change : ""), style: indent, href: filesHash(id, f.path),
+        // Al volver, el archivo a la vista aunque se haya abierto buscando.
+        onclick: () => openParents(open, f.path) },
         h("span", { class: "file-mark", text: f.change === "modified" ? "M" : f.change === "added" ? "+" : "" }),
         h("span", { class: "file-path" },
-          slash >= 0 && h("span", { class: "file-dir", text: f.path.slice(0, slash + 1) }),
+          row.flat && slash >= 0 && h("span", { class: "file-dir", text: f.path.slice(0, slash + 1) }),
           h("span", { class: "file-name", text: f.path.slice(slash + 1) })));
-    }), ...(rest > 0 ? [h("p", { class: "hint", text: `${rest} más: escribe para encontrarlos` })] : []));
+    }), ...(rest > 0 ? [h("p", { class: "hint", text: `${rest} más: ${q ? "afina la búsqueda" : "escribe para encontrarlos"}` })] : []));
   };
   input.addEventListener("input", draw);
   main.append(h("div", { class: "files-head" }, input, chips), list);
   attempt(async () => {
     listing = await api("GET", `/agents/${encodeURIComponent(id)}/files`);
     if (listing.truncated) toast(`Hay más de ${listing.files.length} archivos: solo se listan los primeros`);
+    syncOpen();
     draw();
   }).then(() => { if (!listing) list.replaceChildren(empty("folder", "Sin archivos", "No pude leer el directorio.")); });
 }
