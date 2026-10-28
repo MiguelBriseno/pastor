@@ -467,7 +467,13 @@ async fn list_agents(Shared(app): Shared<Arc<App>>) -> Response {
             let mut tracker = app.tracker.lock().unwrap_or_else(PoisonError::into_inner);
             ops::observe(&state, &mut tracker)?
         };
-        let mut stats = current_stats(&app);
+        // Se consulta a menudo: solo el gasto de cada agente, sin las
+        // estadísticas enteras.
+        let tail = {
+            let mut tail = app.history.lock().unwrap_or_else(PoisonError::into_inner);
+            tail.refresh();
+            tail
+        };
         Ok(state
             .agents
             .into_iter()
@@ -476,7 +482,7 @@ async fn list_agents(Shared(app): Shared<Arc<App>>) -> Response {
                 AgentView {
                     project: a.project().to_path_buf(),
                     project_name: a.project_name(),
-                    usage: stats.spend_by_agent.remove(&a.id),
+                    usage: tail.agent_spend(&a.id),
                     agent: a,
                     status: st.key(),
                     status_label: st.label(),
@@ -974,7 +980,7 @@ async fn stats(Shared(app): Shared<Arc<App>>) -> Response {
 #[derive(Deserialize)]
 struct SearchParams {
     q: String,
-    /// `30m`, `12h`, `7d`, `2s` o `AAAA-MM-DD`.
+    /// `30m`, `12h`, `7d`, `2w` o `AAAA-MM-DD`.
     since: Option<String>,
     max: Option<usize>,
 }

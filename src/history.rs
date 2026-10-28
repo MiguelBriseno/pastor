@@ -215,6 +215,12 @@ impl Tail {
     pub fn stats(&self, today: NaiveDate) -> Stats {
         self.totals.stats(today)
     }
+
+    /// Lo que lleva gastado el agente `id`, sin armar todas las estadísticas.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn agent_spend(&self, id: &str) -> Option<Spend> {
+        self.totals.spend_by_agent.get(id).copied()
+    }
 }
 
 /// Días que muestra el gráfico de actividad.

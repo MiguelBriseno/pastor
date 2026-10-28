@@ -174,7 +174,7 @@ enum Cmd {
         /// Lo que buscar: los mensajes que tengan todas las palabras
         #[arg(required = true, value_name = "TEXTO")]
         text: Vec<String>,
-        /// Solo desde hace tanto (30m, 12h, 7d, 2s) o desde una fecha (AAAA-MM-DD)
+        /// Solo desde hace tanto (30m, 12h, 7d, 2w) o desde una fecha (AAAA-MM-DD)
         #[arg(long, value_name = "CUÁNDO")]
         desde: Option<String>,
         /// Cuántos mensajes mostrar como máximo

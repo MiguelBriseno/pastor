@@ -341,6 +341,13 @@ pub fn handle(event: &str) -> Result<()> {
     if event == "settle" {
         return settle(&id);
     }
+    if event == "usage" {
+        let current = std::env::var_os(TRANSCRIPT_VAR).map(PathBuf::from);
+        if let Some(agent) = loaded.ok().and_then(|s| s.find_agent(&id).ok().cloned()) {
+            usage::flush(&agent, current)?;
+        }
+        return Ok(());
+    }
     if !from_agent(&id) {
         drain();
         return Ok(());
@@ -364,16 +371,15 @@ pub fn handle(event: &str) -> Result<()> {
             log_error(event, &e);
         }
     }
-    // Al acabar un turno del hilo principal, lo que gastó.
+    // Al acabar un turno del hilo principal, lo que gastó. Aparte y sin
+    // esperarlo: la primera vez puede leer una transcripción de muchos MB, y
+    // Claude Code espera al hook.
     if event == "idle" && p.agent_id.is_none() {
-        if let Some(agent) = loaded
-            .as_ref()
-            .ok()
-            .and_then(|s| s.agents.iter().find(|a| a.id == id))
-        {
-            let transcript = p.transcript_path.as_deref().map(PathBuf::from);
-            usage::flush_quietly(agent, transcript.filter(|t| t.is_absolute()));
-        }
+        let transcript = p
+            .transcript_path
+            .as_deref()
+            .filter(|t| Path::new(t).is_absolute());
+        spawn_detached("usage", transcript.map(|t| (TRANSCRIPT_VAR, t)));
     }
     // Si el aviso no pide nada, ni candado ni lectura. Que no pida nada no
     // depende de los shells de los subagentes.
@@ -493,12 +499,24 @@ fn remember_session(
 /// Lanza `pastor hook settle` sin esperarlo: Claude Code espera al hook, y
 /// la pantalla aún no tiene su forma final (el diálogo, el resumen del turno).
 fn spawn_settle() {
+    spawn_detached("settle", None);
+}
+
+/// Con qué transcripción va `pastor hook usage`.
+const TRANSCRIPT_VAR: &str = "PASTOR_TRANSCRIPT";
+
+/// Lanza `pastor hook <event>` sin esperarlo, con `env` si se da.
+fn spawn_detached(event: &str, env: Option<(&str, &str)>) {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let Ok(exe) = pastor_exe() else { return };
+    let mut c = Command::new(exe);
+    c.args(["hook", event]);
+    if let Some((k, v)) = env {
+        c.env(k, v);
+    }
     // Sin heredar stdout: Claude Code esperaría a que se cierre.
-    let _ = Command::new(exe)
-        .args(["hook", "settle"])
+    let _ = c
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -326,7 +326,10 @@ fn read_new(path: &Path, r: &mut Cursor, since: DateTime<Utc>) -> Result<HashMap
 pub fn flush(agent: &Agent, current: Option<PathBuf>) -> Result<()> {
     let id = agent.id.as_str();
     let current = current.or_else(|| crate::transcript::path_for(id));
-    for (model, tokens) in read_agent(&dir(), id, agent.created_at, current)? {
+    // Ya con el candado: si lo quitaron mientras (`pastor kill` lee lo suyo
+    // y luego borra hasta dónde leyó), empezar de cero lo contaría dos veces.
+    let alive = || State::load().is_ok_and(|s| s.agents.iter().any(|a| a.id == id));
+    for (model, tokens) in read_agent(&dir(), id, agent.created_at, current, alive)? {
         history::record(Event::Usage {
             agent: id.to_string(),
             task: agent.task.clone(),
@@ -339,15 +342,20 @@ pub fn flush(agent: &Agent, current: Option<PathBuf>) -> Result<()> {
 
 /// Lo nuevo de todas las transcripciones conocidas del agente `id` (más
 /// `current` y las de sus subagentes), por modelo, y anota hasta dónde leyó.
+/// Con el candado tomado, nada si `alive` dice que el agente ya no está.
 fn read_agent(
     dir: &Path,
     id: &str,
     since: DateTime<Utc>,
     current: Option<PathBuf>,
+    alive: impl FnOnce() -> bool,
 ) -> Result<Vec<(String, Tokens)>> {
     fs::create_dir_all(dir)?;
     // Dos a la vez (el fin del turno y `pastor kill`) contarían lo mismo dos veces.
     let _lock = store::lock(&dir.join(format!("{id}.lock")))?;
+    if !alive() {
+        return Ok(Vec::new());
+    }
     let path = dir.join(format!("{id}.json"));
     let mut offsets: Offsets = fs::read(&path)
         .ok()
@@ -399,10 +407,11 @@ pub fn flush_quietly(agent: &Agent, current: Option<PathBuf>) {
     }
 }
 
-/// Olvida hasta dónde se leyó: el agente ya no existe.
+/// Olvida hasta dónde se leyó: el agente ya no existe. El `.lock` se queda,
+/// como el de los hooks: otro proceso puede estar esperándolo, y si se
+/// borrara, el siguiente bloquearía otro archivo. Lo quita `prune`.
 pub fn forget(id: &str) {
     let _ = fs::remove_file(offsets_path(id));
-    let _ = fs::remove_file(dir().join(format!("{id}.lock")));
 }
 
 /// Borra lo de los agentes que ya no están en el estado.
@@ -554,11 +563,22 @@ mod tests {
 
         // Con todo el agente: la del subagente también, y lo ya leído no
         // vuelve a contar.
-        let all = |dir: &Path| read_agent(dir, "a1", since, Some(main.clone())).unwrap();
+        let all = |dir: &Path| read_agent(dir, "a1", since, Some(main.clone()), || true).unwrap();
         let got = all(&state_dir);
         let models: Vec<_> = got.iter().map(|(m, t)| (m.as_str(), t.output)).collect();
         assert_eq!(models, [("claude-haiku-5-5", 3), ("claude-opus-5-5", 57)]);
         assert!(all(&state_dir).is_empty());
+        // Si el agente ya no está, no lee nada aunque haya algo nuevo.
+        writeln!(
+            f,
+            "{}",
+            assistant("m3", "claude-opus-5-5", "2026-10-02T10:02:00Z", 9)
+        )
+        .unwrap();
+        f.flush().unwrap();
+        let gone = read_agent(&state_dir, "a1", since, Some(main.clone()), || false).unwrap();
+        assert!(gone.is_empty());
+        assert_eq!(all(&state_dir).len(), 1);
         let offsets: Offsets =
             serde_json::from_slice(&fs::read(state_dir.join("a1.json")).unwrap()).unwrap();
         assert!(offsets.files.contains_key(&sub));

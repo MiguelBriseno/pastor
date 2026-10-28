@@ -21,6 +21,10 @@ pub struct Message {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    /// De una herramienta, su entrada entera (el comando, la ruta, el
+    /// texto que escribió…), para buscar en ella: `text` es solo un resumen.
+    #[serde(skip)]
+    pub input: Option<String>,
 }
 
 /// Comienzos de lo que Claude Code inyecta como mensaje del usuario.
@@ -64,6 +68,7 @@ pub fn parse_line_of(line: &str, subagent: bool) -> Vec<Message> {
         role,
         text,
         at: at.clone(),
+        input: None,
     };
     let content = &v["message"]["content"];
     match v["type"].as_str() {
@@ -98,12 +103,30 @@ pub fn parse_line_of(line: &str, subagent: bool) -> Vec<Message> {
                     let t = b["text"].as_str()?.trim();
                     (!t.is_empty()).then(|| msg("assistant", t.to_string()))
                 }
-                "tool_use" => Some(msg("tool", tool_summary(b))),
+                "tool_use" => Some(Message {
+                    input: Some(input_text(&b["input"])),
+                    ..msg("tool", tool_summary(b))
+                }),
                 _ => None,
             })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Los textos de la entrada de una herramienta, uno por línea.
+fn input_text(input: &Value) -> String {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(input, &mut out);
+    out.join("\n")
 }
 
 /// `Bash · lo que hace`: el nombre y lo más claro de su entrada.

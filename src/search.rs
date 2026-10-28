@@ -38,7 +38,8 @@ pub struct Hit {
     pub cwd: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<DateTime<Utc>>,
-    /// `user`, `assistant` o `tool`.
+    /// `user`, `assistant`, `tool` o `parent` (el agente principal, en la
+    /// conversación de un subagente).
     pub role: &'static str,
     /// El trozo del mensaje alrededor de lo que se buscó, en una línea.
     pub snippet: String,
@@ -53,6 +54,7 @@ impl Hit {
     pub fn who(&self) -> &'static str {
         match self.role {
             "user" => "tú",
+            "parent" => "agente principal",
             "tool" => "herramienta",
             _ => "agente",
         }
@@ -91,8 +93,8 @@ impl Query {
     }
 }
 
-/// Desde cuándo buscar: `30m`, `12h`, `7d`, `2s` (semanas) o una fecha
-/// `AAAA-MM-DD`.
+/// Desde cuándo buscar: `30m`, `12h`, `7d`, `2w` (semanas) o una fecha
+/// `AAAA-MM-DD`. Sin segundos: `s` sería ambiguo (¿segundos o semanas?).
 pub fn parse_since(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim();
     if let Ok(day) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
@@ -106,13 +108,13 @@ pub fn parse_since(s: &str) -> Result<DateTime<Utc>> {
     let unit = s.chars().last().unwrap_or(' ');
     let n: u32 = s[..s.len() - unit.len_utf8().min(s.len())]
         .parse()
-        .map_err(|_| anyhow::anyhow!("no entiendo «{s}»: usa 30m, 12h, 7d, 2s o AAAA-MM-DD"))?;
+        .map_err(|_| anyhow::anyhow!("no entiendo «{s}»: usa 30m, 12h, 7d, 2w o AAAA-MM-DD"))?;
     let span = match unit {
         'm' => Duration::minutes(n.into()),
         'h' => Duration::hours(n.into()),
         'd' => Duration::days(n.into()),
-        's' | 'w' => Duration::weeks(n.into()),
-        _ => bail!("no entiendo «{s}»: usa 30m, 12h, 7d, 2s o AAAA-MM-DD"),
+        'w' => Duration::weeks(n.into()),
+        _ => bail!("no entiendo «{s}»: usa 30m, 12h, 7d, 2w o AAAA-MM-DD"),
     };
     // Con un número enorme se saldría de las fechas posibles.
     Utc::now()
@@ -234,17 +236,29 @@ fn search_file(
             if q.since.is_some_and(|since| at.is_none_or(|at| at < since)) {
                 continue;
             }
-            if !q.matches(&m.text) {
+            // De una herramienta, el resumen y su entrada entera: el
+            // comando de un Bash con descripción no sale en el resumen.
+            let text = match &m.input {
+                Some(input) if !q.matches(&m.text) => format!("{}\n{input}", m.text),
+                _ => m.text,
+            };
+            if !q.matches(&text) {
                 continue;
             }
+            // En la de un subagente, lo que llega como del usuario lo
+            // escribió el agente principal al lanzarlo.
+            let role = match m.role {
+                "user" if subagent => "parent",
+                r => r,
+            };
             hits.push(Hit {
                 agent: s.agent.clone(),
                 name: s.name.clone(),
                 cwd: s.cwd.clone(),
                 at,
-                role: m.role,
-                snippet: snippet(&m.text, &q.words[0], 160),
-                text: m.text,
+                role,
+                snippet: snippet(&text, &q.words[0], 160),
+                text,
                 alive,
             });
         }
@@ -301,6 +315,42 @@ mod tests {
     }
 
     #[test]
+    fn busca_en_la_entrada_de_las_herramientas_y_marca_al_agente_principal() {
+        let dir = std::env::temp_dir().join(format!("pastor-search-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("s.jsonl");
+        let sub = dir.join("sub.jsonl");
+        fs::write(
+            &main,
+            r#"{"type":"assistant","timestamp":"2026-10-02T10:00:00Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"rg auth.rs src/","description":"Busca usos"}}]}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        fs::write(
+            &sub,
+            r#"{"type":"user","isSidechain":true,"message":{"content":"Revisa auth.rs"}}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let src = Source {
+            agent: "a1".into(),
+            name: "api".into(),
+            cwd: dir.clone(),
+            transcript: main.clone(),
+        };
+        let q = Query::new("auth.rs", None, MAX).unwrap();
+        let mut hits = Vec::new();
+        search_file(&main, false, &q, &src, true, &mut hits).unwrap();
+        search_file(&sub, true, &q, &src, true, &mut hits).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].role, "tool");
+        assert!(hits[0].text.starts_with("Bash · Busca usos\n"));
+        assert!(hits[0].snippet.contains("rg auth.rs"));
+        assert_eq!(hits[1].who(), "agente principal");
+    }
+
+    #[test]
     fn trozo_alrededor_de_la_palabra() {
         let text = format!("{} aquí está auth.rs\ny sigue", "x ".repeat(100));
         let s = snippet(&text, "auth", 40);
@@ -316,7 +366,8 @@ mod tests {
         let near = |t: DateTime<Utc>, d: Duration| (now - d - t).num_seconds().abs() < 5;
         assert!(near(parse_since("7d").unwrap(), Duration::days(7)));
         assert!(near(parse_since("12h").unwrap(), Duration::hours(12)));
-        assert!(near(parse_since("2s").unwrap(), Duration::weeks(2)));
+        assert!(near(parse_since("2w").unwrap(), Duration::weeks(2)));
+        assert!(parse_since("30s").is_err());
         assert!(parse_since("2026-10-01").is_ok());
         assert!(parse_since("ayer").is_err());
         // Hacia el futuro no tiene sentido.

@@ -1744,7 +1744,7 @@ function searchPanel() {
   const input = h("input", { type: "search", placeholder: "Qué buscar (p. ej. auth.rs)", enterkeyhint: "search" });
   const results = h("div", { class: "cards" });
   const when = (iso) => new Date(iso).toLocaleString("es", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  const WHO = { user: "tú", assistant: "agente", tool: "herramienta" };
+  const WHO = { user: "tú", parent: "agente principal", assistant: "agente", tool: "herramienta" };
   const hit = (x) => h(x.alive ? "a" : "div", { class: "card hit", href: x.alive ? "#/agent/" + encodeURIComponent(x.agent) : undefined },
     h("div", { class: "card-main" },
       h("div", { class: "card-meta" },
