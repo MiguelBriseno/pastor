@@ -37,21 +37,25 @@ const INJECTED: [&str; 7] = [
 /// Los mensajes de una línea del JSONL: los tuyos, las respuestas del agente
 /// y una línea por herramienta. Fuera el razonamiento, los resultados de las
 /// herramientas, los subagentes y los registros internos.
+// Sin `serve`, solo la búsqueda lee transcripciones, con `parse_line_of`.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
 pub fn parse_line(line: &str) -> Vec<Message> {
+    parse_line_of(line, false)
+}
+
+/// Como `parse_line`; con `subagent`, la línea es de la transcripción de un
+/// subagente, donde todas van marcadas como `isSidechain`.
+pub fn parse_line_of(line: &str, subagent: bool) -> Vec<Message> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
     };
     // Subagentes, registros internos y el resumen que Claude Code escribe al
     // compactar (llega como un mensaje tuyo).
     let flag = |k: &str| v[k].as_bool() == Some(true);
-    if [
-        "isSidechain",
-        "isMeta",
-        "isCompactSummary",
-        "isVisibleInTranscriptOnly",
-    ]
-    .iter()
-    .any(|k| flag(k))
+    if (!subagent && flag("isSidechain"))
+        || ["isMeta", "isCompactSummary", "isVisibleInTranscriptOnly"]
+            .iter()
+            .any(|k| flag(k))
     {
         return Vec::new();
     }
@@ -134,6 +138,7 @@ pub fn path_for(id: &str) -> Option<PathBuf> {
 /// Lee una transcripción por partes: recuerda hasta dónde llegó y solo lee
 /// lo nuevo. Una de una sesión larga pasa de 10 MB.
 #[derive(Default)]
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
 pub struct Reader {
     path: PathBuf,
     offset: u64,
@@ -144,6 +149,7 @@ pub struct Reader {
     pub resets: u32,
 }
 
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
 impl Reader {
     pub fn update(&mut self, path: &Path) -> Result<()> {
         let mut f = File::open(path)

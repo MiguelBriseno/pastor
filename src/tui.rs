@@ -35,10 +35,12 @@ use crate::files::Source;
 use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::limits::{self, Usage};
-use crate::ops::{self, AssignTarget, Place, Snapshot, Tracker};
+use crate::ops::{self, AssignTarget, Overlap, Place, Snapshot, Tracker};
 use crate::remote;
+use crate::search::{self, Hit};
 use crate::store::{self, Agent, State, Task, TaskStatus, Worktree};
 use crate::text::{self, truncate};
+use crate::usage;
 use crate::worktree;
 
 const REFRESH: Duration = Duration::from_secs(1);
@@ -50,6 +52,8 @@ pub(crate) const ACCENT: Color = Color::Magenta;
 const LABEL_W: usize = 14;
 /// Nombre del hilo que observa los paneles.
 const OBSERVER: &str = "observador";
+/// Cada cuánto se miran los archivos en común de los worktrees.
+const OVERLAPS_EVERY: Duration = Duration::from_secs(10);
 /// Nombre del hilo que ejecuta las acciones.
 const ACTIONS: &str = "acciones";
 /// Último pánico del observador, para mostrarlo al reiniciarlo.
@@ -148,6 +152,10 @@ enum Mode {
         msg: String,
         action: Pending,
     },
+    /// Qué buscar en las conversaciones.
+    Search {
+        input: String,
+    },
 }
 
 enum Pending {
@@ -185,6 +193,13 @@ impl AssignForm {
     }
 }
 
+/// Lo que encontró la última búsqueda, en la pestaña Historial.
+struct Found {
+    query: String,
+    hits: Vec<Hit>,
+    sel: ListState,
+}
+
 struct App {
     tab: Tab,
     mode: Mode,
@@ -216,6 +231,10 @@ struct App {
     flash: Option<(String, Instant)>,
     stats: Stats,
     limits: Vec<Usage>,
+    /// Los archivos que cambian a la vez dos tareas (o agentes con
+    /// worktree), por id de la tarea o del agente.
+    overlaps: HashMap<String, Vec<Overlap>>,
+    search: Option<Found>,
     /// Tamaño al que debe dibujar el agente que se ve (id, columnas, filas),
     /// y el último que se le pidió: solo se le pide otra vez si cambia, o
     /// si vuelves a usar la TUI (el celular pudo haberlo cambiado).
@@ -256,6 +275,8 @@ impl App {
             flash: None,
             stats: Stats::default(),
             limits: Vec::new(),
+            overlaps: HashMap::new(),
+            search: None,
             want_fit: None,
             fitted: None,
             want_since: Instant::now(),
@@ -323,6 +344,9 @@ impl App {
                 }
                 if let Some(limits) = pass.limits {
                     self.limits = limits;
+                }
+                if let Some(overlaps) = pass.overlaps {
+                    self.overlaps = overlaps;
                 }
                 // Al volver de un agente pueden ser varios: que se vean todos.
                 if !pass.flashes.is_empty() {
@@ -395,6 +419,18 @@ impl App {
                         self.set_flash(msg);
                         let i = self.state.agents.iter().position(|a| a.id == id);
                         self.agent_sel.select(i);
+                    }
+                    Done::Search { query, hits } => {
+                        self.set_flash(match hits.len() {
+                            0 => format!("Nada con «{query}»"),
+                            1 => "1 mensaje".to_string(),
+                            n if n >= search::MAX => format!("Los {n} mensajes más recientes"),
+                            n => format!("{n} mensajes"),
+                        });
+                        let mut sel = ListState::default();
+                        sel.select((!hits.is_empty()).then_some(0));
+                        self.search = Some(Found { query, hits, sel });
+                        self.tab = Tab::History;
                     }
                     Done::Quiet => {}
                 }
@@ -586,7 +622,7 @@ impl App {
                 _ => return,
             },
             Mode::Send { input, .. } | Mode::Reject { input, .. } => (input, true),
-            Mode::Term { input, .. } => (input, false),
+            Mode::Term { input, .. } | Mode::Search { input } => (input, false),
             Mode::NewTask {
                 title, desc, field, ..
             } => match field {
@@ -619,7 +655,8 @@ impl App {
             _ => match self.tab {
                 Tab::Agents => self.on_agents(key, term)?,
                 Tab::Tasks => self.on_tasks(key, term)?,
-                Tab::Dashboard | Tab::History => {}
+                Tab::History => self.on_history(key),
+                Tab::Dashboard => {}
             },
         }
         Ok(())
@@ -730,6 +767,46 @@ impl App {
         Ok(())
     }
 
+    /// En Historial: `/` busca; con resultados, se recorren y ⏎ va al agente.
+    fn on_history(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('/') {
+            let input = self
+                .search
+                .as_ref()
+                .map(|f| f.query.clone())
+                .unwrap_or_default();
+            self.mode = Mode::Search { input };
+            return;
+        }
+        let Some(found) = self.search.as_mut() else {
+            return;
+        };
+        let n = found.hits.len();
+        match key.code {
+            KeyCode::Esc => self.search = None,
+            KeyCode::Up | KeyCode::Char('k') => found.sel.select(step(found.sel.selected(), n, -1)),
+            KeyCode::Down | KeyCode::Char('j') => {
+                found.sel.select(step(found.sel.selected(), n, 1))
+            }
+            KeyCode::Enter => {
+                let Some(hit) = found.sel.selected().and_then(|i| found.hits.get(i)) else {
+                    return;
+                };
+                match self.state.agents.iter().position(|a| a.id == hit.agent) {
+                    Some(i) => {
+                        self.agent_sel.select(Some(i));
+                        self.tab = Tab::Agents;
+                    }
+                    None => {
+                        let msg = format!("{} ya terminó", hit.name);
+                        self.set_flash(msg);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn on_tasks(&mut self, key: KeyEvent, term: &mut DefaultTerminal) -> Result<()> {
         let n = self.state.tasks.len();
         let task = self.selected_task().cloned();
@@ -795,7 +872,7 @@ impl App {
             }
             KeyCode::Char('A') => {
                 if let Some(t) = task {
-                    let msg = match &t.worktree {
+                    let mut msg = match &t.worktree {
                         Some(wt) => format!(
                             "¿Integrar {} en {} y terminar a su agente?",
                             wt.branch,
@@ -803,6 +880,12 @@ impl App {
                         ),
                         None => format!("¿Dar la tarea {} por hecha?", t.id),
                     };
+                    if let Some(list) = self.overlaps.get(&t.id).filter(|_| t.worktree.is_some()) {
+                        msg = format!(
+                            "Ojo: cambia {}. {msg}",
+                            ops::describe_overlaps(&self.state, list)
+                        );
+                    }
                     self.mode = Mode::Confirm {
                         msg,
                         action: Pending::ApproveTask(t.id),
@@ -1039,6 +1122,25 @@ impl App {
                 } else {
                     edit(&mut input, &key);
                     self.mode = Mode::Reject { task, input };
+                }
+            }
+            Mode::Search { mut input } => {
+                if key.code == KeyCode::Enter {
+                    let query = input.trim().to_string();
+                    if query.is_empty() {
+                        self.set_flash("Escribe qué buscar".to_string());
+                        self.mode = Mode::Search { input };
+                        return Ok(());
+                    }
+                    self.set_flash(format!("Buscando «{query}»…"));
+                    self.actions.run(Some(Mode::Search { input }), move || {
+                        let q = search::Query::new(&query, None, search::MAX)?;
+                        let hits = search::run(&q)?;
+                        Ok(Done::Search { query, hits })
+                    });
+                } else {
+                    edit(&mut input, &key);
+                    self.mode = Mode::Search { input };
                 }
             }
             Mode::Confirm { action, .. } => {
@@ -1302,6 +1404,11 @@ impl App {
                 truncate(&t.title, 50)
             ));
         }
+        if let Some(spend) = self.stats.spend_by_agent.get(&a.id) {
+            block = block.title_bottom(
+                Line::from(format!(" {} ", spend.short()).dark_gray()).right_aligned(),
+            );
+        }
         f.render_widget(Paragraph::new(text).block(block), right);
         self.want_fit = Some(fit);
     }
@@ -1339,14 +1446,27 @@ impl App {
                         }
                         None => Line::from("-".dark_gray()),
                     };
+                    let title = match self.overlaps.contains_key(&t.id) {
+                        true => Line::from(vec![
+                            Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+                            Span::raw(t.title.clone()),
+                        ]),
+                        false => Line::from(t.title.clone()),
+                    };
+                    let cost = self
+                        .stats
+                        .spend_by_task
+                        .get(&t.id)
+                        .map_or_else(|| "-".to_string(), usage::Spend::cost_label);
                     Row::new(vec![
                         Cell::from(t.id.clone()),
                         Cell::from(Span::styled(
                             format!("{}{}", pad(ic.task_status(t.status)), t.status.label()),
                             Style::default().fg(task_color(t.status)),
                         )),
-                        Cell::from(t.title.clone()),
+                        Cell::from(title),
                         Cell::from(agent),
+                        Cell::from(Line::from(cost.dark_gray()).right_aligned()),
                     ])
                 })
                 .collect();
@@ -1357,10 +1477,11 @@ impl App {
                     Constraint::Length(14),
                     Constraint::Min(10),
                     Constraint::Length(22),
+                    Constraint::Length(10),
                 ],
             )
             .header(
-                Row::new(["ID", "Estado", "Título", "Agente"])
+                Row::new(["ID", "Estado", "Título", "Agente", "    Gasto"])
                     .style(Style::default().fg(Color::DarkGray).bold()),
             )
             .block(block)
@@ -1378,6 +1499,27 @@ impl App {
                 desc.push_line(Line::from(
                     "v ver cambios · A aprobar e integrar · r pedir cambios".dark_gray(),
                 ));
+            }
+            for o in self.overlaps.get(&t.id).into_iter().flatten() {
+                desc.push_line(Line::from(vec![
+                    Span::styled(
+                        format!("⚠ También los cambia {}: ", o.with.label(&self.state)),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(o.files.join(", ")),
+                ]));
+            }
+            if let Some(spend) = self.stats.spend_by_task.get(&t.id) {
+                desc.push_line(Line::from(
+                    format!(
+                        "Gasto: {} (precio de la API) · {}",
+                        spend.short(),
+                        breakdown(&spend.tokens)
+                    )
+                    .dark_gray(),
+                ));
+            }
+            if !desc.lines.is_empty() {
                 desc.push_line(Line::raw(""));
             }
             if t.description.is_empty() {
@@ -1501,6 +1643,28 @@ impl App {
                 Span::raw(format!("{} {} — revisar", t.id, t.title)),
             ])));
         }
+        // Cada par una vez: el aviso de la tarea con el id menor.
+        let mut keys: Vec<&String> = self.overlaps.keys().collect();
+        keys.sort();
+        for id in keys {
+            for o in &self.overlaps[id] {
+                let other = match &o.with {
+                    ops::With::Task(t) | ops::With::Agent(t) if t < id => continue,
+                    w => w.label(&self.state),
+                };
+                let who = match self.state.find_task(id) {
+                    Ok(_) => id.clone(),
+                    Err(_) => format!("el agente {}", self.agent_name(id)),
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(" ⚠ ", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(
+                        "{who} y {other} cambian {}",
+                        truncate(&o.files.join(", "), 60)
+                    )),
+                ])));
+            }
+        }
         if items.is_empty() {
             items.push(ListItem::new(" Nada pendiente ✓".dark_gray()));
         }
@@ -1615,15 +1779,49 @@ impl App {
         }
     }
 
-    fn draw_history(&self, f: &mut Frame, area: Rect) {
+    fn draw_history(&mut self, f: &mut Frame, area: Rect) {
+        if self.search.is_some() {
+            return self.draw_search(f, area);
+        }
         let ic = icons::get();
         let s = &self.stats;
-        let [r1, r2, r3] = Layout::vertical([
+        let [r1, r2, r_usage, r3] = Layout::vertical([
+            Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Min(0),
         ])
         .areas(area);
+        let [a, b, c, d] = Layout::horizontal([Constraint::Ratio(1, 4); 4]).areas(r_usage);
+        stat(
+            f,
+            a,
+            "tokens de Claude",
+            usage::tokens(s.spend.tokens.total()),
+            kind_color(Kind::Claude),
+        );
+        stat(
+            f,
+            b,
+            "costo (precio de la API)",
+            s.spend.cost_label(),
+            Color::Yellow,
+        );
+        stat(
+            f,
+            c,
+            "costo de hoy",
+            s.spend_today.cost_label(),
+            Color::Yellow,
+        );
+        stat(
+            f,
+            d,
+            "costo medio por tarea",
+            s.avg_task_cost
+                .map_or_else(|| "—".to_string(), |c| format!("≈ {}", usage::dollars(c))),
+            Color::Yellow,
+        );
 
         let since = s.since.map_or_else(
             || "—".to_string(),
@@ -1770,6 +1968,84 @@ impl App {
         );
     }
 
+    /// Los resultados de la búsqueda: la lista y, abajo, el mensaje elegido.
+    fn draw_search(&mut self, f: &mut Frame, area: Rect) {
+        let Some(found) = self.search.as_mut() else {
+            return;
+        };
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(area);
+        let width = top.width.saturating_sub(2) as usize;
+        let items: Vec<ListItem> = found
+            .hits
+            .iter()
+            .map(|h| {
+                let when = h.at.map_or_else(
+                    || "—".to_string(),
+                    |t| t.with_timezone(&Local).format("%d/%m %H:%M").to_string(),
+                );
+                let head = format!(" {when}  {} · {}  ", h.name, h.who());
+                let room = width.saturating_sub(text::width(&head));
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {when}  "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        h.name.clone(),
+                        Style::default()
+                            .fg(if h.alive {
+                                Color::White
+                            } else {
+                                Color::DarkGray
+                            })
+                            .bold(),
+                    ),
+                    Span::styled(
+                        format!(" · {}  ", h.who()),
+                        Style::default().fg(match h.role {
+                            "user" => Color::Cyan,
+                            "tool" => Color::Yellow,
+                            _ => ACCENT,
+                        }),
+                    ),
+                    Span::raw(truncate(&h.snippet, room.max(8))),
+                ]))
+            })
+            .collect();
+        let title = format!(" {}«{}» ", pad(icons::get().history), found.query);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(title)
+            .title_bottom(Line::from(
+                " más recientes primero · en gris los agentes que ya terminaron ".dark_gray(),
+            ));
+        if items.is_empty() {
+            let p = Paragraph::new("\nNo hay mensajes con eso.\n\nPulsa / para buscar otra cosa.")
+                .alignment(Alignment::Center)
+                .block(block);
+            f.render_widget(p, top);
+        } else {
+            let list = List::new(items)
+                .block(block)
+                .highlight_style(Style::default().bg(SELECTED));
+            f.render_stateful_widget(list, top, &mut found.sel);
+        }
+        let hit = found.sel.selected().and_then(|i| found.hits.get(i));
+        let (title, body) = match hit {
+            Some(h) => (
+                format!(" {} · {} · {} ", h.name, h.who(), tilde(&h.cwd)),
+                h.text.clone(),
+            ),
+            None => (" Mensaje ".to_string(), String::new()),
+        };
+        f.render_widget(
+            Paragraph::new(body).wrap(Wrap { trim: false }).block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(title),
+            ),
+            bottom,
+        );
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         if let Some((msg, _)) = &self.flash {
             f.render_widget(
@@ -1814,9 +2090,24 @@ impl App {
                 ("Tab pestaña", 2),
                 ("q salir", 0),
             ],
-            (Mode::Normal, Tab::Dashboard | Tab::History) => {
+            (Mode::Normal, Tab::History) if self.search.is_some() => &[
+                ("↑↓ mover", 1),
+                ("⏎ ir al agente", 0),
+                ("/ buscar otra cosa", 0),
+                ("Esc volver", 0),
+                ("Tab pestaña", 2),
+                ("q salir", 0),
+            ],
+            (Mode::Normal, Tab::History) => &[
+                ("/ buscar en las conversaciones", 0),
+                ("1-4 pestañas", 1),
+                ("Tab siguiente", 1),
+                ("q salir", 0),
+            ],
+            (Mode::Normal, Tab::Dashboard) => {
                 &[("1-4 pestañas", 0), ("Tab siguiente", 0), ("q salir", 0)]
             }
+            (Mode::Search { .. }, _) => &[("⏎ buscar", 0), ("Esc cancelar", 0)],
             (Mode::Confirm { .. }, _) => &[("y confirmar", 0), ("cualquier otra tecla cancela", 0)],
             (Mode::Assign(form), _) if form.new_selected() => &[
                 ("↑↓ elegir", 0),
@@ -1963,8 +2254,24 @@ impl App {
                 f.render_widget(Paragraph::new(lines), inner);
             }
             Mode::Confirm { msg, .. } => {
-                let inner = popup(f, " Confirmar ", 50, 4);
-                let lines = vec![Line::raw(""), Line::from(format!(" {msg}  (y/n)").bold())];
+                let w = modal_width(f, 70);
+                let text = format!(" {msg}  (y/n)");
+                // Lo que ocupa con el ajuste de línea, a ojo: un aviso largo
+                // (archivos en común) no cabe en una.
+                let rows = text::width(&text).div_ceil(w.saturating_sub(4).max(1) as usize);
+                let inner = popup(f, " Confirmar ", w, rows as u16 + 3);
+                let lines = vec![Line::raw(""), Line::from(text.bold())];
+                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+            }
+            Mode::Search { input } => {
+                let w = modal_width(f, 80);
+                let mut lines = vec![Line::raw("")];
+                lines.extend(keep_tail(field_lines("Buscar", input, true, w), 3));
+                lines.extend([Line::from(
+                        "  En las conversaciones de los agentes de Claude, también los que ya terminaron."
+                            .dark_gray(),
+                )]);
+                let inner = popup(f, " Buscar ", w, lines.len() as u16 + 2);
                 f.render_widget(Paragraph::new(lines), inner);
             }
         }
@@ -2031,6 +2338,17 @@ fn suspend<T>(term: &mut DefaultTerminal, f: impl FnOnce() -> Result<T>) -> Resu
     Ok(result)
 }
 
+/// `entrada 1.2k · salida 34k · caché 12M leídos, 300k escritos`.
+fn breakdown(t: &usage::Tokens) -> String {
+    format!(
+        "entrada {} · salida {} · caché {} leídos, {} escritos",
+        usage::tokens(t.input),
+        usage::tokens(t.output),
+        usage::tokens(t.cache_read),
+        usage::tokens(t.cache_write_5m + t.cache_write_1h)
+    )
+}
+
 /// Las últimas `h` líneas con contenido de una pantalla capturada.
 fn tail(screen: &str, h: usize) -> String {
     let mut lines: Vec<&str> = screen.lines().collect();
@@ -2049,6 +2367,8 @@ struct Pass {
     stats: Option<Stats>,
     /// Solo si se volvieron a leer.
     limits: Option<Vec<Usage>>,
+    /// Solo si se volvieron a calcular.
+    overlaps: Option<HashMap<String, Vec<Overlap>>>,
     /// Avisos de agentes que terminaron o necesitan atención.
     flashes: Vec<String>,
 }
@@ -2059,6 +2379,7 @@ impl Pass {
         self.flashes = [old.flashes, self.flashes].concat();
         self.stats = self.stats.or(old.stats);
         self.limits = self.limits.or(old.limits);
+        self.overlaps = self.overlaps.or(old.overlaps);
         self.snaps = self.snaps.or(old.snaps);
         self
     }
@@ -2075,6 +2396,8 @@ struct Watch {
     day: Option<NaiveDate>,
     /// Si la pasada anterior no pudo preguntar a tmux: se avisa una vez.
     failing: bool,
+    /// Cuándo se calcularon los archivos en común de los worktrees.
+    overlaps_at: Option<Instant>,
 }
 
 impl Watch {
@@ -2107,6 +2430,7 @@ impl Watch {
             snaps: Some(snaps),
             stats,
             limits: None,
+            overlaps: None,
             flashes,
         })
     }
@@ -2166,6 +2490,19 @@ impl Observer {
                             ..Pass::default()
                         });
                     }
+                    // Corre git en cada worktree: no en cada pasada.
+                    if watch
+                        .overlaps_at
+                        .is_none_or(|t| t.elapsed() >= OVERLAPS_EVERY)
+                    {
+                        watch.overlaps_at = Some(Instant::now());
+                        if let Ok(state) = State::load() {
+                            publish(Pass {
+                                overlaps: Some(ops::overlaps(&state)),
+                                ..Pass::default()
+                            });
+                        }
+                    }
                 }
             })
             // Lo mismo que haría `thread::spawn`.
@@ -2201,6 +2538,11 @@ enum Done {
     Agent {
         id: String,
         msg: String,
+    },
+    /// Terminó una búsqueda: se ven sus resultados.
+    Search {
+        query: String,
+        hits: Vec<Hit>,
     },
     Quiet,
 }

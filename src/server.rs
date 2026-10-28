@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{self, CloseFrame, WebSocket, WebSocketUpgrade};
@@ -34,6 +35,7 @@ use crate::store::{self, Agent, State, TaskStatus};
 use crate::syntax::{self, Colors};
 use crate::tmux;
 use crate::transcript;
+use crate::{search, usage};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7433";
 
@@ -47,6 +49,9 @@ struct App {
     history: Mutex<history::Tail>,
     /// Los límites de uso leídos, para no preguntar en cada consulta.
     limits: Mutex<limits::Cache>,
+    /// Los archivos en común de los worktrees y cuándo se calcularon: corre
+    /// git en cada uno, no en cada consulta de las tareas.
+    overlaps: Mutex<Option<(Instant, Overlaps)>>,
     /// Pasa a `true` al apagarse, para que las terminales abiertas intenten
     /// despedirse. axum no espera a los WebSocket: si no alcanzan, al soltar
     /// el runtime el `Drop` de cada `Pty` igual cierra su tmux.
@@ -77,6 +82,7 @@ pub fn run(bind: SocketAddr) -> Result<()> {
         transcripts: Mutex::default(),
         history: Mutex::default(),
         limits: Mutex::default(),
+        overlaps: Mutex::default(),
         closing: tokio::sync::watch::Sender::new(false),
     });
     let closing = app.closing.clone();
@@ -124,6 +130,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/tasks/{id}/approve", post(approve_task))
         .route("/tasks/{id}/reject", post(reject_task))
         .route("/stats", get(stats))
+        .route("/search", get(search_messages))
         .route("/limits", get(limits))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no existe esa ruta") })
         .layer(middleware::from_fn_with_state(app.clone(), auth));
@@ -419,6 +426,36 @@ struct AgentView {
     /// El repositorio en el que trabaja (o su directorio), para agruparlo.
     project: PathBuf,
     project_name: String,
+    /// Lo que lleva gastado, si es de Claude Code y ya terminó algún turno.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<usage::Spend>,
+}
+
+/// Las estadísticas del historial, leyendo solo lo nuevo.
+fn current_stats(app: &App) -> history::Stats {
+    let mut tail = app.history.lock().unwrap_or_else(PoisonError::into_inner);
+    tail.refresh();
+    tail.stats(chrono::Local::now().date_naive())
+}
+
+/// Los archivos en común, por id de la tarea o del agente.
+type Overlaps = HashMap<String, Vec<ops::Overlap>>;
+
+/// Cada cuánto se vuelven a mirar los archivos en común de los worktrees.
+const OVERLAPS_EVERY: Duration = Duration::from_secs(10);
+
+/// Los archivos en común de los worktrees, recalculados como mucho cada
+/// `OVERLAPS_EVERY`.
+fn current_overlaps(app: &App, state: &State) -> Overlaps {
+    let mut cache = app.overlaps.lock().unwrap_or_else(PoisonError::into_inner);
+    match &*cache {
+        Some((at, o)) if at.elapsed() < OVERLAPS_EVERY => o.clone(),
+        _ => {
+            let o = ops::overlaps(state);
+            *cache = Some((Instant::now(), o.clone()));
+            o
+        }
+    }
 }
 
 // ---------- agentes ----------
@@ -430,6 +467,7 @@ async fn list_agents(Shared(app): Shared<Arc<App>>) -> Response {
             let mut tracker = app.tracker.lock().unwrap_or_else(PoisonError::into_inner);
             ops::observe(&state, &mut tracker)?
         };
+        let mut stats = current_stats(&app);
         Ok(state
             .agents
             .into_iter()
@@ -438,6 +476,7 @@ async fn list_agents(Shared(app): Shared<Arc<App>>) -> Response {
                 AgentView {
                     project: a.project().to_path_buf(),
                     project_name: a.project_name(),
+                    usage: stats.spend_by_agent.remove(&a.id),
                     agent: a,
                     status: st.key(),
                     status_label: st.label(),
@@ -788,8 +827,49 @@ async fn write_file(Path(id): Path<String>, Body(req): Body<Write>) -> Response 
 
 // ---------- tareas ----------
 
-async fn list_tasks() -> Response {
-    blocking(|| Ok(State::load()?.tasks)).await
+#[derive(Serialize)]
+struct TaskView {
+    #[serde(flatten)]
+    task: store::Task,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<usage::Spend>,
+    /// Los archivos que cambia también otra tarea, otro agente o tu rama.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    overlaps: Vec<OverlapView>,
+}
+
+#[derive(Serialize)]
+struct OverlapView {
+    #[serde(flatten)]
+    overlap: ops::Overlap,
+    /// `t4 (web)`, `el agente web` o `tu rama`.
+    label: String,
+}
+
+async fn list_tasks(Shared(app): Shared<Arc<App>>) -> Response {
+    blocking(move || {
+        let state = State::load()?;
+        let mut stats = current_stats(&app);
+        let mut overlaps = current_overlaps(&app, &state);
+        Ok(state
+            .tasks
+            .iter()
+            .map(|t| TaskView {
+                usage: stats.spend_by_task.remove(&t.id),
+                overlaps: overlaps
+                    .remove(&t.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|o| OverlapView {
+                        label: o.with.label(&state),
+                        overlap: o,
+                    })
+                    .collect(),
+                task: t.clone(),
+            })
+            .collect::<Vec<_>>())
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -869,11 +949,7 @@ async fn delete_task(Path(id): Path<String>) -> Response {
 /// Las estadísticas de la pestaña Historial. Las duraciones van en segundos.
 async fn stats(Shared(app): Shared<Arc<App>>) -> Response {
     blocking(move || {
-        let s = {
-            let mut tail = app.history.lock().unwrap_or_else(PoisonError::into_inner);
-            tail.refresh();
-            tail.stats(chrono::Local::now().date_naive())
-        };
+        let s = current_stats(&app);
         Ok(json!({
             "since": s.since,
             "sessions": s.sessions,
@@ -887,7 +963,29 @@ async fn stats(Shared(app): Shared<Arc<App>>) -> Response {
             "by_kind": Kind::ALL.iter().zip(&s.by_kind).map(|(k, n)| json!({ "kind": k, "sessions": n })).collect::<Vec<_>>(),
             "projects": s.projects.iter().map(|(p, n)| json!({ "path": p, "sessions": n })).collect::<Vec<_>>(),
             "daily": s.daily.iter().map(|(d, n)| json!({ "day": d, "events": n })).collect::<Vec<_>>(),
+            "usage": s.spend,
+            "usage_today": s.spend_today,
+            "avg_task_cost": s.avg_task_cost,
         }))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: String,
+    /// `30m`, `12h`, `7d`, `2s` o `AAAA-MM-DD`.
+    since: Option<String>,
+    max: Option<usize>,
+}
+
+/// Busca en las conversaciones de los agentes de Claude, lo más reciente
+/// primero.
+async fn search_messages(Params(p): Params<SearchParams>) -> Response {
+    blocking(move || {
+        let since = p.since.as_deref().map(search::parse_since).transpose()?;
+        let max = p.max.unwrap_or(search::MAX).min(500);
+        search::run(&search::Query::new(&p.q, since, max)?)
     })
     .await
 }
@@ -964,6 +1062,7 @@ mod tests {
             transcripts: Mutex::default(),
             history: Mutex::default(),
             limits: Mutex::default(),
+            overlaps: Mutex::default(),
             closing: tokio::sync::watch::Sender::new(false),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();

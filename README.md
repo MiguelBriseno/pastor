@@ -42,6 +42,12 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   por día.
 - **Dashboard** con el resumen de agentes, el progreso de las tareas y lo que necesita tu
   atención.
+- **Gasto por agente y por tarea.** Los tokens de cada agente de Claude Code y lo que costarían
+  con los precios de la API, en la lista de tareas, al pie de cada agente y en el Historial.
+- **Buscar en las conversaciones** de todos los agentes de Claude, también los que ya terminaron
+  («¿quién tocó `auth.rs` la semana pasada?»).
+- **Aviso de conflictos.** Si dos tareas (o una tarea y tu rama) cambian los mismos archivos,
+  pastor te avisa antes de que apruebes una.
 - **CLI completa** para usarlo desde scripts o desde otros agentes.
 - **No toca tu configuración.** Usa un servidor de tmux propio y los hooks de Claude Code solo
   se aplican a los agentes que lanza pastor.
@@ -235,6 +241,11 @@ Cuando la tarea está *por revisar*:
   que el merge pisaría, git se niega y pastor te muestra por qué.
 - `r` le manda tu comentario al agente.
 
+Si el worktree de una tarea cambia archivos que también cambia otra tarea, otro agente con
+worktree o tu rama (commits nuevos o cambios sin guardar), la tarea lleva un `⚠` y su descripción
+dice cuáles y con quién. Al aprobarla, la confirmación lo recuerda: ahí es donde puede haber
+conflictos. pastor lo revisa cada 10 segundos.
+
 Si el agente ya no existe, vuelve a asignar la tarea a uno nuevo con **Worktree: sí** (el
 formulario ya lo propone): trabajará en el mismo worktree. Si la asignas sin worktree, o a un agente
 que ya existe, la tarea deja su worktree y se revisa en el directorio del agente.
@@ -250,7 +261,8 @@ de agente nuevo, o con `pastor new claude --worktree`.
 ### 3 · Dashboard
 
 Cuántos agentes hay en cada estado, cuántas tareas en cada etapa, el porcentaje completado y una
-lista de lo que necesita tu atención: agentes esperando respuesta y tareas por revisar.
+lista de lo que necesita tu atención: agentes esperando respuesta, tareas por revisar y tareas que
+cambian los mismos archivos.
 
 ### 4 · Historial
 
@@ -261,6 +273,20 @@ sesiones.
 
 El historial empezó a guardarse en esta versión. De antes solo se conocen los totales de agentes
 y tareas creados, que se suman a las cifras.
+
+También el **gasto** de los agentes de Claude Code: tokens, costo total, de hoy y medio por tarea
+hecha. Al final de cada turno pastor lee lo nuevo de la transcripción del agente (y de sus
+subagentes) y lo anota con la tarea que tenía. El costo es lo que costarían esos tokens con los
+precios de la API de Anthropic: con una suscripción no pagas por token, pero sirve para comparar
+lo que gasta cada agente y cada tarea. Un `+` (`≈ $3.40+`) indica tokens de un modelo cuyo precio
+pastor no conoce. Codex y opencode no dejan una transcripción que pastor sepa leer: de ellos no hay
+gasto. La pestaña Tareas tiene una columna **Gasto** y el panel de cada agente lo lleva al pie.
+
+Pulsa `/` para **buscar en las conversaciones** de los agentes de Claude, también los que ya
+terminaron (mientras exista su transcripción en `~/.claude/projects`). Salen los mensajes que
+tienen todas las palabras, sin importar mayúsculas, del más reciente al más viejo: los tuyos, los
+del agente y las herramientas que usó (`Edit · src/auth.rs`). `↑` `↓` recorre los resultados y
+muestra el mensaje entero, `⏎` va al agente y `Esc` vuelve a las estadísticas.
 
 ### En los formularios
 
@@ -326,6 +352,18 @@ pastor task done t1
 pastor task rm t1
 ```
 
+`pastor task ls` muestra también el gasto de cada tarea y, debajo, los archivos que comparte con
+otra tarea o con tu rama.
+
+### Buscar
+
+```sh
+pastor search auth.rs                 # en todas las conversaciones de los agentes de Claude
+pastor search migrar login --desde 7d # todas las palabras, solo de la última semana
+pastor search oauth --desde 2026-10-01 --max 10
+pastor search oauth --json
+```
+
 ## Otras máquinas por SSH
 
 pastor puede manejar los agentes de otra máquina (un servidor, la computadora de la oficina) como si
@@ -377,7 +415,7 @@ IP de Tailscale (que ya cifra).
 
 | Método | Ruta | Cuerpo |
 |---|---|---|
-| `GET` | `/api/agents` | — (cada agente trae `status`: `starting`, `working`, `blocked`, `idle` o `dead`, y `project` y `project_name`: el repositorio en el que trabaja) |
+| `GET` | `/api/agents` | — (cada agente trae `status`: `starting`, `working`, `blocked`, `idle` o `dead`, y `project` y `project_name`: el repositorio en el que trabaja; los de Claude, `usage` con lo que llevan gastado) |
 | `POST` | `/api/agents` | `{"kind": "claude", "cwd": "/ruta", "name"?, "prompt"?, "worktree"?}` |
 | `POST` | `/api/agents/{id}/send` | `{"text": "..."}` (lo pega y pulsa Enter) |
 | `POST` | `/api/agents/{id}/keys` | `{"keys": ["Down", "Enter"]}` |
@@ -386,14 +424,15 @@ IP de Tailscale (que ya cifra).
 | `GET` | `/api/agents/{id}/conversation` | — (la conversación entera de un agente de Claude, de su transcripción; con `?session=…&after=N`, solo lo nuevo) |
 | `POST` | `/api/agents/{id}/restore` | — (lo vuelve a abrir si se perdió, retomando su conversación) |
 | `DELETE` | `/api/agents/{id}` | — |
-| `GET` | `/api/tasks` | — |
+| `GET` | `/api/tasks` | — (cada tarea trae `usage`, su gasto, y `overlaps`, los archivos que comparte con otra tarea, otro agente o tu rama) |
 | `POST` | `/api/tasks` | `{"title": "...", "description"?}` |
 | `POST` | `/api/tasks/{id}/assign` | `{"agent": "web"}` o `{"kind": "claude", "cwd": "/ruta", "worktree"?: true}` |
 | `POST` | `/api/tasks/{id}/done` | — |
 | `POST` | `/api/tasks/{id}/approve` | — |
 | `POST` | `/api/tasks/{id}/reject` | `{"text": "..."}` |
 | `DELETE` | `/api/tasks/{id}` | — |
-| `GET` | `/api/stats` | — (las estadísticas de la pestaña Historial; las duraciones van en segundos) |
+| `GET` | `/api/stats` | — (las estadísticas de la pestaña Historial; las duraciones van en segundos, el gasto en `usage`, `usage_today` y `avg_task_cost`) |
+| `GET` | `/api/search` | `?q=auth.rs` (y `since=7d`, `max=50`): los mensajes de las conversaciones que tienen todas las palabras |
 
 ```sh
 curl -H "Authorization: Bearer $(cat ~/.local/share/pastor/serve-token)" localhost:7433/api/agents

@@ -41,7 +41,9 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/history.rs` | Historial de eventos en `history.jsonl` y las estadísticas de la pestaña Historial |
 | `src/worktree.rs` | Los worktrees de git de los agentes: crearlos, ver su diff, integrarlos y borrarlos |
 | `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
-| `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular |
+| `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular y la búsqueda |
+| `src/usage.rs` | Los tokens de los agentes de Claude, leídos de sus transcripciones, y su costo con los precios de la API |
+| `src/search.rs` | Busca en las conversaciones de los agentes de Claude, vivos o terminados |
 | `src/pty.rs` | Un proceso en un pseudoterminal propio, para la terminal del celular (solo con `serve`) |
 | `src/remote.rs` | Las otras máquinas: su registro, `ssh` con conexión compartida y el hilo que pregunta por sus agentes |
 | `src/files.rs` | Los archivos del directorio de un agente para el editor: listarlos con lo que cambió en git, leerlos y guardarlos, aquí o en otra máquina |
@@ -332,3 +334,37 @@ del directorio del agente: ni `../`, ni rutas absolutas, ni un enlace que lleve 
 En un agente de otra máquina, el editor llama allá a `pastor files` (oculto) por la misma
 conexión SSH que el resto: lista y lee en JSON, y el texto a guardar va por la entrada estándar,
 porque como argumento tiene un límite de tamaño.
+
+### El gasto se anota en el historial
+
+El `usage` de cada respuesta está en la transcripción de Claude Code, pero las transcripciones se
+pueden borrar y no dicen de qué tarea eran. Así que, al acabar cada turno (hook `Stop`), antes de
+terminar un agente y antes de darle otra tarea, `usage::flush` lee lo nuevo de sus transcripciones
+(la del hilo principal y las de `<sesión>/subagents/`) y anota un evento `usage` por modelo, con la
+tarea que tiene el agente. Hasta dónde leyó cada archivo queda en `usage/<id>.json`, con candado:
+el hook y `pastor kill` pueden correr a la vez. Claude Code escribe una línea por bloque de la
+respuesta, todas con el mismo `usage`: se cuenta una vez por `message.id`. Lo escrito antes de lanzar
+el agente (una conversación retomada con `/resume`) no cuenta. Primero se guarda hasta dónde se
+leyó y después el historial: si algo falla entre medias, se cuenta de menos, nunca dos veces.
+
+El costo sale de una tabla de precios en `usage.rs` (dólares por millón de tokens). Escribir en la
+caché cuesta 1.25 veces la entrada por 5 minutos y el doble por una hora; leerla, el precio de cada
+modelo. Un modelo que no está en la tabla suma tokens pero no costo, y el costo se marca con `+`.
+
+### La búsqueda lee las transcripciones
+
+No hay índice: `pastor search` recorre las transcripciones línea por línea y solo arma el JSON de
+las que tienen todas las palabras, así que es rápido aunque sumen cientos de MB. Cada vez que un
+agente empieza otra sesión (al lanzarlo, con `/clear` o `/resume`), el hook anota en el historial un
+evento `session` con su nombre, su directorio y la ruta de la transcripción: así se puede buscar en
+la conversación de un agente que ya no existe. Con `--desde`, una transcripción que no cambió desde
+entonces no se abre.
+
+### Archivos en común entre worktrees
+
+`ops::overlaps` junta los worktrees de las tareas sin terminar y de los agentes, y para cada uno
+saca lo que cambió desde su base (`git diff --name-only` contra el mismo punto que usa el diff de
+revisión, más los archivos nuevos) y lo que cambió tu repositorio desde ese punto (tu rama y lo que
+tienes sin guardar). Dos del mismo repositorio que comparten archivos, o uno que comparte con tu
+rama, son un posible conflicto al integrar. Corre git en cada worktree, así que la TUI lo calcula
+en el hilo del observador cada 10 segundos y no en cada pasada.

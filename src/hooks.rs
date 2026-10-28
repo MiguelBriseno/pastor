@@ -17,6 +17,7 @@ use crate::history::{self, Event};
 use crate::ops;
 use crate::store::{self, data_dir, ensure_dirs, write_atomic, write_atomic_mode, write_volatile};
 use crate::tmux::{self, shell_quote};
+use crate::usage;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct HookStatus {
@@ -112,6 +113,7 @@ pub fn clear_status(id: &str) {
 pub fn prune_status() {
     let _ = store::State::with_lock(|s| {
         prune_status_in(&data_dir().join("status"), s);
+        usage::prune(s);
         // Los de `state.json`: con su candado nadie lo está escribiendo. Los
         // de otros archivos (`claude-settings.json`) con margen.
         remove_stale_tmp(&data_dir(), "state.json.", Duration::ZERO);
@@ -357,8 +359,20 @@ pub fn handle(event: &str) -> Result<()> {
         .is_some_and(|t| Path::new(t).exists());
     if let (Ok(state), Some(session), None, true) = (&loaded, &p.session_id, &p.agent_id, resumable)
     {
-        if let Err(e) = remember_session(state, &id, session) {
+        let transcript = Path::new(p.transcript_path.as_deref().unwrap_or_default());
+        if let Err(e) = remember_session(state, &id, session, transcript) {
             log_error(event, &e);
+        }
+    }
+    // Al acabar un turno del hilo principal, lo que gastó.
+    if event == "idle" && p.agent_id.is_none() {
+        if let Some(agent) = loaded
+            .as_ref()
+            .ok()
+            .and_then(|s| s.agents.iter().find(|a| a.id == id))
+        {
+            let transcript = p.transcript_path.as_deref().map(PathBuf::from);
+            usage::flush_quietly(agent, transcript.filter(|t| t.is_absolute()));
         }
     }
     // Si el aviso no pide nada, ni candado ni lectura. Que no pida nada no
@@ -442,17 +456,38 @@ pub fn handle(event: &str) -> Result<()> {
 
 /// Guarda en el agente la sesión de Claude Code en la que va, si cambió: con
 /// ella `pastor restore` retoma la conversación.
-fn remember_session(state: &store::State, id: &str, session: &str) -> Result<()> {
-    let known = state.agents.iter().find(|a| a.id == id);
-    if session.is_empty() || known.is_none_or(|a| a.session.as_deref() == Some(session)) {
+/// Cada sesión nueva queda en el historial con su transcripción, para buscar
+/// en ella aunque el agente ya no exista.
+fn remember_session(
+    state: &store::State,
+    id: &str,
+    session: &str,
+    transcript: &Path,
+) -> Result<()> {
+    let Some(known) = state.agents.iter().find(|a| a.id == id) else {
+        return Ok(());
+    };
+    if session.is_empty() || known.session.as_deref() == Some(session) {
         return Ok(());
     }
-    store::State::update(|s| {
-        if let Some(a) = s.agents.iter_mut().find(|a| a.id == id) {
-            a.session = Some(session.to_string());
-        }
-        Ok(())
-    })
+    let changed = store::State::update(|s| {
+        let Some(a) = s.agents.iter_mut().find(|a| a.id == id) else {
+            return Ok(false);
+        };
+        // Otro hook del mismo agente pudo guardarla mientras.
+        let changed = a.session.as_deref() != Some(session);
+        a.session = Some(session.to_string());
+        Ok(changed)
+    })?;
+    if changed {
+        history::record(Event::Session {
+            agent: id.to_string(),
+            name: known.name.clone(),
+            cwd: known.cwd.clone(),
+            transcript: transcript.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Lanza `pastor hook settle` sin esperarlo: Claude Code espera al hook, y
