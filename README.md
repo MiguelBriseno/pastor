@@ -170,8 +170,8 @@ con `t`.
 #### Editor de archivos
 
 Pulsa `e` sobre un agente para ver los archivos de su directorio, o usa `pastor edit` fuera de la
-interfaz. A la izquierda está la lista y a la derecha el archivo abierto, con colores según el
-lenguaje.
+interfaz. A la izquierda están las carpetas (las que tienen cambios, con `•`) y a la derecha el
+archivo abierto, con colores según el lenguaje.
 
 - La lista incluye los archivos ignorados por git (el `.env` sale), pero no carpetas pesadas como
   `node_modules`, `target` o `dist`.
@@ -186,7 +186,8 @@ lenguaje.
 | Tecla | En la lista | En el archivo |
 |---|---|---|
 | `↑` `↓` / `k` `j` | Mover | Mover (también `←` `→` / `h` `l`) |
-| `⏎` | Abrir el archivo | |
+| `⏎` | Abrir el archivo, o abrir / cerrar la carpeta | |
+| `→` `←` / `l` `h` | Abrir / cerrar la carpeta (`←` en un archivo: a su carpeta) | |
 | `/` | Filtrar por nombre (letras en orden: `sajs` encuentra `src/app.js`) | Buscar en el archivo (`n` / `N`: siguiente / anterior) |
 | `c` | Solo los que cambiaron | |
 | `r` / `R` | Volver a leer la lista | Volver a leer el archivo |
