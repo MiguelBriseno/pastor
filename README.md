@@ -28,6 +28,9 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   los tuyos, desde la interfaz o la línea de comandos.
 - **Terminal al lado de cada agente.** Abre una terminal junto al agente, en su mismo directorio,
   para correr por ejemplo `npm run dev` mientras el agente hace cambios.
+- **Editor de archivos.** Revisa o cambia rápido un archivo del agente (el `app.js`, el `.env`…)
+  sin salir de pastor: con colores, búsqueda y marcados los que cambió el agente. También en
+  agentes de otras máquinas y desde el celular.
 - **Notificaciones de escritorio** cuando un agente te necesita o termina su trabajo, y también
   en el celular con [ntfy](https://ntfy.sh) si lo configuras.
 - **Tareas.** Crea tareas y asígnalas a un agente existente o a uno nuevo. Cuando el agente
@@ -138,6 +141,7 @@ repositorio del que salieron; los que están fuera de un repositorio, en su carp
 | `s` | Enviarle un mensaje sin entrar |
 | `t` | Abrir una terminal al lado del agente (ver abajo) |
 | `T` | Cerrar esa terminal |
+| `e` | Abrir los archivos del agente en el editor (ver abajo) |
 | `r` | Restaurar el agente si se perdió (p. ej. al reiniciar), retomando su conversación |
 | `x` | Terminar el agente (pide confirmación) |
 | `<` `>` | Estrechar / ensanchar la lista de agentes |
@@ -162,6 +166,37 @@ Puedes cambiarlo o dejarlo vacío para abrir una terminal sin comando. Al confir
 La terminal es un shell normal: `Ctrl-c` detiene el servidor y puedes escribir otros comandos.
 Pulsa `T` para cerrarla, o escribe `exit` en ella: el panel se cierra solo y puedes abrir otra
 con `t`.
+
+#### Editor de archivos
+
+Pulsa `e` sobre un agente para ver los archivos de su directorio, o usa `pastor edit` fuera de la
+interfaz. A la izquierda está la lista y a la derecha el archivo abierto, con colores según el
+lenguaje.
+
+- La lista incluye los archivos ignorados por git (el `.env` sale), pero no carpetas pesadas como
+  `node_modules`, `target` o `dist`.
+- Lo que cambió el agente aparece marcado: `M` modificado y `+` nuevo. En un agente con worktree
+  cuenta todo lo de su rama, también lo que ya está en commits. `c` deja solo esos.
+- Se abre en modo lectura; pulsa `i` para editar y `Esc` para volver a leer. `Ctrl-s` guarda.
+- Si el agente cambió el archivo mientras lo tenías abierto, no se guarda encima: pastor te avisa
+  y lo vuelves a leer con `R`.
+- Abre archivos de texto de hasta 2 MB. Al guardar se conservan sus permisos (un `.env` con
+  `600` sigue igual) y sus saltos de línea (`\r\n` si los tenía).
+
+| Tecla | En la lista | En el archivo |
+|---|---|---|
+| `↑` `↓` / `k` `j` | Mover | Mover (también `←` `→` / `h` `l`) |
+| `⏎` | Abrir el archivo | |
+| `/` | Filtrar por nombre (letras en orden: `sajs` encuentra `src/app.js`) | Buscar en el archivo (`n` / `N`: siguiente / anterior) |
+| `c` | Solo los que cambiaron | |
+| `r` / `R` | Volver a leer la lista | Volver a leer el archivo |
+| `:` | | Ir a una línea |
+| `g` `G` | Inicio / fin | Inicio / fin del archivo |
+| `i` | | Editar (`Esc` para dejar de editar) |
+| `Ctrl-s` | Guardar | Guardar |
+| `Ctrl-z` `Ctrl-y` | | Deshacer / rehacer |
+| `Tab` / `Esc` | Pasar al archivo | Volver a la lista |
+| `q` / `Ctrl-c` | Salir (pregunta si hay cambios sin guardar) | Igual |
 
 ### 2 · Tareas
 
@@ -261,6 +296,9 @@ pastor keys web Down Enter    # pulsa teclas, para contestar sus menús
 pastor term web npm run dev   # abre una terminal al lado y ejecuta el comando
 pastor term web               # abre una terminal sin comando
 pastor term web --close       # la cierra
+pastor edit                   # el editor, en la carpeta actual
+pastor edit src/app.js        # ese archivo abierto, con el resto del repositorio al lado
+pastor edit web               # los archivos del agente web (también servidor:a3)
 pastor kill web               # lo termina (y su terminal)
 pastor restore                # vuelve a abrir los que se perdieron al reiniciar
 pastor restore web            # solo ese
@@ -378,6 +416,9 @@ agente puedes ver:
 - **Pantalla:** lo que se ve en su panel, con una caja para escribirle y botones para las teclas
   (Esc, ⏎, flechas, Tab, `1`/`2`/`3`, `y`/`n`, Ctrl-C).
 - **Conversación:** la conversación entera, solo con los agentes de Claude.
+- **Archivos:** con el botón de la carpeta, arriba. Los que cambió el agente, marcados (y un
+  filtro para ver solo esos); al abrir uno se ve con colores, se busca dentro y, con el lápiz, se
+  edita y se guarda. Si el agente lo cambió mientras, no se guarda encima.
 - **Terminal:** su sesión de tmux en vivo, como con `pastor attach`. Lo que escribes le llega al
   momento, con colores, y también ves la terminal de al lado (cambia de panel con Ctrl-B y una
   flecha). Mientras está abierta, el agente dibuja al tamaño del celular.
@@ -602,6 +643,7 @@ rm -rf ~/Library/Application\ Support/pastor    # macOS
 - [x] Restaurar agentes después de reiniciar
 - [x] Manejar agentes en otras máquinas por SSH
 - [x] Desde el celular: API, avisos con ntfy, pantalla en vivo, una PWA y una terminal interactiva
+- [x] Un editor para revisar y cambiar archivos rápido, también remotos y desde el celular
 
 ## Contribuir
 

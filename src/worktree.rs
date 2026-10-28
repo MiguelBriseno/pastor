@@ -255,6 +255,143 @@ fn diff_base(wt: &Worktree) -> String {
         .unwrap_or_else(|_| wt.base.clone())
 }
 
+/// Carpetas que pesan mucho y no se leen a mano: el editor no entra en ellas
+/// aunque no estén en el `.gitignore`.
+pub const HEAVY_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".cache",
+    "coverage",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
+
+/// Las rutas de una salida de git separada por NUL (`-z`).
+fn nul_split(out: &str) -> impl Iterator<Item = &str> {
+    out.split('\0').filter(|s| !s.is_empty())
+}
+
+/// Si alguna carpeta de la ruta `rel` es pesada.
+fn in_heavy_dir(rel: &str) -> bool {
+    rel.rsplit_once('/')
+        .is_some_and(|(dirs, _)| dirs.split('/').any(|d| HEAVY_DIRS.contains(&d)))
+}
+
+/// Los archivos de `dir` (que está en un repositorio), relativos a él: los del
+/// repositorio y los nuevos, más los ignorados, sin los que estén en una
+/// carpeta pesada aunque no esté ignorada. Así sale el `.env`, pero no
+/// `node_modules`. Los del repositorio sí salen siempre: alguien los subió.
+/// `untracked` son los nuevos, de `untracked`.
+pub fn files(dir: &Path, untracked: &[String], max: usize) -> Result<Vec<String>> {
+    let cached = git(dir, &["ls-files", "-z", "--cached"])?;
+    let mut files: Vec<String> = nul_split(&cached).map(String::from).collect();
+    files.extend(untracked.iter().filter(|p| !in_heavy_dir(p)).cloned());
+    let ignored = git(
+        dir,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+        ],
+    )?;
+    for path in nul_split(&ignored) {
+        if files.len() >= max {
+            break;
+        }
+        match path.strip_suffix('/') {
+            Some(sub) => {
+                let name = sub.rsplit('/').next().unwrap_or(sub);
+                if !HEAVY_DIRS.contains(&name) && !in_heavy_dir(path) {
+                    walk(dir, Path::new(sub), max, &mut files);
+                }
+            }
+            None if !in_heavy_dir(path) => files.push(path.to_string()),
+            None => {}
+        }
+    }
+    // Los borrados siguen en el índice, y un submódulo es una carpeta.
+    files.retain(|f| dir.join(f).is_file());
+    Ok(files)
+}
+
+/// Agrega a `out` los archivos de `dir/sub` (relativos a `dir`), sin entrar en
+/// carpetas pesadas ni seguir enlaces a carpetas, hasta tener `max`.
+pub fn walk(dir: &Path, sub: &Path, max: usize, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir.join(sub)) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        if out.len() >= max {
+            return;
+        }
+        let name = e.file_name();
+        let rel = sub.join(&name);
+        let Ok(kind) = e.file_type() else { continue };
+        if kind.is_dir() {
+            if !HEAVY_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                walk(dir, &rel, max, out);
+            }
+        } else if dir.join(&rel).is_file() {
+            out.push(rel.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// Lo que cambió en `dir`, relativo a él: con `wt`, todo lo del agente desde
+/// que salió su rama (commits incluidos); sin él, lo que no está en un
+/// commit. `true` si el archivo es nuevo. Sin los borrados: ya no se abren.
+/// `untracked` son los nuevos, de `untracked`.
+pub fn changes(dir: &Path, wt: Option<&Worktree>, untracked: &[String]) -> Vec<(String, bool)> {
+    let base = wt.map_or_else(|| "HEAD".to_string(), diff_base);
+    let mut out = Vec::new();
+    // Sin commits todavía no hay contra qué comparar: solo los nuevos.
+    if let Ok(diff) = git(
+        dir,
+        &[
+            "diff",
+            "-z",
+            "--name-status",
+            "--no-renames",
+            "--relative",
+            &base,
+        ],
+    ) {
+        let mut parts = nul_split(&diff);
+        while let (Some(status), Some(path)) = (parts.next(), parts.next()) {
+            match status {
+                "D" => {}
+                "A" => out.push((path.to_string(), true)),
+                _ => out.push((path.to_string(), false)),
+            }
+        }
+    }
+    out.extend(untracked.iter().map(|p| (p.clone(), true)));
+    out
+}
+
+/// Los archivos de `dir` que no están en el repositorio ni ignorados,
+/// relativos a él.
+pub fn untracked(dir: &Path) -> Result<Vec<String>> {
+    let out = git(dir, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    Ok(nul_split(&out).map(String::from).collect())
+}
+
 /// Guarda en un commit lo que el agente dejó sin guardar e integra la rama
 /// en la rama actual del repositorio. Devuelve en qué rama se integró, o
 /// `None` si no había nada que integrar.

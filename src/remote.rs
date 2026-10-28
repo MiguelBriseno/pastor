@@ -172,6 +172,31 @@ pub fn run(host: &str, args: &[&str]) -> Result<String> {
         .stdin(Stdio::null())
         .output()
         .context("no pude ejecutar ssh")?;
+    answer(host, out)
+}
+
+/// Como `run`, mandando `input` por la entrada del pastor de allá (lo que
+/// no cabe en un argumento, como un archivo entero).
+pub fn run_input(host: &str, args: &[&str], input: &[u8]) -> Result<String> {
+    use std::io::Write;
+    let mut child = ssh(host, false)?
+        .args(remote_command(args))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("no pude ejecutar ssh")?;
+    // Allá se lee la entrada entera antes de responder: escribirla toda
+    // primero no se traba. Si ssh no conectó, el error es el de su salida.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    let out = child.wait_with_output().context("no pude ejecutar ssh")?;
+    answer(host, out)
+}
+
+/// Lo que imprimió el pastor de allá o, si falló, su error.
+fn answer(host: &str, out: std::process::Output) -> Result<String> {
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }

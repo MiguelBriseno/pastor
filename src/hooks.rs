@@ -48,8 +48,13 @@ pub struct Screen {
 /// FNV-1a: estable entre versiones de pastor, a diferencia de `DefaultHasher`
 /// (el hook y quien lo lee pueden ser binarios distintos).
 pub fn screen_hash(screen: &str) -> u64 {
-    screen.bytes().fold(0xcbf29ce484222325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    fnv1a(screen.as_bytes())
+}
+
+/// FNV-1a de `bytes`.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
     })
 }
 

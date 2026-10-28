@@ -45,6 +45,7 @@ const ICONS = {
   dashboard: '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
   history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
   restore: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
+  pencil: '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>',
   bell: '<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>',
 };
 
@@ -379,6 +380,8 @@ tabs.append(...TABS.map(([tab, label, ic]) =>
   )));
 
 function route() {
+  leaveGuard = null;
+  currentNav = stampNav();
   cleanup.forEach((f) => f());
   cleanup = [];
   sheets.forEach((d) => d.close());
@@ -390,6 +393,19 @@ function route() {
   if (!store.get("pastor-token")) {
     document.body.dataset.view = "token";
     return tokenView();
+  }
+  const files = hash.match(/^\/files\/([^/]+)(?:\/(.+))?$/);
+  if (files) {
+    let id, path;
+    try {
+      id = decodeURIComponent(files[1]);
+      path = files[2] && decodeURIComponent(files[2]);
+    } catch {
+      location.hash = "#/agents";
+      return;
+    }
+    document.body.dataset.view = "files";
+    return path ? fileView(id, path) : filesView(id);
   }
   const agent = hash.match(/^\/agent\/(.+)$/);
   if (agent) {
@@ -410,7 +426,48 @@ function route() {
   agentsView();
 }
 
-window.addEventListener("hashchange", route);
+/** Si la pantalla actual tiene algo que se perdería al salir: la pantalla lo
+ * pone y `route` lo quita. */
+let leaveGuard = null;
+/** El sello de la entrada del historial que se ve: cada entrada lleva uno
+ * creciente en `history.state`, y uno menor al cambiar es que se fue atrás.
+ * Comparar hashes no basta: la flecha de volver es un enlace al de antes,
+ * que agrega una entrada nueva en vez de ir atrás. */
+let lastNav = 0;
+let currentNav = 0;
+function stampNav() {
+  if (history.state?.nav == null) {
+    lastNav = Math.max(Date.now(), lastNav + 1);
+    history.replaceState({ ...history.state, nav: lastNav }, "");
+  }
+  return history.state.nav;
+}
+/** El siguiente cambio de hash es el de deshacer una salida: no se dibuja. */
+let restoring = false;
+
+// Cualquier salida (el botón de volver, el gesto o el botón atrás del
+// celular, un enlace) pasa por aquí. El hash ya cambió: se deshace el paso
+// en el historial (adelante si fue «atrás», atrás si fue un enlace) para no
+// dejar entradas repetidas y, si se acepta perder los cambios, se rehace.
+window.addEventListener("hashchange", async () => {
+  if (restoring) {
+    restoring = false;
+    return;
+  }
+  if (leaveGuard?.()) {
+    const target = location.hash;
+    const wentBack = history.state?.nav != null && history.state.nav < currentNav;
+    restoring = true;
+    if (wentBack) history.forward();
+    else history.back();
+    if (!(await ask("¿Salir sin guardar?", "Lo que cambiaste no se guarda.", "Salir", true))) return;
+    leaveGuard = null;
+    if (wentBack) history.back();
+    else location.hash = target;
+    return;
+  }
+  route();
+});
 
 // ---------- token ----------
 
@@ -691,7 +748,8 @@ function liveTerm(id) {
 function agentView(id) {
   let agent = null;
   const more = h("button", { class: "icon-btn", "aria-label": "Opciones", onclick: () => agentMenu() }, icon("more"));
-  const top = setTop({ title: id, back: "#/agents", actions: [more] });
+  const files = h("a", { class: "icon-btn", href: filesHash(id), "aria-label": "Archivos" }, icon("folder"));
+  const top = setTop({ title: id, back: "#/agents", actions: [files, more] });
   const screen = h("pre", { class: "term loading", text: "Cargando pantalla…" });
   termPrefs(screen);
   const { atBottom, jump, sync } = scrollFollow(screen);
@@ -1108,6 +1166,212 @@ function conversationPane(id, getAgent) {
       if (on) tick();
     },
   };
+}
+
+// ---------- archivos ----------
+
+const filesHash = (id, path) =>
+  `#/files/${encodeURIComponent(id)}` + (path ? "/" + encodeURIComponent(path) : "");
+
+/** Cuántos archivos se dibujan a la vez: con miles la lista se traba. */
+const MAX_FILES_SHOWN = 300;
+
+/** Si `path` tiene las letras de `q` en orden. Lo que contiene `q` seguido va
+ * primero, y entre esos los más cortos. */
+function fuzzy(path, q) {
+  const lower = path.toLowerCase();
+  let at = 0;
+  for (const c of q) {
+    at = lower.indexOf(c, at);
+    if (at < 0) return null;
+    at += c.length;
+  }
+  return [lower.includes(q) ? 0 : 1, path.length];
+}
+
+function filesView(id) {
+  const top = setTop({ title: "Archivos", back: "#/agent/" + encodeURIComponent(id) });
+  watchAgents((agents) => {
+    const a = agents.find((x) => x.id === id);
+    if (a) top.subtitle.replaceChildren(h("span", { class: "ellipsis", text: `${a.name} · ${shortPath(a.cwd)}` }));
+  });
+  const filterKey = "pastor-files-changed";
+  let onlyChanged = store.get(filterKey) === "1";
+  let listing = null;
+  const input = h("input", {
+    type: "search", placeholder: "Buscar archivo…", "aria-label": "Buscar archivo",
+    autocapitalize: "off", autocorrect: "off", spellcheck: "false", enterkeyhint: "search",
+  });
+  const chips = h("div", { class: "chips" });
+  const list = h("div", { class: "files" }, skeleton(4));
+  const draw = () => {
+    if (!listing) return;
+    const changed = listing.files.filter((f) => f.change).length;
+    chips.replaceChildren(...[[false, "Todos", listing.files.length], [true, "Cambiados", changed]].map(([on, label, n]) =>
+      h("button", {
+        type: "button", class: "chip" + (on === onlyChanged ? " on" : ""),
+        onclick: () => { onlyChanged = on; store.set(filterKey, on ? "1" : ""); draw(); },
+      }, label, h("span", { class: "chip-count", text: String(n) }))));
+    const q = input.value.trim().toLowerCase();
+    let shown = listing.files
+      .filter((f) => !onlyChanged || f.change)
+      .map((f) => [f, q ? fuzzy(f.path, q) : [0, 0]])
+      .filter(([, rank]) => rank);
+    if (q) shown.sort(([, a], [, b]) => a[0] - b[0] || a[1] - b[1]);
+    const rest = shown.length - MAX_FILES_SHOWN;
+    shown = shown.slice(0, MAX_FILES_SHOWN);
+    if (!shown.length) {
+      list.replaceChildren(onlyChanged && !q
+        ? empty("check", "Nada cambió", "El agente todavía no cambió ningún archivo.")
+        : empty("folder", "Sin archivos", q ? "Ningún archivo coincide." : "Este directorio está vacío."));
+      return;
+    }
+    list.replaceChildren(...shown.map(([f]) => {
+      const slash = f.path.lastIndexOf("/");
+      return h("a", { class: "file-row" + (f.change ? " " + f.change : ""), href: filesHash(id, f.path) },
+        h("span", { class: "file-mark", text: f.change === "modified" ? "M" : f.change === "added" ? "+" : "" }),
+        h("span", { class: "file-path" },
+          slash >= 0 && h("span", { class: "file-dir", text: f.path.slice(0, slash + 1) }),
+          h("span", { class: "file-name", text: f.path.slice(slash + 1) })));
+    }), ...(rest > 0 ? [h("p", { class: "hint", text: `${rest} más: escribe para encontrarlos` })] : []));
+  };
+  input.addEventListener("input", draw);
+  main.append(h("div", { class: "files-head" }, input, chips), list);
+  attempt(async () => {
+    listing = await api("GET", `/agents/${encodeURIComponent(id)}/files`);
+    if (listing.truncated) toast(`Hay más de ${listing.files.length} archivos: solo se listan los primeros`);
+    draw();
+  }).then(() => { if (!listing) list.replaceChildren(empty("folder", "Sin archivos", "No pude leer el directorio.")); });
+}
+
+/** Las líneas del archivo con sus números y colores, como nodos de texto. */
+function codeLines(file) {
+  const palette = file.colors?.palette || [];
+  const colored = file.colors?.lines;
+  return file.text.replace(/\n$/, "").split("\n").map((line, i) => h("div", { class: "code-line" },
+    h("span", { class: "code-num", text: String(i + 1) }),
+    h("span", { class: "code-text" }, colored?.[i]?.length
+      // Una línea sin trozos (muy larga para colorearla) va sin colores.
+      ? colored[i].map(([c, t]) => h("span", { style: `color:${palette[c]}`, text: t }))
+      : line)));
+}
+
+function fileView(id, path) {
+  const slash = path.lastIndexOf("/");
+  const edit = h("button", { class: "icon-btn", "aria-label": "Editar", disabled: true }, icon("pencil"));
+  const top = setTop({ title: path.slice(slash + 1), back: filesHash(id), actions: [edit] });
+  top.subtitle.replaceChildren(h("span", { class: "ellipsis", text: slash >= 0 ? path.slice(0, slash + 1) : "./" }));
+  let file = null;
+  let editing = false;
+  const code = h("div", { class: "code loading", text: "Cargando…" });
+  const find = h("input", {
+    type: "search", placeholder: "Buscar en el archivo…", "aria-label": "Buscar en el archivo",
+    autocapitalize: "off", autocorrect: "off", spellcheck: "false", enterkeyhint: "search",
+  });
+  const text = h("textarea", { class: "code-edit", hidden: true, spellcheck: "false", autocapitalize: "off", autocorrect: "off", "aria-label": "Contenido" });
+  const cancel = h("button", { type: "button", class: "btn", text: "Cancelar" });
+  const save = h("button", { type: "button", class: "btn primary" }, icon("check"), "Guardar");
+  const bar = h("div", { class: "code-bar" }, find);
+  const editBar = h("div", { class: "code-bar", hidden: true }, cancel, save);
+  // El textarea convierte los `\r\n` en `\n`: se compara con el texto así,
+  // y al guardar se vuelven a poner si el archivo los usaba en todas sus líneas.
+  const plainText = () => file.text.replace(/\r\n?/g, "\n");
+  const crlf = () => file.text.includes("\r\n") && !/(^|[^\r])\n/.test(file.text);
+  const dirty = () => editing && text.value !== plainText();
+
+  const load = async () => {
+    file = await api("GET", `/agents/${encodeURIComponent(id)}/file?path=${encodeURIComponent(path)}`);
+    code.classList.remove("loading");
+    code.replaceChildren(...codeLines(file));
+    edit.disabled = false;
+  };
+  const setEditing = (on) => {
+    editing = on;
+    code.hidden = on;
+    text.hidden = !on;
+    bar.hidden = on;
+    editBar.hidden = !on;
+    edit.hidden = on;
+    if (on) {
+      text.value = plainText();
+      text.focus();
+      text.setSelectionRange(0, 0);
+    }
+  };
+  edit.addEventListener("click", () => {
+    if (!file) return;
+    // El textarea no guarda los `\r` sueltos ni los finales mezclados: al
+    // guardar cambiaría los finales de línea de todo el archivo.
+    if (/\r(?!\n)/.test(file.text) || (file.text.includes("\r\n") && !crlf())) {
+      return toast("Este archivo mezcla finales de línea: edítalo desde la terminal", true);
+    }
+    setEditing(true);
+  });
+  cancel.addEventListener("click", async () => {
+    if (dirty() && !(await ask("¿Descartar los cambios?", "Lo que cambiaste no se guarda.", "Descartar", true))) return;
+    setEditing(false);
+  });
+  save.addEventListener("click", async () => {
+    if (save.disabled) return;
+    if (!dirty()) return setEditing(false);
+    save.disabled = true;
+    try {
+      const sent = crlf() ? text.value.replace(/\n/g, "\r\n") : text.value;
+      const { hash } = await api("PUT", `/agents/${encodeURIComponent(id)}/file`, { path, text: sent, hash: file.hash });
+      toast("Guardado");
+      // Se ve ya, sin colores; los colores llegan al volver a leerlo.
+      file = { ...file, text: sent, hash, colors: null };
+      code.replaceChildren(...codeLines(file));
+      setEditing(false);
+      attempt(load);
+    } catch (e) {
+      if (e instanceof Unauthorized) return attempt(() => { throw e; });
+      toast(errorText(e), true);
+      // Lo cambió alguien más: lo escrito se pierde si se vuelve a leer.
+      if (/cambió/.test(e.message) && await ask("El archivo cambió", "Alguien más (el agente) lo cambió mientras lo editabas. Si lo vuelves a leer, pierdes tus cambios.", "Volver a leer", true)) {
+        await attempt(load);
+        setEditing(false);
+      }
+    } finally {
+      save.disabled = false;
+    }
+  });
+  // Que salir no se lleve lo que no se guardó.
+  leaveGuard = dirty;
+  const warn = (e) => { if (dirty()) e.preventDefault(); };
+  window.addEventListener("beforeunload", warn);
+  cleanup.push(() => window.removeEventListener("beforeunload", warn));
+
+  // Buscar: cada Enter salta a la siguiente línea que lo tiene.
+  let hit = -1;
+  find.addEventListener("input", () => {
+    code.children[hit]?.classList.remove("hit");
+    hit = -1;
+  });
+  find.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !file) return;
+    e.preventDefault();
+    const q = find.value.toLowerCase();
+    if (!q) return;
+    const lines = [...code.children];
+    const n = lines.length;
+    for (let step = 1; step <= n; step++) {
+      const i = (hit + step) % n;
+      // Solo el texto: con un número, el de la línea no cuenta.
+      if (lines[i].lastChild.textContent.toLowerCase().includes(q)) {
+        lines[hit]?.classList.remove("hit");
+        hit = i;
+        lines[i].classList.add("hit");
+        lines[i].scrollIntoView({ block: "center" });
+        return;
+      }
+    }
+    toast(`No encontré «${find.value}»`, true);
+  });
+
+  main.className = "code-main";
+  main.append(bar, editBar, h("div", { class: "code-wrap" }, code, text));
+  attempt(load).then(() => { if (!file) code.textContent = "No pude abrir el archivo."; });
 }
 
 // ---------- tareas ----------
