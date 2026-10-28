@@ -215,7 +215,11 @@ impl Editor {
                     };
                     // Lo que ya estaba cambiado: sus carpetas, si se cerraron,
                     // se quedan cerradas.
-                    let old = changed_paths(self.listing.as_ref());
+                    let old = if self.only_changed {
+                        changed_paths(self.listing.as_ref())
+                    } else {
+                        HashSet::new()
+                    };
                     self.listing = Some(listing);
                     self.list_error = None;
                     if self.only_changed {
@@ -961,26 +965,34 @@ impl Editor {
                 Row::Dir {
                     path,
                     depth,
-                    open,
+                    open: unfolded,
                     changed,
                 } => {
-                    let name = base_name(path);
                     let head = format!(
                         "{}{}{}",
                         "  ".repeat(*depth),
-                        if *open { "▾ " } else { "▸ " },
+                        if *unfolded { "▾ " } else { "▸ " },
                         pad(ic.folder)
                     );
-                    let room = w.saturating_sub(text::width(&head));
+                    // Un nombre suelto se corta por la derecha: importa el
+                    // principio.
+                    let room = w.saturating_sub(text::width(&head) + 1);
+                    let name = format!("{}/", text::truncate(base_name(path), room));
                     let mark = if *changed > 0 { "• " } else { "  " };
+                    // Cerrada con el archivo abierto adentro: en cian, para
+                    // saber dónde está.
+                    let holds_open = !*unfolded
+                        && open.is_some_and(|o| {
+                            o.strip_prefix(path.as_str())
+                                .is_some_and(|r| r.starts_with('/'))
+                        });
+                    let color = if holds_open { Color::Cyan } else { Color::Blue };
                     ListItem::new(Line::from(vec![
                         Span::styled(mark, Style::default().fg(Color::Yellow)),
-                        Span::styled(head, Style::default().fg(Color::Blue)),
+                        Span::styled(head, Style::default().fg(color)),
                         Span::styled(
-                            truncate_left(&format!("{name}/"), room),
-                            Style::default()
-                                .fg(Color::Blue)
-                                .add_modifier(Modifier::BOLD),
+                            name,
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ),
                     ]))
                 }
@@ -1347,7 +1359,10 @@ fn tree(files: &[Entry], picked: &[usize], expanded: &HashSet<String>) -> Vec<Ro
             }
         }
         let mut here = node.files;
-        here.sort_by_cached_key(|&i| base_name(&files[i].path).to_lowercase());
+        here.sort_by_cached_key(|&i| {
+            let name = base_name(&files[i].path);
+            (name.to_lowercase(), name)
+        });
         rows.extend(here.into_iter().map(|i| Row::File { i, depth }));
     }
 
