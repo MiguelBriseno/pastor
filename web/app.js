@@ -381,8 +381,7 @@ tabs.append(...TABS.map(([tab, label, ic]) =>
 
 function route() {
   leaveGuard = null;
-  if (location.hash !== currentHash) previousHash = currentHash;
-  currentHash = location.hash;
+  currentNav = stampNav();
   cleanup.forEach((f) => f());
   cleanup = [];
   sheets.forEach((d) => d.close());
@@ -430,9 +429,19 @@ function route() {
 /** Si la pantalla actual tiene algo que se perdería al salir: la pantalla lo
  * pone y `route` lo quita. */
 let leaveGuard = null;
-let currentHash = location.hash;
-/** La pantalla de antes: si se va a ella, casi seguro fue «atrás». */
-let previousHash = "";
+/** El sello de la entrada del historial que se ve: cada entrada lleva uno
+ * creciente en `history.state`, y uno menor al cambiar es que se fue atrás.
+ * Comparar hashes no basta: la flecha de volver es un enlace al de antes,
+ * que agrega una entrada nueva en vez de ir atrás. */
+let lastNav = 0;
+let currentNav = 0;
+function stampNav() {
+  if (history.state?.nav == null) {
+    lastNav = Math.max(Date.now(), lastNav + 1);
+    history.replaceState({ ...history.state, nav: lastNav }, "");
+  }
+  return history.state.nav;
+}
 /** El siguiente cambio de hash es el de deshacer una salida: no se dibuja. */
 let restoring = false;
 
@@ -447,7 +456,7 @@ window.addEventListener("hashchange", async () => {
   }
   if (leaveGuard?.()) {
     const target = location.hash;
-    const wentBack = target === previousHash;
+    const wentBack = history.state?.nav != null && history.state.nav < currentNav;
     restoring = true;
     if (wentBack) history.forward();
     else history.back();
@@ -1289,7 +1298,15 @@ function fileView(id, path) {
       text.setSelectionRange(0, 0);
     }
   };
-  edit.addEventListener("click", () => file && setEditing(true));
+  edit.addEventListener("click", () => {
+    if (!file) return;
+    // El textarea no guarda los `\r` sueltos ni los finales mezclados: al
+    // guardar cambiaría los finales de línea de todo el archivo.
+    if (/\r(?!\n)/.test(file.text) || (file.text.includes("\r\n") && !crlf())) {
+      return toast("Este archivo mezcla finales de línea: edítalo desde la terminal", true);
+    }
+    setEditing(true);
+  });
   cancel.addEventListener("click", async () => {
     if (dirty() && !(await ask("¿Descartar los cambios?", "Lo que cambiaste no se guarda.", "Descartar", true))) return;
     setEditing(false);

@@ -134,9 +134,14 @@ impl Source {
             Source::Local { root, .. } => write(root, path, text, hash),
             Source::Remote { host, id } => {
                 // El texto va por la entrada: como argumento tiene un límite.
+                // Con su tamaño: si la conexión se corta a medias, allá llega
+                // el fin de la entrada antes y no debe guardar lo que llegó.
+                let bytes = text.len().to_string();
                 let out = remote::run_input(
                     host,
-                    &["files", id, "--write", path, "--hash", hash],
+                    &[
+                        "files", id, "--write", path, "--hash", hash, "--bytes", &bytes,
+                    ],
                     text.as_bytes(),
                 )?;
                 let saved: Saved = parse(host, &out)?;

@@ -198,6 +198,11 @@ impl Editor {
                         ));
                     }
                 }
+                // Con la lista ya a la vista, el error de recargarla no se
+                // dibujaría: va en el pie.
+                Loaded::List(_, Err(e)) if self.listing.is_some() => {
+                    self.set_flash(format!("No pude recargar la lista: {e:#}"));
+                }
                 Loaded::List(_, Err(e)) => self.list_error = Some(format!("{e:#}")),
                 Loaded::File(n, _) if n != self.file_gen => {}
                 Loaded::File(n, result) => {
@@ -876,7 +881,7 @@ impl Editor {
         let mut info = format!(
             " ln {}/{} · col {} ",
             b.cursor.row + 1,
-            b.len(),
+            b.len().max(b.cursor.row + 1),
             b.cursor_col() + 1
         );
         if let Some(c) = &file.colors {
@@ -900,7 +905,10 @@ impl Editor {
         if self.focus == Focus::File {
             self.page = height.saturating_sub(1).max(1);
         }
-        let gutter = file.buf.len().to_string().len() + 1;
+        // La línea vacía tras el último salto no es una línea más, salvo
+        // con el cursor en ella (al bajar del final o escribir ahí).
+        let shown_last = file.buf.len().max(file.buf.cursor.row + 1);
+        let gutter = shown_last.to_string().len() + 1;
         let width = (inner.width as usize).saturating_sub(gutter + 1);
         if height == 0 || width == 0 {
             return;
@@ -924,9 +932,7 @@ impl Editor {
             .as_mut()
             .map(|c| c.paint(lines, file.top..end))
             .unwrap_or_default();
-        let shown_last = file.buf.len();
         for (i, r) in (file.top..end).enumerate() {
-            // La línea vacía tras el último salto no es una línea más.
             if r >= shown_last {
                 break;
             }

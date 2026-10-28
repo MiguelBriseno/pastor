@@ -144,11 +144,15 @@ enum Cmd {
         #[arg(long, conflicts_with = "write", value_name = "RUTA")]
         read: Option<String>,
         /// Guarda en este archivo lo que llega por la entrada
-        #[arg(long, requires = "hash", value_name = "RUTA")]
+        #[arg(long, requires_all = ["hash", "bytes"], value_name = "RUTA")]
         write: Option<String>,
         /// El hash del archivo al leerlo: si cambió, no se guarda
         #[arg(long, value_name = "HASH")]
         hash: Option<String>,
+        /// Cuántos bytes trae la entrada: si llegan menos (se cortó la
+        /// conexión), no se guarda
+        #[arg(long, value_name = "N")]
+        bytes: Option<usize>,
     },
     /// Termina un agente
     Kill {
@@ -529,6 +533,7 @@ fn main() -> Result<()> {
             read,
             write,
             hash,
+            bytes,
         }) => {
             let source = files::Source::agent(&agent)?;
             let json = match (read, write, hash) {
@@ -536,6 +541,9 @@ fn main() -> Result<()> {
                 (None, Some(path), Some(hash)) => {
                     let mut text = String::new();
                     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                    if bytes != Some(text.len()) {
+                        anyhow::bail!("el texto llegó incompleto; no guardé {path}");
+                    }
                     let hash = source.write(&path, &text, &hash)?;
                     serde_json::to_string(&files::Saved { hash })?
                 }
