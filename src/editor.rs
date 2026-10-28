@@ -1,10 +1,11 @@
-//! El editor de archivos: a la izquierda los archivos del directorio (con lo
-//! que cambió en git), a la derecha el archivo abierto, con colores, búsqueda
+//! El editor de archivos: a la izquierda los archivos del directorio en
+//! carpetas (con lo que cambió en git), a la derecha el archivo abierto, con colores, búsqueda
 //! y edición sencilla. Se abre con `e` sobre un agente o con `pastor edit`.
 //!
 //! Leer y guardar va en hilos aparte: con un agente de otra máquina pasa por
 //! SSH y tarda, y la interfaz no debe trabarse mientras.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::buffer::{self, Buffer};
-use crate::files::{Change, Listing, Opened, Source};
+use crate::files::{Change, Entry, Listing, Opened, Source};
 use crate::icons::{self, pad};
 use crate::syntax::{self, Colors, Painted};
 use crate::text;
@@ -67,6 +68,21 @@ enum Loaded {
     },
 }
 
+/// Una fila de la lista. Sin filtro, las carpetas en árbol; filtrando, solo
+/// los archivos que coinciden, con su ruta entera.
+#[derive(Debug, PartialEq)]
+enum Row {
+    Dir {
+        path: String,
+        depth: usize,
+        open: bool,
+        /// Cuántos archivos cambiaron dentro.
+        changed: usize,
+    },
+    /// El índice en `listing.files`.
+    File { i: usize, depth: usize },
+}
+
 struct FileView {
     /// La apertura de la que salió (`file_gen` entonces): un guardado
     /// solo vale para el buffer que lo pidió.
@@ -89,8 +105,14 @@ pub struct Editor {
     list_error: Option<String>,
     filter: String,
     only_changed: bool,
-    /// Los índices de `listing.files` que pasan el filtro, en orden.
-    shown: Vec<usize>,
+    /// Las filas que se ven, en orden.
+    shown: Vec<Row>,
+    /// Cuántos archivos pasan el filtro.
+    matches: usize,
+    /// Las carpetas abiertas.
+    expanded: HashSet<String>,
+    /// Con `c`, las que estaban abiertas antes: al quitarlo se vuelve a ellas.
+    expanded_before: Option<HashSet<String>>,
     list_sel: ListState,
     focus: Focus,
     file: Option<FileView>,
@@ -126,6 +148,9 @@ impl Editor {
             filter: String::new(),
             only_changed: false,
             shown: Vec::new(),
+            matches: 0,
+            expanded: HashSet::new(),
+            expanded_before: None,
             list_sel: ListState::default(),
             focus: Focus::List,
             file: None,
@@ -186,10 +211,21 @@ impl Editor {
                     // La primera vez, el archivo que ya se abrió.
                     let keep = match &self.listing {
                         None => self.file.as_ref().map(|f| f.path.clone()),
-                        Some(_) => self.selected_path(),
+                        Some(_) => self.selected_key(),
+                    };
+                    // Lo que ya estaba cambiado: sus carpetas, si se cerraron,
+                    // se quedan cerradas.
+                    let old = if self.only_changed {
+                        changed_paths(self.listing.as_ref())
+                    } else {
+                        HashSet::new()
                     };
                     self.listing = Some(listing);
                     self.list_error = None;
+                    if self.only_changed {
+                        // Lo que cambió desde que se pulsó `c`, también a la vista.
+                        self.open_changed(&old);
+                    }
                     self.refilter(keep.as_deref());
                     if let Some(l) = self.listing.as_ref().filter(|l| l.truncated) {
                         self.set_flash(format!(
@@ -260,15 +296,11 @@ impl Editor {
         if let Some(c) = cursor {
             view.buf.goto(c);
         }
-        // En la lista, el que se abrió.
-        if let Some(l) = &self.listing {
-            if let Some(i) = self
-                .shown
-                .iter()
-                .position(|&i| l.files[i].path == view.path)
-            {
-                self.list_sel.select(Some(i));
-            }
+        // En la lista, el que se abrió (con sus carpetas abiertas). Al
+        // volver a leer el mismo, la lista se queda como estaba.
+        if self.listing.is_some() && cursor.is_none() {
+            let path = view.path.clone();
+            self.refilter(Some(&path));
         }
         self.file = Some(view);
         self.focus = Focus::File;
@@ -321,30 +353,54 @@ impl Editor {
 
     // ---------- la lista ----------
 
-    fn selected_path(&self) -> Option<String> {
-        let l = self.listing.as_ref()?;
-        let i = *self.shown.get(self.list_sel.selected()?)?;
-        Some(l.files[i].path.clone())
+    fn selected_row(&self) -> Option<&Row> {
+        self.shown.get(self.list_sel.selected()?)
     }
 
-    /// Vuelve a filtrar la lista, dejando seleccionado `keep` si sigue.
+    /// El archivo seleccionado (no si es una carpeta).
+    fn selected_path(&self) -> Option<String> {
+        let l = self.listing.as_ref()?;
+        match self.selected_row()? {
+            Row::File { i, .. } => Some(l.files[*i].path.clone()),
+            Row::Dir { .. } => None,
+        }
+    }
+
+    /// La ruta de la fila seleccionada, carpeta o archivo.
+    fn selected_key(&self) -> Option<String> {
+        let l = self.listing.as_ref()?;
+        Some(row_path(&l.files, self.selected_row()?).to_string())
+    }
+
+    /// Vuelve a filtrar la lista, dejando seleccionado `keep` (un archivo o
+    /// una carpeta) si sigue, con sus carpetas abiertas.
     fn refilter(&mut self, keep: Option<&str>) {
         let Some(l) = &self.listing else {
             return;
         };
         let q = self.filter.to_lowercase();
-        let mut shown: Vec<(usize, (bool, usize))> = l
+        let mut picked: Vec<(usize, (bool, usize))> = l
             .files
             .iter()
             .enumerate()
             .filter(|(_, e)| !self.only_changed || e.change.is_some())
             .filter_map(|(i, e)| fuzzy(&e.path, &q).map(|rank| (i, rank)))
             .collect();
-        if !q.is_empty() {
-            shown.sort_by_key(|(_, rank)| *rank);
+        self.matches = picked.len();
+        if q.is_empty() {
+            if let Some(p) = keep {
+                open_parents(&mut self.expanded, p);
+            }
+            let picked: Vec<usize> = picked.into_iter().map(|(i, _)| i).collect();
+            self.shown = tree(&l.files, &picked, &self.expanded);
+        } else {
+            picked.sort_by_key(|(_, rank)| *rank);
+            self.shown = picked
+                .into_iter()
+                .map(|(i, _)| Row::File { i, depth: 0 })
+                .collect();
         }
-        self.shown = shown.into_iter().map(|(i, _)| i).collect();
-        let at = keep.and_then(|p| self.shown.iter().position(|&i| l.files[i].path == p));
+        let at = keep.and_then(|p| self.shown.iter().position(|r| row_path(&l.files, r) == p));
         let sel = match at {
             Some(i) => Some(i),
             None if self.shown.is_empty() => None,
@@ -356,6 +412,57 @@ impl Editor {
             ),
         };
         self.list_sel.select(sel);
+    }
+
+    /// Cambió el filtro: con algo escrito, lo primero que pasa; vacío, de
+    /// vuelta al árbol con lo que estaba seleccionado.
+    fn filter_changed(&mut self) {
+        if self.filter.is_empty() {
+            let keep = self.selected_key();
+            self.refilter(keep.as_deref());
+        } else {
+            self.list_sel.select(Some(0));
+            self.refilter(None);
+        }
+    }
+
+    /// Abre las carpetas con archivos cambiados, menos los que están en `old`.
+    fn open_changed(&mut self, old: &HashSet<String>) {
+        if let Some(l) = &self.listing {
+            for e in l.files.iter().filter(|e| e.change.is_some()) {
+                if old.contains(&e.path) {
+                    continue;
+                }
+                open_parents(&mut self.expanded, &e.path);
+            }
+        }
+    }
+
+    /// Abre o cierra la carpeta `path`.
+    fn fold(&mut self, path: &str, open: bool) {
+        if open {
+            self.expanded.insert(path.to_string());
+        } else {
+            self.expanded.remove(path);
+        }
+        self.refilter(Some(path));
+    }
+
+    /// Selecciona la carpeta que contiene la fila seleccionada.
+    fn select_parent(&mut self) {
+        let Some(key) = self.selected_key() else {
+            return;
+        };
+        let Some((parent, _)) = key.rsplit_once('/') else {
+            return;
+        };
+        if let Some(i) = self
+            .shown
+            .iter()
+            .position(|r| matches!(r, Row::Dir { path, .. } if path == parent))
+        {
+            self.list_sel.select(Some(i));
+        }
     }
 
     fn move_list(&mut self, d: isize) {
@@ -459,8 +566,7 @@ impl Editor {
         match &mut self.prompt {
             Some(Prompt::Filter) => {
                 self.filter.push_str(&text.replace('\n', ""));
-                let keep = self.selected_path();
-                self.refilter(keep.as_deref());
+                self.filter_changed();
             }
             Some(Prompt::Search(s) | Prompt::Goto(s)) => s.push_str(&text.replace('\n', " ")),
             Some(Prompt::Discard(_)) => {}
@@ -526,11 +632,17 @@ impl Editor {
                     KeyCode::Esc => self.filter.clear(),
                     KeyCode::Enter | KeyCode::Down | KeyCode::Up | KeyCode::Tab => {
                         if key.code == KeyCode::Enter {
+                            let sel = self.selected_row();
+                            if let Some(Row::Dir { path, open, .. }) = sel {
+                                let (path, open) = (path.clone(), *open);
+                                self.fold(&path, !open);
+                                return;
+                            }
                             if let Some(path) = self.selected_path() {
                                 self.ask(Then::Open(path));
                             }
                         }
-                        let keep = self.selected_path();
+                        let keep = self.selected_key();
                         self.refilter(keep.as_deref());
                         return;
                     }
@@ -541,9 +653,7 @@ impl Editor {
                         self.prompt = Some(Prompt::Filter);
                     }
                 }
-                // Al filtrar, lo primero que pasa el filtro.
-                self.list_sel.select(Some(0));
-                self.refilter(None);
+                self.filter_changed();
             }
             Prompt::Search(mut s) => match key.code {
                 KeyCode::Esc => {}
@@ -599,14 +709,49 @@ impl Editor {
             KeyCode::Home | KeyCode::Char('g') => self.move_list(isize::MIN / 2),
             KeyCode::End | KeyCode::Char('G') => self.move_list(isize::MAX / 2),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(path) = self.selected_path() {
-                    self.ask(Then::Open(path));
+                let sel = self.selected_row();
+                match sel {
+                    Some(Row::Dir { path, open, .. }) => {
+                        let (path, open) = (path.clone(), *open);
+                        if !open || key.code == KeyCode::Enter {
+                            self.fold(&path, !open);
+                        } else {
+                            // Ya abierta: → baja a lo primero de adentro.
+                            self.move_list(1);
+                        }
+                    }
+                    Some(Row::File { .. }) => {
+                        if let Some(path) = self.selected_path() {
+                            self.ask(Then::Open(path));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                let sel = self.selected_row();
+                match sel {
+                    Some(Row::Dir {
+                        path, open: true, ..
+                    }) => {
+                        let path = path.clone();
+                        self.fold(&path, false);
+                    }
+                    _ => self.select_parent(),
                 }
             }
             KeyCode::Char('/') => self.prompt = Some(Prompt::Filter),
             KeyCode::Char('c') => {
                 self.only_changed = !self.only_changed;
-                let keep = self.selected_path();
+                if self.only_changed {
+                    // Las carpetas con cambios, abiertas.
+                    self.expanded_before = Some(self.expanded.clone());
+                    self.open_changed(&HashSet::new());
+                } else if let Some(before) = self.expanded_before.take() {
+                    // Las de antes (y las de lo seleccionado, en `refilter`).
+                    self.expanded = before;
+                }
+                let keep = self.selected_key();
                 self.refilter(keep.as_deref());
             }
             KeyCode::Char('r') => {
@@ -616,7 +761,7 @@ impl Editor {
             KeyCode::Tab if self.file.is_some() => self.focus = Focus::File,
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
-                let keep = self.selected_path();
+                let keep = self.selected_key();
                 self.refilter(keep.as_deref());
             }
             KeyCode::Esc | KeyCode::Char('q') => self.ask(Then::Close),
@@ -752,7 +897,7 @@ impl Editor {
             .title(format!(" {}{} ", pad(ic.folder), self.title));
         if let Some(l) = &self.listing {
             let changed = l.files.iter().filter(|e| e.change.is_some()).count();
-            let mut info = format!(" {}/{} ", self.shown.len(), l.files.len());
+            let mut info = format!(" {}/{} ", self.matches, l.files.len());
             if changed > 0 {
                 info.push_str(&format!("· {changed} cambiados "));
             }
@@ -811,27 +956,75 @@ impl Editor {
             return;
         }
         let open = self.file.as_ref().map(|f| f.path.as_str());
+        let flat = !self.filter.is_empty();
         let w = (rest.width as usize).saturating_sub(2);
         let items: Vec<ListItem> = self
             .shown
             .iter()
-            .map(|&i| {
-                let e = &l.files[i];
-                let (mark, color) = match e.change {
-                    Some(Change::Modified) => ("M ", Color::Yellow),
-                    Some(Change::Added) => ("+ ", Color::Green),
-                    None => ("  ", Color::DarkGray),
-                };
-                let mut style = Style::default();
-                if Some(e.path.as_str()) == open {
-                    style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
-                } else if e.change.is_some() {
-                    style = style.fg(color);
+            .map(|row| match row {
+                Row::Dir {
+                    path,
+                    depth,
+                    open: unfolded,
+                    changed,
+                } => {
+                    let head = format!(
+                        "{}{}{}",
+                        "  ".repeat(*depth),
+                        if *unfolded { "▾ " } else { "▸ " },
+                        pad(ic.folder)
+                    );
+                    // Un nombre suelto se corta por la derecha: importa el
+                    // principio.
+                    let room = w.saturating_sub(text::width(&head) + 1);
+                    let name = format!("{}/", text::truncate(base_name(path), room));
+                    let mark = if *changed > 0 { "• " } else { "  " };
+                    // Cerrada con el archivo abierto adentro: en cian, para
+                    // saber dónde está.
+                    let holds_open = !*unfolded
+                        && open.is_some_and(|o| {
+                            o.strip_prefix(path.as_str())
+                                .is_some_and(|r| r.starts_with('/'))
+                        });
+                    let color = if holds_open { Color::Cyan } else { Color::Blue };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(mark, Style::default().fg(Color::Yellow)),
+                        Span::styled(head, Style::default().fg(color)),
+                        Span::styled(
+                            name,
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
                 }
-                ListItem::new(Line::from(vec![
-                    Span::styled(mark, Style::default().fg(color)),
-                    Span::styled(truncate_left(&e.path, w), style),
-                ]))
+                Row::File { i, depth } => {
+                    let e = &l.files[*i];
+                    let (mark, color) = match e.change {
+                        Some(Change::Modified) => ("M ", Color::Yellow),
+                        Some(Change::Added) => ("+ ", Color::Green),
+                        None => ("  ", Color::DarkGray),
+                    };
+                    let mut style = Style::default();
+                    if Some(e.path.as_str()) == open {
+                        style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                    } else if e.change.is_some() {
+                        style = style.fg(color);
+                    }
+                    // En el árbol, el nombre a la altura del de las carpetas
+                    // hermanas (después de la flecha y el icono).
+                    let (indent, name) = if flat {
+                        (String::new(), e.path.as_str())
+                    } else {
+                        let name = base_name(&e.path);
+                        let skip = 2 * depth + 2 + text::width(&pad(ic.folder));
+                        (" ".repeat(skip), name)
+                    };
+                    let room = w.saturating_sub(indent.len());
+                    ListItem::new(Line::from(vec![
+                        Span::styled(mark, Style::default().fg(color)),
+                        Span::raw(indent),
+                        Span::styled(truncate_left(name, room), style),
+                    ]))
+                }
             })
             .collect();
         let list = List::new(items).highlight_style(Style::default().bg(SELECTED));
@@ -1058,9 +1251,22 @@ impl Editor {
                 ("Esc lista", 0),
                 ("q salir", 0),
             ],
+            // Filtrando no hay carpetas.
+            _ if !self.filter.is_empty() => &[
+                ("↑↓ mover", 1),
+                ("⏎ abrir", 0),
+                ("/ filtrar", 0),
+                ("Esc borrar filtro", 0),
+                ("c solo cambiados", 1),
+                ("r recargar", 2),
+                ("Tab al archivo", 2),
+                ("< > ancho", 3),
+                ("q salir", 0),
+            ],
             _ => &[
                 ("↑↓ mover", 1),
                 ("⏎ abrir", 0),
+                ("←→ carpetas", 1),
                 ("/ filtrar", 0),
                 ("c solo cambiados", 1),
                 ("r recargar", 2),
@@ -1078,6 +1284,103 @@ fn changed(f: &mut FileView, row: usize) {
     if let Some(c) = f.colors.as_mut() {
         c.changed(row);
     }
+}
+
+/// El último tramo de una ruta con `/`.
+fn base_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Las rutas de los archivos cambiados de `listing`.
+fn changed_paths(listing: Option<&Listing>) -> HashSet<String> {
+    listing
+        .map(|l| {
+            l.files
+                .iter()
+                .filter(|e| e.change.is_some())
+                .map(|e| e.path.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Abre las carpetas que contienen `path`.
+fn open_parents(expanded: &mut HashSet<String>, path: &str) {
+    for (i, _) in path.match_indices('/') {
+        expanded.insert(path[..i].to_string());
+    }
+}
+
+/// La ruta de una fila: de la carpeta o del archivo.
+fn row_path<'a>(files: &'a [Entry], row: &'a Row) -> &'a str {
+    match row {
+        Row::Dir { path, .. } => path,
+        Row::File { i, .. } => &files[*i].path,
+    }
+}
+
+/// Los archivos `picked` (índices de `files`) en árbol: en cada carpeta,
+/// primero las carpetas y luego los archivos, por nombre. De las carpetas
+/// cerradas no sale lo de adentro.
+fn tree(files: &[Entry], picked: &[usize], expanded: &HashSet<String>) -> Vec<Row> {
+    #[derive(Default)]
+    struct Node<'a> {
+        dirs: HashMap<&'a str, Node<'a>>,
+        files: Vec<usize>,
+        changed: usize,
+    }
+
+    fn walk(
+        node: Node,
+        prefix: &str,
+        depth: usize,
+        files: &[Entry],
+        expanded: &HashSet<String>,
+        rows: &mut Vec<Row>,
+    ) {
+        let mut dirs: Vec<_> = node.dirs.into_iter().collect();
+        // Desempata por el nombre tal cual: el orden del mapa cambia cada vez.
+        dirs.sort_by_cached_key(|(name, _)| (name.to_lowercase(), *name));
+        for (name, sub) in dirs {
+            let path = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let open = expanded.contains(&path);
+            rows.push(Row::Dir {
+                path: path.clone(),
+                depth,
+                open,
+                changed: sub.changed,
+            });
+            if open {
+                walk(sub, &path, depth + 1, files, expanded, rows);
+            }
+        }
+        let mut here = node.files;
+        here.sort_by_cached_key(|&i| {
+            let name = base_name(&files[i].path);
+            (name.to_lowercase(), name)
+        });
+        rows.extend(here.into_iter().map(|i| Row::File { i, depth }));
+    }
+
+    let mut root = Node::default();
+    for &i in picked {
+        let e = &files[i];
+        let changed = usize::from(e.change.is_some());
+        let dirs = e.path.rsplit_once('/').map_or("", |(d, _)| d);
+        let mut node = &mut root;
+        for d in dirs.split('/').filter(|d| !d.is_empty()) {
+            node = node.dirs.entry(d).or_default();
+            node.changed += changed;
+        }
+        node.files.push(i);
+    }
+    let mut rows = Vec::new();
+    walk(root, "", 0, files, expanded, &mut rows);
+    rows
 }
 
 /// Si `path` tiene las letras de `q` en orden (sin mayúsculas: `q` ya viene
@@ -1268,6 +1571,137 @@ mod tests {
         ed.on_key(key(KeyCode::Char('y')));
         ed.opened(b, opened("b.txt", "dos"));
         assert_eq!(ed.file.as_ref().unwrap().path, "a.txt");
+    }
+
+    fn entry(path: &str, change: Option<Change>) -> Entry {
+        Entry {
+            path: path.into(),
+            change,
+        }
+    }
+
+    fn rows(files: &[Entry], rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                Row::Dir {
+                    path,
+                    depth,
+                    open,
+                    changed,
+                } => format!("{depth} {path}/ {open} {changed}"),
+                Row::File { i, depth } => format!("{depth} {}", files[*i].path),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ordena_en_carpetas_primero_las_carpetas() {
+        let files = vec![
+            entry("README.md", None),
+            entry("a.txt", None),
+            entry("src/main.rs", Some(Change::Modified)),
+            entry("src/ui/app.js", Some(Change::Added)),
+            entry("Docs/x.md", None),
+            entry("docs/y.md", None),
+        ];
+        let all: Vec<usize> = (0..files.len()).collect();
+        let none = HashSet::new();
+        assert_eq!(
+            rows(&files, &tree(&files, &all, &none)),
+            [
+                "0 Docs/ false 0",
+                "0 docs/ false 0",
+                "0 src/ false 2",
+                "0 a.txt",
+                "0 README.md"
+            ]
+        );
+        let mut open = HashSet::new();
+        open_parents(&mut open, "src/ui/app.js");
+        assert_eq!(
+            rows(&files, &tree(&files, &all, &open)),
+            [
+                "0 Docs/ false 0",
+                "0 docs/ false 0",
+                "0 src/ true 2",
+                "1 src/ui/ true 1",
+                "2 src/ui/app.js",
+                "1 src/main.rs",
+                "0 a.txt",
+                "0 README.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn las_flechas_abren_y_cierran_carpetas() {
+        let dir = std::env::temp_dir().join(format!("pastor-ed3-{}", std::process::id()));
+        let mut ed = Editor::new(Source::dir(dir), "x".into(), None);
+        ed.listing = Some(Listing {
+            files: vec![entry("src/a.rs", None), entry("z.txt", None)],
+            ..Default::default()
+        });
+        ed.refilter(None);
+        assert_eq!(ed.shown.len(), 2);
+        assert_eq!(ed.selected_key().as_deref(), Some("src"));
+        ed.on_key(key(KeyCode::Right));
+        assert_eq!(ed.shown.len(), 3);
+        ed.on_key(key(KeyCode::Right));
+        assert_eq!(ed.selected_path().as_deref(), Some("src/a.rs"));
+        ed.on_key(key(KeyCode::Left));
+        assert_eq!(ed.selected_key().as_deref(), Some("src"));
+        ed.on_key(key(KeyCode::Left));
+        assert_eq!(ed.shown.len(), 2);
+        // Filtrando, la ruta entera; al borrar el filtro, de vuelta al árbol
+        // con el archivo a la vista.
+        ed.on_key(key(KeyCode::Char('/')));
+        ed.on_key(key(KeyCode::Char('a')));
+        assert_eq!(ed.shown, [Row::File { i: 0, depth: 0 }]);
+        ed.on_key(key(KeyCode::Esc));
+        assert_eq!(ed.selected_path().as_deref(), Some("src/a.rs"));
+        // Con `c` se abren las carpetas con cambios; al quitarlo, se vuelve
+        // a como estaban.
+        ed.on_key(key(KeyCode::Left));
+        ed.on_key(key(KeyCode::Left));
+        ed.listing.as_mut().unwrap().files[0].change = Some(Change::Modified);
+        ed.on_key(key(KeyCode::Char('c')));
+        assert_eq!(ed.shown.len(), 2);
+        ed.on_key(key(KeyCode::Up));
+        ed.on_key(key(KeyCode::Char('c')));
+        assert_eq!(ed.selected_key().as_deref(), Some("src"));
+        assert_eq!(ed.shown.len(), 2);
+    }
+
+    #[test]
+    fn con_c_lo_que_cambia_al_recargar_queda_a_la_vista() {
+        let dir = std::env::temp_dir().join(format!("pastor-ed4-{}", std::process::id()));
+        let mut ed = Editor::new(Source::dir(dir), "x".into(), None);
+        let listing = |change| Listing {
+            files: vec![
+                entry("a/x.rs", Some(Change::Modified)),
+                entry("b/y.rs", change),
+            ],
+            ..Default::default()
+        };
+        ed.listing = Some(listing(None));
+        ed.on_key(key(KeyCode::Char('c')));
+        assert_eq!(ed.shown.len(), 2);
+        ed.list_gen += 1;
+        ed.tx
+            .send(Loaded::List(ed.list_gen, Ok(listing(Some(Change::Added)))))
+            .unwrap();
+        ed.poll();
+        assert_eq!(ed.shown.len(), 4);
+        // Lo que ya estaba cambiado no vuelve a abrir la carpeta cerrada.
+        ed.list_sel.select(Some(0));
+        ed.on_key(key(KeyCode::Left));
+        assert_eq!(ed.shown.len(), 3);
+        ed.list_gen += 1;
+        ed.tx
+            .send(Loaded::List(ed.list_gen, Ok(listing(Some(Change::Added)))))
+            .unwrap();
+        ed.poll();
+        assert_eq!(ed.shown.len(), 3);
     }
 
     #[test]
