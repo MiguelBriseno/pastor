@@ -36,6 +36,12 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
+/// El valor de `key` en la configuración de git del repositorio de `dir`
+/// (la de un worktree es la de su repositorio), si está puesta.
+pub fn config_get(dir: &Path, key: &str) -> Option<String> {
+    git(dir, &["config", "--get", key]).ok()
+}
+
 /// La raíz del repositorio de git que contiene `dir`, si está en uno.
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     git(dir, &["rev-parse", "--show-toplevel"])

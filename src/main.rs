@@ -1,6 +1,8 @@
+mod acciones;
 mod agent;
 mod avisos;
 mod buffer;
+mod check;
 mod editor;
 mod files;
 mod history;
@@ -293,6 +295,16 @@ enum TaskCmd {
             value_name = "TEXTO"
         )]
         text: Vec<String>,
+    },
+    /// Corre la revisión automática de una tarea en su worktree: el comando
+    /// de `git config pastor.check` de su repositorio
+    Check {
+        /// Id de la tarea
+        #[arg(value_name = "TAREA")]
+        task: String,
+        /// Si falla, se la devuelve a su agente con la salida
+        #[arg(long = "return")]
+        give_back: bool,
     },
     /// Marca una tarea como hecha
     Done {
@@ -749,10 +761,17 @@ fn task_cmd(cmd: TaskCmd) -> Result<()> {
                     .spend_by_task
                     .get(&t.id)
                     .map_or_else(|| "-".to_string(), usage::Spend::cost_label);
+                let mark = match t.check.as_ref().map(|c| (c.state, c.interrupted())) {
+                    Some((_, true)) => " ?",
+                    Some((store::CheckState::Running, _)) => " …",
+                    Some((store::CheckState::Passed, _)) => " ✓",
+                    Some((store::CheckState::Failed, _)) => " ✗",
+                    None => "",
+                };
                 println!(
-                    "{:<5} {:<12} {} {:>9}  {}",
+                    "{:<5} {:<14} {} {:>9}  {}",
                     t.id,
-                    t.status.label(),
+                    format!("{}{mark}", t.status.label()),
                     text::pad_right(agent, 16),
                     cost,
                     t.title
@@ -792,6 +811,19 @@ fn task_cmd(cmd: TaskCmd) -> Result<()> {
         TaskCmd::Reject { task, text } => {
             let a = ops::reject_task(&task, &text.join(" "))?;
             println!("Tarea {task} devuelta a {}", a.name);
+        }
+        TaskCmd::Check { task, give_back } => {
+            let out = check::run(&task, give_back, |line| println!("{line}"))?;
+            match (out.passed, out.returned_to) {
+                (true, _) => println!("✓ La tarea {task} pasó la revisión"),
+                (false, Some(agent)) => {
+                    println!("✗ La tarea {task} no pasó la revisión; se la devolví a {agent}")
+                }
+                (false, None) => {
+                    println!("✗ La tarea {task} no pasó la revisión");
+                    std::process::exit(1);
+                }
+            }
         }
         TaskCmd::Done { task } => ops::set_task_status(&task, TaskStatus::Done)?,
         TaskCmd::Rm { task } => ops::delete_task(&task)?,

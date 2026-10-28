@@ -46,6 +46,10 @@ cuando alguno necesita tu respuesta y te deja repartirles tareas.
   con los precios de la API, en la lista de tareas, al pie de cada agente y en el Historial.
 - **Buscar en las conversaciones** de todos los agentes de Claude, también los que ya terminaron
   («¿quién tocó `auth.rs` la semana pasada?»).
+- **Aprobar desde el aviso.** Cuando un agente te pide permiso, el aviso del celular trae lo que
+  pregunta y los botones *Aprobar* y *Rechazar*: contestas sin abrir nada.
+- **Revisión automática.** Al terminar el agente, pastor corre los tests del proyecto en el
+  worktree de la tarea; si fallan, le devuelve la tarea con el error.
 - **Aviso de conflictos.** Si dos tareas (o una tarea y tu rama) cambian los mismos archivos,
   pastor te avisa antes de que apruebes una.
 - **CLI completa** para usarlo desde scripts o desde otros agentes.
@@ -214,6 +218,7 @@ archivo abierto, con colores según el lenguaje.
 | `espacio` | Avanzar el estado: pendiente → en curso → por revisar → hecha |
 | `d` | Marcar como hecha |
 | `v` | Ver lo que cambió en su worktree (con el paginador de git; sal con `q`) |
+| `c` | Correr la revisión automática (ver abajo) |
 | `A` | Aprobar: integra su rama, termina a su agente y borra el worktree (pide confirmación) |
 | `r` | Pedir cambios: le manda tu comentario al agente y la tarea vuelve a *en curso* |
 | `g` | Ir al agente que tiene la tarea |
@@ -240,6 +245,29 @@ Cuando la tarea está *por revisar*:
   agente con `r` que integre tu rama en la suya y vuelve a aprobar. Si tienes cambios sin commit
   que el merge pisaría, git se niega y pastor te muestra por qué.
 - `r` le manda tu comentario al agente.
+
+#### Revisión automática
+
+Dile a pastor con qué se revisa un repositorio, una vez:
+
+```sh
+git -C ~/proyectos/api config pastor.check "cargo test"
+```
+
+(se guarda en `.git/config`, no en un archivo del proyecto). Desde entonces, cada vez que una tarea
+pasa a *por revisar*, pastor corre ese comando con `sh` en su worktree (o en el directorio de su
+agente, si no tiene). En la lista, la tarea lleva `…` mientras corre, `✓` si pasó y `✗` si no, y su
+descripción dice cuándo y muestra las últimas líneas de la salida (`?` si se interrumpió: el
+proceso terminó sin dar resultado, por ejemplo al reiniciar la máquina). Si falla, se la devuelve a su
+agente con la salida («La revisión automática falló… Arréglalo») y la tarea vuelve a *en curso*;
+cuando el agente termina, se revisa otra vez. Después de 3 intentos seguidos sin pasar, la deja por
+revisar para ti. Te llega un aviso con cada resultado.
+
+El comando corre en otro proceso: no frena la interfaz y sigue aunque la cierres. Si pasa de 20
+minutos, pastor lo detiene y cuenta como fallo. La salida completa queda en
+`~/.local/share/pastor/checks/<tarea>.log`. Con `c` (o `pastor task check t1`) la corres a mano,
+sin que se la devuelva al agente. Al aprobar con `A`, la confirmación avisa si no pasó o si todavía
+corre.
 
 Si el worktree de una tarea cambia archivos que también cambia otra tarea, otro agente con
 worktree o tu rama (commits nuevos o cambios sin guardar), la tarea lleva un `⚠` y su descripción
@@ -345,6 +373,7 @@ pastor task assign t1 --agent api                          # con uno que ya exis
 pastor task assign t1 --new claude --worktree              # con uno nuevo en su worktree
 
 pastor task diff t1            # lo que cambió en su worktree (--stat para el resumen)
+pastor task check t1           # corre su revisión automática (--return: si falla, se la devuelve)
 pastor task reject t1 "falta cubrir el caso de contraseña vacía"
 pastor task approve t1         # integra su rama, termina al agente y borra el worktree
 
@@ -430,6 +459,7 @@ IP de Tailscale (que ya cifra).
 | `POST` | `/api/tasks/{id}/done` | — |
 | `POST` | `/api/tasks/{id}/approve` | — |
 | `POST` | `/api/tasks/{id}/reject` | `{"text": "..."}` |
+| `POST` | `/api/tasks/{id}/check` | — (corre su revisión automática en otro proceso; el resultado llega en `check` de la tarea) |
 | `DELETE` | `/api/tasks/{id}` | — |
 | `GET` | `/api/stats` | — (las estadísticas de la pestaña Historial; las duraciones van en segundos, el gasto en `usage`, `usage_today` y `avg_task_cost`) |
 | `GET` | `/api/search` | `?q=auth.rs` (y `since=7d`, `max=50`): los mensajes de las conversaciones que tienen todas las palabras |
@@ -545,6 +575,32 @@ esté abierto. Con los dos abiertos avisa solo la interfaz, así que no llegan d
 sigue `pastor serve` (lo que pase en ese segundo no avisa). Como servicio de systemd, define las variables con
 `Environment=PASTOR_NTFY_URL=…` en la unidad: no lee tu `.bashrc`. El que avisa también pasa a revisión la tarea de un agente que
 termina. Si un aviso no sale (URL o token mal puestos, sin red), el motivo queda en `hooks.log`.
+
+### Aprobar o rechazar desde el aviso
+
+Si además el celular llega a `pastor serve`, el aviso de «web necesita tu atención» trae lo que el
+agente pregunta (el comando que quiere correr, por ejemplo) y los botones **Aprobar** y
+**Rechazar**; todos los avisos traen **Abrir**, que abre el agente en la app. Dile a pastor con qué
+dirección lo alcanza el celular, junto a la de ntfy:
+
+```sh
+export PASTOR_SERVE_URL=http://100.101.102.103:7433   # p. ej. la IP de Tailscale de esta máquina
+```
+
+pastor lee las opciones del diálogo en la pantalla: *Aprobar* elige la primera que empieza con sí
+(«Yes», «Allow»…) y *Rechazar* la primera con no, moviéndose con las flechas. No es pulsar Enter: en
+el diálogo de confianza de Claude Code la opción marcada es «No, exit». Si el diálogo no tiene
+opciones de sí o no, el aviso solo trae *Abrir*.
+
+Lo que pregunta el agente (el comando entero, si es un permiso de Bash) va en el texto del aviso y
+pasa por el servidor de ntfy: si un comando puede llevar un secreto, ponlo en el tema de un servidor
+propio o quítalo con `PASTOR_NTFY_DETAIL=0`.
+
+Cada botón es una dirección de un solo uso que caduca en una hora, y solo vale para el diálogo tal
+como estaba al avisar: si ya contestaste desde la compu, o el agente pregunta otra cosa, el botón
+no pulsa nada y ntfy te muestra por qué. Usar uno anula el otro, y un aviso nuevo del mismo agente
+anula los anteriores. Estas direcciones pasan por el servidor de ntfy, pero solo sirven donde se
+alcance `pastor serve` (con Tailscale, solo tus dispositivos) y no dan acceso a nada más.
 
 ### Sonido
 

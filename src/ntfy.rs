@@ -23,9 +23,26 @@ fn config() -> Option<Config> {
     })
 }
 
-/// Publica `msg` si ntfy está configurado. Devuelve el `curl` en marcha para
-/// que quien llama lo espere (o lo mate si tarda).
-pub fn publish(msg: &str) -> Option<Child> {
+/// Un botón del aviso: abre una página o llama a `pastor serve`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    View { label: String, url: String },
+    Post { label: String, url: String },
+}
+
+/// La URL con la que el celular llega a `pastor serve` (p. ej.
+/// `http://100.64.1.2:7433`), sin la `/` del final. Con ella los avisos
+/// llevan botones.
+pub fn serve_url() -> Option<String> {
+    let url = std::env::var("PASTOR_SERVE_URL").ok()?;
+    let url = url.trim().trim_end_matches('/');
+    (url.starts_with("http://") || url.starts_with("https://")).then(|| url.to_string())
+}
+
+/// Publica `msg` si ntfy está configurado, con `actions` como botones.
+/// Devuelve el `curl` en marcha para que quien llama lo espere (o lo mate si
+/// tarda).
+pub fn publish(msg: &str, actions: &[Action]) -> Option<Child> {
     let config = config()?;
     let mut child = Command::new("curl")
         // La configuración por la entrada: así el token no se ve en `ps`.
@@ -36,7 +53,7 @@ pub fn publish(msg: &str) -> Option<Child> {
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    let input = curl_config(&config, msg);
+    let input = curl_config(&config, msg, actions);
     let written = child
         .stdin
         .take()
@@ -76,9 +93,15 @@ fn failure(stderr: Option<ChildStderr>, status: Option<ExitStatus>) -> Option<St
     }
 }
 
-fn curl_config(c: &Config, msg: &str) -> String {
+fn curl_config(c: &Config, msg: &str, actions: &[Action]) -> String {
     let mut out = format!("url = {}\n", quote(&c.url));
     out.push_str("header = \"Title: pastor\"\n");
+    if !actions.is_empty() {
+        out.push_str(&format!(
+            "header = {}\n",
+            quote(&format!("Actions: {}", actions_header(actions)))
+        ));
+    }
     if let Some(t) = &c.token {
         out.push_str(&format!(
             "header = {}\n",
@@ -87,6 +110,22 @@ fn curl_config(c: &Config, msg: &str) -> String {
     }
     out.push_str(&format!("data-binary = {}\n", quote(msg)));
     out
+}
+
+/// Los botones en el formato de la cabecera `Actions` de ntfy (como mucho
+/// tres). Las etiquetas y URLs son nuestras: sin `,` ni `;`.
+fn actions_header(actions: &[Action]) -> String {
+    actions
+        .iter()
+        .take(3)
+        .map(|a| match a {
+            Action::View { label, url } => format!("view, {label}, {url}, clear=true"),
+            Action::Post { label, url } => {
+                format!("http, {label}, {url}, method=POST, clear=true")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Una cadena entre comillas del archivo de configuración de curl.
@@ -145,13 +184,27 @@ mod tests {
             token: Some("tk_1".into()),
         };
         assert_eq!(
-            curl_config(&c, "web terminó"),
+            curl_config(&c, "web terminó", &[]),
             "url = \"https://ntfy.sh/tema\"\n\
              header = \"Title: pastor\"\n\
              header = \"Authorization: Bearer tk_1\"\n\
              data-binary = \"web terminó\"\n"
         );
         let c = Config { token: None, ..c };
-        assert!(!curl_config(&c, "x").contains("Authorization"));
+        assert!(!curl_config(&c, "x", &[]).contains("Authorization"));
+        let actions = [
+            Action::View {
+                label: "Abrir".into(),
+                url: "http://h:7433/#/agent/a1".into(),
+            },
+            Action::Post {
+                label: "Aprobar".into(),
+                url: "http://h:7433/act/abc".into(),
+            },
+        ];
+        assert!(curl_config(&c, "x", &actions).contains(
+            "header = \"Actions: view, Abrir, http://h:7433/#/agent/a1, clear=true; \
+             http, Aprobar, http://h:7433/act/abc, method=POST, clear=true\"\n"
+        ));
     }
 }
