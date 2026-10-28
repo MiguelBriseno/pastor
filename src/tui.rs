@@ -30,6 +30,8 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::agent::{Kind, Status};
 use crate::avisos::Notifier;
+use crate::editor::Editor;
+use crate::files::Source;
 use crate::history::{self, Stats};
 use crate::icons::{self, pad};
 use crate::limits::{self, Usage};
@@ -41,9 +43,9 @@ use crate::worktree;
 
 const REFRESH: Duration = Duration::from_secs(1);
 /// Cuánto se ve un aviso en el pie.
-const FLASH: Duration = Duration::from_secs(5);
-const SELECTED: Color = Color::Rgb(45, 45, 60);
-const ACCENT: Color = Color::Magenta;
+pub(crate) const FLASH: Duration = Duration::from_secs(5);
+pub(crate) const SELECTED: Color = Color::Rgb(45, 45, 60);
+pub(crate) const ACCENT: Color = Color::Magenta;
 /// Columnas de la etiqueta de un campo (`" {name:>11}: "`).
 const LABEL_W: usize = 14;
 /// Nombre del hilo que observa los paneles.
@@ -197,6 +199,8 @@ struct App {
     actions: Actions,
     /// Los agentes de las otras máquinas.
     remotes: remote::Poller,
+    /// Los archivos de un agente, abiertos con `e`: ocupa toda la vista.
+    editor: Option<Editor>,
     /// Las máquinas que no respondían en la última recarga: se avisa una vez.
     offline: Vec<String>,
     /// Índice en `state.agents`, que está ordenado por proyecto.
@@ -241,6 +245,7 @@ impl App {
             observer_since: Instant::now(),
             actions: Actions::spawn(),
             remotes: remote::Poller::spawn(REFRESH),
+            editor: None,
             offline: Vec::new(),
             agent_sel: ListState::default(),
             agent_rows: ListState::default(),
@@ -331,6 +336,9 @@ impl App {
             }
             if self.observer.died() {
                 self.restart_observer();
+            }
+            if self.editor.as_mut().is_some_and(Editor::poll) {
+                self.dirty = true;
             }
             if self
                 .flash
@@ -539,6 +547,15 @@ impl App {
     // ---------- teclado ----------
 
     fn on_key(&mut self, key: KeyEvent, term: &mut DefaultTerminal) {
+        // En el editor, todas las teclas son suyas (Ctrl-C lo cierra, y pregunta
+        // antes si hay cambios sin guardar).
+        if let Some(ed) = self.editor.as_mut() {
+            ed.on_key(key);
+            if ed.closed {
+                self.editor = None;
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -557,6 +574,10 @@ impl App {
     /// de mensaje y descripción conservan los saltos de línea.
     fn on_paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(ed) = self.editor.as_mut() {
+            ed.on_paste(&text);
+            return;
+        }
         let (field, multiline) = match &mut self.mode {
             Mode::NewAgent(f) => match f.field {
                 1 => (&mut f.cwd, false),
@@ -666,6 +687,16 @@ impl App {
                             input: ops::suggest_term_cmd(a),
                         };
                     }
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(a) = self.selected_agent() {
+                    let dir = a.cwd.file_name().map(|d| d.to_string_lossy().into_owned());
+                    let title = match dir {
+                        Some(d) if d != a.name => format!("{} · {d}", a.name),
+                        _ => a.name.clone(),
+                    };
+                    self.editor = Some(Editor::new(Source::of(a), title, None));
                 }
             }
             KeyCode::Char('T') => {
@@ -1042,6 +1073,13 @@ impl App {
         .areas(f.area());
         self.want_fit = None;
         self.draw_header(f, header);
+        if let Some(ed) = self.editor.as_mut() {
+            // Con su propio pie: los atajos son otros.
+            let [_, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(f.area());
+            ed.draw(f, rest);
+            return;
+        }
         match self.tab {
             Tab::Agents => self.draw_agents(f, body),
             Tab::Tasks => self.draw_tasks(f, body),
@@ -1752,6 +1790,7 @@ impl App {
                 ("n nuevo", 0),
                 ("s mensaje", 0),
                 ("t terminal", 1),
+                ("e archivos", 1),
                 ("T cerrar terminal", 2),
                 ("r restaurar", 2),
                 ("x terminar", 1),
@@ -2275,7 +2314,7 @@ fn popup(f: &mut Frame, title: &str, w: u16, h: u16) -> Rect {
 /// Los atajos de `help` unidos con ` · `, quitando de uno en uno los menos
 /// importantes (y, a igual importancia, los de más a la derecha) hasta que
 /// quepan en `width` columnas. Los de importancia 0 no se quitan.
-fn fit_help(help: &[(&str, u8)], width: usize) -> String {
+pub(crate) fn fit_help(help: &[(&str, u8)], width: usize) -> String {
     let mut drop: Vec<usize> = (0..help.len()).filter(|&i| help[i].1 > 0).collect();
     drop.sort_by_key(|&i| (help[i].1, i));
     let mut shown = vec![true; help.len()];
@@ -2553,7 +2592,7 @@ fn default_cwd() -> String {
     std::env::current_dir().map_or_else(|_| String::new(), |p| tilde(&p))
 }
 
-fn tilde(p: &std::path::Path) -> String {
+pub(crate) fn tilde(p: &std::path::Path) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Ok(rest) = p.strip_prefix(&home) {
             return format!("~/{}", rest.display());

@@ -1,5 +1,8 @@
 mod agent;
 mod avisos;
+mod buffer;
+mod editor;
+mod files;
 mod history;
 mod hooks;
 mod icons;
@@ -12,6 +15,7 @@ mod remote;
 #[cfg(feature = "serve")]
 mod server;
 mod store;
+mod syntax;
 mod text;
 mod tmux;
 #[cfg(feature = "serve")]
@@ -124,6 +128,27 @@ enum Cmd {
         /// Cierra la terminal en vez de abrirla
         #[arg(long, conflicts_with = "cmd")]
         close: bool,
+    },
+    /// Abre el editor para revisar o cambiar archivos rápido
+    Edit {
+        /// Archivo, carpeta o agente (id o nombre). Por defecto la carpeta actual
+        #[arg(value_name = "RUTA|AGENTE")]
+        target: Option<String>,
+    },
+    /// Uso interno: los archivos de un agente, para el editor de otro pastor
+    #[command(hide = true)]
+    Files {
+        #[arg(value_name = "AGENTE")]
+        agent: String,
+        /// Imprime este archivo
+        #[arg(long, conflicts_with = "write", value_name = "RUTA")]
+        read: Option<String>,
+        /// Guarda en este archivo lo que llega por la entrada
+        #[arg(long, requires = "hash", value_name = "RUTA")]
+        write: Option<String>,
+        /// El hash del archivo al leerlo: si cambió, no se guarda
+        #[arg(long, value_name = "HASH")]
+        hash: Option<String>,
     },
     /// Termina un agente
     Kill {
@@ -498,6 +523,27 @@ fn main() -> Result<()> {
             println!("{}", ops::screen(&agent)?);
             Ok(())
         }
+        Some(Cmd::Edit { target }) => edit(target),
+        Some(Cmd::Files {
+            agent,
+            read,
+            write,
+            hash,
+        }) => {
+            let source = files::Source::agent(&agent)?;
+            let json = match (read, write, hash) {
+                (Some(path), ..) => serde_json::to_string(&source.read(&path)?)?,
+                (None, Some(path), Some(hash)) => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                    let hash = source.write(&path, &text, &hash)?;
+                    serde_json::to_string(&files::Saved { hash })?
+                }
+                _ => serde_json::to_string(&source.list()?)?,
+            };
+            println!("{json}");
+            Ok(())
+        }
         Some(Cmd::Kill { agent }) => ops::kill_agent(&agent),
         Some(Cmd::Restore { agent: Some(agent) }) => {
             print_restored(&ops::restore_agent(&agent)?);
@@ -507,6 +553,34 @@ fn main() -> Result<()> {
         Some(Cmd::Task(cmd)) => task_cmd(cmd),
         Some(Cmd::Host(cmd)) => host_cmd(cmd),
     }
+}
+
+/// `pastor edit`: una carpeta, un archivo (con su proyecto en la lista) o
+/// el directorio de un agente.
+fn edit(target: Option<String>) -> Result<()> {
+    let here = std::env::current_dir()?;
+    let path = target.as_ref().map_or(here.clone(), |t| here.join(t));
+    if path.is_dir() {
+        let root = path.canonicalize()?;
+        let title = tui::tilde(&root);
+        return editor::run(files::Source::dir(root), title, None);
+    }
+    if path.is_file() {
+        let full = path.canonicalize()?;
+        let dir = full.parent().unwrap_or(&full).to_path_buf();
+        // La raíz del repositorio, para ver el resto del proyecto al lado.
+        let root = worktree::toplevel(&dir)
+            .and_then(|t| t.canonicalize().ok())
+            .filter(|t| full.starts_with(t))
+            .unwrap_or(dir);
+        let rel = full.strip_prefix(&root)?.to_string_lossy().into_owned();
+        let title = tui::tilde(&root);
+        return editor::run(files::Source::dir(root), title, Some(rel));
+    }
+    let key = target.unwrap_or_default();
+    let source = files::Source::agent(&key)
+        .map_err(|_| anyhow::anyhow!("no existe el archivo, la carpeta ni el agente `{key}`"))?;
+    editor::run(source, key, None)
 }
 
 /// Restaura los agentes que se perdieron y dice cómo le fue con cada uno.

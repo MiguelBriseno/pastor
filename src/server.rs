@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{self, CloseFrame, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State as Shared};
+use axum::extract::{
+    DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State as Shared,
+};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -23,11 +25,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::agent::{Kind, Status};
+use crate::files::{self, Source};
 use crate::history;
 use crate::limits;
 use crate::ops::{self, AssignTarget, Place, Tracker};
 use crate::pty::Pty;
 use crate::store::{self, Agent, State, TaskStatus};
+use crate::syntax::{self, Colors};
 use crate::tmux;
 use crate::transcript;
 
@@ -104,6 +108,15 @@ fn router(app: Arc<App>) -> Router {
         .route("/agents/{id}/screen", get(screen))
         .route("/agents/{id}/conversation", get(conversation))
         .route("/agents/{id}/attach", get(attach))
+        .route("/agents/{id}/files", get(list_files))
+        // Un archivo de hasta `MAX_BYTES`, en JSON: pasa del límite de siempre.
+        // En JSON un carácter de control ocupa hasta 6 bytes (`\u001b`).
+        .route(
+            "/agents/{id}/file",
+            get(read_file).put(write_file).layer(DefaultBodyLimit::max(
+                6 * files::MAX_BYTES as usize + 64 * 1024,
+            )),
+        )
         .route("/tasks", get(list_tasks).post(add_task))
         .route("/tasks/{id}", delete(delete_task))
         .route("/tasks/{id}/assign", post(assign_task))
@@ -691,6 +704,86 @@ async fn bridge(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
     // Cerrar tmux espera a que salga.
     let _ = tokio::task::spawn_blocking(move || drop(pty)).await;
+}
+
+// ---------- archivos ----------
+
+async fn list_files(Path(id): Path<String>) -> Response {
+    blocking(move || Source::agent(&id)?.list()).await
+}
+
+#[derive(Deserialize)]
+struct FilePath {
+    path: String,
+}
+
+/// Hasta cuántas líneas se mandan con colores: más, el celular tarda en
+/// dibujarlas.
+const COLOR_LINES: usize = 5000;
+
+/// Un archivo, con sus colores si se puede: `palette` son los colores y cada
+/// línea, sus trozos como `[color, texto]`. En trozos de texto y no en HTML,
+/// para que la app los meta con `textContent` como todo lo demás.
+async fn read_file(Path(id): Path<String>, Params(q): Params<FilePath>) -> Response {
+    blocking(move || {
+        let opened = Source::agent(&id)?.read(&q.path)?;
+        let lines: Vec<&str> = opened.text.split('\n').collect();
+        let colors = (opened.text.len() <= syntax::MAX_BYTES && lines.len() <= COLOR_LINES)
+            .then(|| Colors::new(&opened.path, lines[0]))
+            .flatten()
+            .map(|mut c| {
+                let mut palette: Vec<(u8, u8, u8)> = Vec::new();
+                let mut index = |rgb| match palette.iter().position(|p| *p == rgb) {
+                    Some(i) => i,
+                    None => {
+                        palette.push(rgb);
+                        palette.len() - 1
+                    }
+                };
+                let painted: Vec<Vec<(usize, &str)>> = c
+                    .paint(&lines, 0..lines.len())
+                    .iter()
+                    .zip(&lines)
+                    .map(|(p, line)| {
+                        let mut pieces: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+                        for (paint, range) in p {
+                            let color = index(paint.rgb);
+                            match pieces.last_mut() {
+                                // Del mismo color que el anterior: un solo trozo.
+                                Some((c, r)) if *c == color => r.end = range.end,
+                                _ => pieces.push((color, range.clone())),
+                            }
+                        }
+                        pieces.into_iter().map(|(c, r)| (c, &line[r])).collect()
+                    })
+                    .collect();
+                let palette: Vec<String> = palette
+                    .iter()
+                    .map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
+                    .collect();
+                json!({ "palette": palette, "lines": painted })
+            });
+        let mut v = serde_json::to_value(&opened)?;
+        v["colors"] = colors.unwrap_or(Value::Null);
+        Ok(v)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct Write {
+    path: String,
+    text: String,
+    /// El que dio la lectura: si el archivo cambió desde entonces, no se guarda.
+    hash: String,
+}
+
+async fn write_file(Path(id): Path<String>, Body(req): Body<Write>) -> Response {
+    blocking(move || {
+        let hash = Source::agent(&id)?.write(&req.path, &req.text, &req.hash)?;
+        Ok(json!({ "hash": hash }))
+    })
+    .await
 }
 
 // ---------- tareas ----------

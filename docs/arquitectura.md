@@ -44,6 +44,10 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular |
 | `src/pty.rs` | Un proceso en un pseudoterminal propio, para la terminal del celular (solo con `serve`) |
 | `src/remote.rs` | Las otras máquinas: su registro, `ssh` con conexión compartida y el hilo que pregunta por sus agentes |
+| `src/files.rs` | Los archivos del directorio de un agente para el editor: listarlos con lo que cambió en git, leerlos y guardarlos, aquí o en otra máquina |
+| `src/editor.rs` | El editor de la TUI (`e` sobre un agente y `pastor edit`): lista, vista con colores, búsqueda y edición |
+| `src/buffer.rs` | El texto de un archivo abierto: cursor por grafemas, cambios y deshacer |
+| `src/syntax.rs` | Los colores de sintaxis con syntect, calculados por partes para no analizar el archivo entero en cada cuadro |
 | `src/server.rs` | `pastor serve`, solo con el feature `serve`: API HTTP con `axum` sobre las mismas funciones de `ops` |
 | `web/` | La app del celular (PWA) que sirve `pastor serve` en `/`: HTML, CSS y JS sin build, metidos en el binario, con xterm.js para la terminal |
 
@@ -314,3 +318,17 @@ avisos lanza `notify-send` y `curl` a la vez y espera a los dos con un límite.
 2. Define su binario en `Kind::bin` y cómo recibe el primer mensaje en `Kind::launch_command`.
 3. Si muestra textos propios mientras trabaja o pide permisos, agrégalos a `WORKING` o `BLOCKED`.
 4. Agrega su etiqueta en el gráfico del dashboard (`draw_dashboard` en `src/tui.rs`).
+
+### El editor no escribe encima de un agente
+
+Un agente puede cambiar el archivo que tienes abierto. Al leerlo, pastor guarda un hash (FNV-1a)
+de su contenido; al guardar, lo vuelve a calcular y, si no coincide, no escribe y avisa. Se
+escribe sobre el mismo archivo (sin archivo temporal y `rename`) para conservar sus permisos y
+enlaces: un `.env` con `600` debe seguir así.
+
+Las rutas llegan también del celular, así que se resuelven con `canonicalize` y deben quedar dentro
+del directorio del agente: ni `../`, ni rutas absolutas, ni un enlace que lleve fuera.
+
+En un agente de otra máquina, el editor llama allá a `pastor files` (oculto) por la misma
+conexión SSH que el resto: lista y lee en JSON, y el texto a guardar va por la entrada estándar,
+porque como argumento tiene un límite de tamaño.
