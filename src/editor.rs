@@ -213,11 +213,14 @@ impl Editor {
                         None => self.file.as_ref().map(|f| f.path.clone()),
                         Some(_) => self.selected_key(),
                     };
+                    // Lo que ya estaba cambiado: sus carpetas, si se cerraron,
+                    // se quedan cerradas.
+                    let old = changed_paths(self.listing.as_ref());
                     self.listing = Some(listing);
                     self.list_error = None;
                     if self.only_changed {
                         // Lo que cambió desde que se pulsó `c`, también a la vista.
-                        self.open_changed();
+                        self.open_changed(&old);
                     }
                     self.refilter(keep.as_deref());
                     if let Some(l) = self.listing.as_ref().filter(|l| l.truncated) {
@@ -419,10 +422,13 @@ impl Editor {
         }
     }
 
-    /// Abre las carpetas con archivos cambiados.
-    fn open_changed(&mut self) {
+    /// Abre las carpetas con archivos cambiados, menos los que están en `old`.
+    fn open_changed(&mut self, old: &HashSet<String>) {
         if let Some(l) = &self.listing {
             for e in l.files.iter().filter(|e| e.change.is_some()) {
+                if old.contains(&e.path) {
+                    continue;
+                }
                 open_parents(&mut self.expanded, &e.path);
             }
         }
@@ -736,7 +742,7 @@ impl Editor {
                 if self.only_changed {
                     // Las carpetas con cambios, abiertas.
                     self.expanded_before = Some(self.expanded.clone());
-                    self.open_changed();
+                    self.open_changed(&HashSet::new());
                 } else if let Some(before) = self.expanded_before.take() {
                     // Las de antes (y las de lo seleccionado, en `refilter`).
                     self.expanded = before;
@@ -1273,6 +1279,19 @@ fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Las rutas de los archivos cambiados de `listing`.
+fn changed_paths(listing: Option<&Listing>) -> HashSet<String> {
+    listing
+        .map(|l| {
+            l.files
+                .iter()
+                .filter(|e| e.change.is_some())
+                .map(|e| e.path.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Abre las carpetas que contienen `path`.
 fn open_parents(expanded: &mut HashSet<String>, path: &str) {
     for (i, _) in path.match_indices('/') {
@@ -1308,7 +1327,8 @@ fn tree(files: &[Entry], picked: &[usize], expanded: &HashSet<String>) -> Vec<Ro
         rows: &mut Vec<Row>,
     ) {
         let mut dirs: Vec<_> = node.dirs.into_iter().collect();
-        dirs.sort_by_cached_key(|(name, _)| name.to_lowercase());
+        // Desempata por el nombre tal cual: el orden del mapa cambia cada vez.
+        dirs.sort_by_cached_key(|(name, _)| (name.to_lowercase(), *name));
         for (name, sub) in dirs {
             let path = if prefix.is_empty() {
                 name.to_string()
@@ -1567,6 +1587,7 @@ mod tests {
             entry("src/main.rs", Some(Change::Modified)),
             entry("src/ui/app.js", Some(Change::Added)),
             entry("Docs/x.md", None),
+            entry("docs/y.md", None),
         ];
         let all: Vec<usize> = (0..files.len()).collect();
         let none = HashSet::new();
@@ -1574,6 +1595,7 @@ mod tests {
             rows(&files, &tree(&files, &all, &none)),
             [
                 "0 Docs/ false 0",
+                "0 docs/ false 0",
                 "0 src/ false 2",
                 "0 a.txt",
                 "0 README.md"
@@ -1585,6 +1607,7 @@ mod tests {
             rows(&files, &tree(&files, &all, &open)),
             [
                 "0 Docs/ false 0",
+                "0 docs/ false 0",
                 "0 src/ true 2",
                 "1 src/ui/ true 1",
                 "2 src/ui/app.js",
@@ -1654,6 +1677,16 @@ mod tests {
             .unwrap();
         ed.poll();
         assert_eq!(ed.shown.len(), 4);
+        // Lo que ya estaba cambiado no vuelve a abrir la carpeta cerrada.
+        ed.list_sel.select(Some(0));
+        ed.on_key(key(KeyCode::Left));
+        assert_eq!(ed.shown.len(), 3);
+        ed.list_gen += 1;
+        ed.tx
+            .send(Loaded::List(ed.list_gen, Ok(listing(Some(Change::Added)))))
+            .unwrap();
+        ed.poll();
+        assert_eq!(ed.shown.len(), 3);
     }
 
     #[test]
