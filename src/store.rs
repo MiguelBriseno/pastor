@@ -160,6 +160,61 @@ pub struct Task {
     /// El worktree donde se hizo la tarea, para revisarla e integrarla.
     #[serde(default)]
     pub worktree: Option<Worktree>,
+    /// La última revisión automática (`git config pastor.check`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
+    /// Cuántas veces seguidas se la devolvió al agente por no pasarla.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub check_returns: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Running,
+    Passed,
+    Failed,
+}
+
+impl Check {
+    /// Si sigue corriendo de verdad: una que pasó de su límite de tiempo sin
+    /// resultado se interrumpió (el proceso murió, se reinició la máquina).
+    pub fn running(&self) -> bool {
+        let limit = chrono::Duration::from_std(crate::check::TIMEOUT).unwrap_or_default()
+            + chrono::Duration::minutes(5);
+        self.state == CheckState::Running && Utc::now() - self.started < limit
+    }
+
+    /// Si se quedó corriendo sin resultado.
+    pub fn interrupted(&self) -> bool {
+        self.state == CheckState::Running && !self.running()
+    }
+}
+
+/// Una revisión automática: el comando del proyecto corrido en el worktree
+/// de la tarea al terminar el agente.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Check {
+    pub state: CheckState,
+    pub cmd: String,
+    pub started: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished: Option<DateTime<Utc>>,
+    /// Las últimas líneas de lo que escribió (la salida entera queda en
+    /// `checks/<tarea>.log`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
+    /// Si al no pasarla se le devolvió la tarea a su agente.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub returned: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -321,6 +376,8 @@ impl State {
             source: None,
             url: None,
             worktree: None,
+            check: None,
+            check_returns: 0,
         };
         self.tasks.push(task.clone());
         task
@@ -377,6 +434,22 @@ pub fn unique_suffix() -> String {
 /// uno a medias, y un corte de luz no lo deja vacío.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     write_atomic_mode(path, contents, None)
+}
+
+/// Compara sin cortar en el primer byte distinto, para no dar pistas por el
+/// tiempo de respuesta.
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `bytes` bytes al azar en hexadecimal, para tokens.
+pub fn random_hex(bytes: usize) -> Result<String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .context("no pude generar el token")?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Como `write_atomic`, con permisos `mode` (p. ej. 0o755 para un script).

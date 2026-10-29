@@ -30,6 +30,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::agent::{Kind, Status};
 use crate::avisos::Notifier;
+use crate::check;
 use crate::editor::Editor;
 use crate::files::Source;
 use crate::history::{self, Stats};
@@ -880,6 +881,15 @@ impl App {
                         ),
                         None => format!("¿Dar la tarea {} por hecha?", t.id),
                     };
+                    match &t.check {
+                        Some(c) if c.state == store::CheckState::Failed => {
+                            msg = format!("Ojo: no pasó la revisión automática. {msg}")
+                        }
+                        Some(c) if c.running() => {
+                            msg = format!("Ojo: la revisión automática aún corre. {msg}")
+                        }
+                        _ => {}
+                    }
                     if let Some(list) = self.overlaps.get(&t.id).filter(|_| t.worktree.is_some()) {
                         msg = format!(
                             "Ojo: cambia {}. {msg}",
@@ -890,6 +900,12 @@ impl App {
                         msg,
                         action: Pending::ApproveTask(t.id),
                     };
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(t) = task {
+                    let cmd = check::spawn_manual(&t.id)?;
+                    self.set_flash(format!("Revisando {} con `{cmd}`…", t.id));
                 }
             }
             KeyCode::Char('r') => {
@@ -1458,12 +1474,16 @@ impl App {
                         .spend_by_task
                         .get(&t.id)
                         .map_or_else(|| "-".to_string(), usage::Spend::cost_label);
+                    let mut status = vec![Span::styled(
+                        format!("{}{}", pad(ic.task_status(t.status)), t.status.label()),
+                        Style::default().fg(task_color(t.status)),
+                    )];
+                    if let Some((mark, color)) = t.check.as_ref().map(check_mark) {
+                        status.push(Span::styled(format!(" {mark}"), Style::default().fg(color)));
+                    }
                     Row::new(vec![
                         Cell::from(t.id.clone()),
-                        Cell::from(Span::styled(
-                            format!("{}{}", pad(ic.task_status(t.status)), t.status.label()),
-                            Style::default().fg(task_color(t.status)),
-                        )),
+                        Cell::from(Line::from(status)),
                         Cell::from(title),
                         Cell::from(agent),
                         Cell::from(Line::from(cost.dark_gray()).right_aligned()),
@@ -1474,7 +1494,7 @@ impl App {
                 rows,
                 [
                     Constraint::Length(5),
-                    Constraint::Length(14),
+                    Constraint::Length(16),
                     Constraint::Min(10),
                     Constraint::Length(22),
                     Constraint::Length(10),
@@ -1508,6 +1528,41 @@ impl App {
                     ),
                     Span::raw(o.files.join(", ")),
                 ]));
+            }
+            if let Some(c) = &t.check {
+                let (mark, color) = check_mark(c);
+                let when = |at: chrono::DateTime<chrono::Utc>| {
+                    history::human((chrono::Utc::now() - at).num_seconds())
+                };
+                let what = match (c.state, c.finished) {
+                    _ if c.interrupted() => {
+                        format!("se interrumpió (empezó hace {})", when(c.started))
+                    }
+                    (store::CheckState::Running, _) => {
+                        format!("corriendo desde hace {}", when(c.started))
+                    }
+                    (store::CheckState::Passed, f) => {
+                        format!("pasó hace {}", when(f.unwrap_or(c.started)))
+                    }
+                    (_, f) => format!("falló hace {}", when(f.unwrap_or(c.started))),
+                };
+                let returns = match t.check_returns {
+                    0 => String::new(),
+                    n => format!(" · devuelta {n} de {} veces", check::MAX_RETURNS),
+                };
+                desc.push_line(Line::from(vec![
+                    Span::styled(
+                        format!("{mark} Revisión `{}`: ", c.cmd),
+                        Style::default().fg(color),
+                    ),
+                    Span::raw(format!("{what}{returns} · c para correrla otra vez")).dark_gray(),
+                ]));
+                if c.state == store::CheckState::Failed {
+                    let lines: Vec<&str> = c.output.lines().collect();
+                    for l in &lines[lines.len().saturating_sub(6)..] {
+                        desc.push_line(Line::from(format!("  {l}").dark_gray()));
+                    }
+                }
             }
             if let Some(spend) = self.stats.spend_by_task.get(&t.id) {
                 desc.push_line(Line::from(
@@ -1640,7 +1695,16 @@ impl App {
                     format!(" {} ", ic.task_status(TaskStatus::Review)),
                     Style::default().fg(task_color(TaskStatus::Review)),
                 ),
-                Span::raw(format!("{} {} — revisar", t.id, t.title)),
+                Span::raw(format!(
+                    "{} {} — revisar{}",
+                    t.id,
+                    t.title,
+                    match t.check.as_ref().map(|c| c.state) {
+                        Some(store::CheckState::Passed) => " (✓ pasó la revisión)",
+                        Some(store::CheckState::Failed) => " (✗ no pasó la revisión)",
+                        _ => "",
+                    }
+                )),
             ])));
         }
         // Cada par una vez: el aviso de la tarea con el id menor.
@@ -2082,6 +2146,7 @@ impl App {
                 ("espacio avanzar", 1),
                 ("d hecha", 1),
                 ("v cambios", 1),
+                ("c revisar", 2),
                 ("A aprobar", 1),
                 ("r pedir cambios", 2),
                 ("g ir al agente", 2),
@@ -2336,6 +2401,16 @@ fn suspend<T>(term: &mut DefaultTerminal, f: impl FnOnce() -> Result<T>) -> Resu
     let result = result?;
     back?;
     Ok(result)
+}
+
+/// La marca y el color de una revisión automática.
+fn check_mark(c: &store::Check) -> (&'static str, Color) {
+    match c.state {
+        _ if c.interrupted() => ("?", Color::DarkGray),
+        store::CheckState::Running => ("…", Color::Cyan),
+        store::CheckState::Passed => ("✓", Color::Green),
+        store::CheckState::Failed => ("✗", Color::Red),
+    }
 }
 
 /// `entrada 1.2k · salida 34k · caché 12M leídos, 300k escritos`.

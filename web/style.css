@@ -183,6 +183,15 @@ body[data-view="token"] main { padding-top: calc(16px + env(safe-area-inset-top)
 .tag { flex: none; padding: 0 6px; border: 1px solid var(--magenta); color: var(--magenta); font: 700 11px var(--mono); }
 .tag.warn { border-color: var(--yellow); color: var(--yellow); }
 .cost { flex: none; color: var(--yellow); }
+.tag.check-passed { border-color: var(--green); color: var(--green); }
+.tag.check-failed { border-color: var(--magenta); color: var(--magenta); }
+.tag.check-running { border-color: var(--cyan); color: var(--cyan); }
+.check-box { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--c, var(--muted)); }
+.check-box.check-passed { --c: var(--green); }
+.check-box.check-failed { --c: var(--magenta); }
+.check-box.check-running { --c: var(--cyan); }
+.check-box small { color: var(--muted); }
+.check-box pre { margin: 6px 0 0; max-height: 220px; overflow: auto; font: 12px/1.4 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
 .sheet-text.warn { color: var(--yellow); margin-bottom: 10px; }
 .search { display: flex; gap: 8px; margin-bottom: 12px; }
 .search input { flex: 1; min-width: 0; }

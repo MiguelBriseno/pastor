@@ -1491,6 +1491,7 @@ function tasksView() {
       h("div", { class: "card-meta" },
         h("span", { class: "tag", text: t.id }),
         t.overlaps && h("span", { class: "tag warn", text: "⚠ archivos en común" }),
+        t.check && h("span", { class: "tag check-" + checkState(t.check), text: CHECK_LABEL[checkState(t.check)] }),
         t.agent && [icon("bot"), h("span", { class: "ellipsis", text: agentName(t.agent) })],
         t.usage && h("span", { class: "cost", text: costLabel(t.usage) }),
         h("span", { class: "time", text: ago(t.created_at) }),
@@ -1544,6 +1545,10 @@ function taskSheet(t, agentName, reload) {
   const d = sheet(t.title,
     t.description && h("p", { class: "sheet-text", text: t.description }),
     (t.overlaps || []).map((o) => h("p", { class: "sheet-text warn", text: `⚠ También los cambia ${o.label}: ${o.files.join(", ")}` })),
+    t.check && h("div", { class: "check-box check-" + checkState(t.check) },
+      h("b", { text: `${CHECK_LABEL[checkState(t.check)]} · ${t.check.cmd}` }),
+      h("small", { text: t.check.finished ? since(t.check.finished) : "desde " + since(t.check.started) }),
+      t.check.state === "failed" && t.check.output && h("pre", { text: t.check.output.split("\n").slice(-15).join("\n") })),
     h("dl", { class: "info" },
       row("Estado", TASK_LABEL[t.status] || t.status),
       row("Id", t.id),
@@ -1555,6 +1560,11 @@ function taskSheet(t, agentName, reload) {
     h("div", { class: "menu" },
       t.agent && menuItem("bot", "Abrir su agente", () => { location.hash = "#/agent/" + encodeURIComponent(t.agent); }),
       t.status !== "done" && menuItem("assign", t.agent ? "Asignar a otro agente" : "Asignar a un agente", () => { d.close(); assignSheet(t, reload); }),
+      menuItem("tasks", "Correr la revisión automática", async () => {
+        d.close();
+        const r = await attempt(() => api("POST", path + "/check"));
+        if (r) { toast("Revisando con " + r.cmd); reload(); }
+      }),
       t.status !== "done" && menuItem("check", "Marcar como hecha", async () => {
         d.close();
         if (await attempt(() => api("POST", path + "/done"))) { toast("Tarea hecha"); reload(); }
@@ -1615,6 +1625,11 @@ function human(secs) {
   const d = Math.floor(secs / 86400), hr = Math.floor(secs / 3600) % 24, m = Math.floor(secs / 60) % 60;
   return d ? `${d}d ${hr}h` : hr ? `${hr}h ${m}m` : m ? `${m}m` : `${secs}s`;
 }
+
+const CHECK_LABEL = { running: "revisando…", passed: "✓ revisión", failed: "✗ revisión", interrupted: "? revisión" };
+
+/** El estado de la revisión; una que pasó de su límite (20 min) sin resultado se interrumpió. */
+const checkState = (c) => c.state === "running" && Date.now() - Date.parse(c.started) > 25 * 60000 ? "interrupted" : c.state;
 
 /** `850`, `12.3k`, `1.2M`, como `usage::tokens`. */
 function fmtTokens(n) {

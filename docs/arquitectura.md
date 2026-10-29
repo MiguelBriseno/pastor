@@ -43,6 +43,8 @@ Las rutas son las de Linux; en macOS `~/.local/share/pastor` es
 | `src/ntfy.rs` | Publica los avisos en un tema de ntfy con `curl`, si está configurado |
 | `src/transcript.rs` | Lee la conversación de un agente de Claude de su transcripción, para la app del celular y la búsqueda |
 | `src/usage.rs` | Los tokens de los agentes de Claude, leídos de sus transcripciones, y su costo con los precios de la API |
+| `src/check.rs` | La revisión automática de las tareas: corre el comando del repositorio y se la devuelve al agente si falla |
+| `src/acciones.rs` | Los botones de los avisos: lee el diálogo de la pantalla y guarda las URLs de un solo uso |
 | `src/search.rs` | Busca en las conversaciones de los agentes de Claude, vivos o terminados |
 | `src/pty.rs` | Un proceso en un pseudoterminal propio, para la terminal del celular (solo con `serve`) |
 | `src/remote.rs` | Las otras máquinas: su registro, `ssh` con conexión compartida y el hilo que pregunta por sus agentes |
@@ -368,3 +370,27 @@ revisión, más los archivos nuevos) y lo que cambió tu repositorio desde ese p
 tienes sin guardar). Dos del mismo repositorio que comparten archivos, o uno que comparte con tu
 rama, son un posible conflicto al integrar. Corre git en cada worktree, así que la TUI lo calcula
 en el hilo del observador cada 10 segundos y no en cada pasada.
+
+### La revisión automática corre aparte
+
+Quien pasa una tarea a revisión (el hook `Stop` o el proceso que manda los avisos) lanza
+`pastor task check <tarea> --return` en su propio grupo de procesos, sin esperarlo, si el
+repositorio tiene `pastor.check` en su configuración de git. Ese proceso guarda en la tarea que
+está corriendo, con la hora de inicio, corre el comando con `sh` (la salida de error junto a la
+normal, todo a `checks/<tarea>.log`) y al terminar escribe el resultado solo si la revisión de la
+tarea sigue siendo la suya: si mientras tanto empezó otra, la suya ya no vale. Le devuelve la tarea
+al agente solo si sigue *por revisar* y con su agente, y como mucho 3 veces seguidas
+(`check_returns`, que vuelve a 0 al pasar o al asignarla). El comando corre sin `PASTOR_AGENT` ni
+`TMUX`: si los tests lanzan un `claude`, no es el agente. Con tiempo de más se mata al grupo
+entero, y la lectura de la salida no espera a lo que haya quedado vivo con la tubería abierta.
+
+### Botones de un solo uso
+
+Al avisar de un agente que espera, si está `PASTOR_SERVE_URL`, `acciones::buttons` lee el último
+menú de la pantalla: la línea con el cursor (`❯`) y sus vecinas que empiezan en la misma columna que
+su texto (las que van más adentro continúan una opción larga). Guarda en `acciones.json` (0600, con
+candado) un token por botón con las teclas para llegar a su opción desde el cursor y la huella de
+la pantalla entera. `POST /act/<token>`, fuera de la autenticación de la API, gasta el token y los
+de su aviso, vuelve a capturar la pantalla y solo pulsa las teclas si la huella coincide. Los tokens
+caducan en una hora, y un aviso nuevo del mismo agente borra los anteriores. Los crea solo el
+proceso que manda los avisos.

@@ -31,7 +31,7 @@ use crate::history;
 use crate::limits;
 use crate::ops::{self, AssignTarget, Place, Tracker};
 use crate::pty::Pty;
-use crate::store::{self, Agent, State, TaskStatus};
+use crate::store::{self, same, Agent, State, TaskStatus};
 use crate::syntax::{self, Colors};
 use crate::tmux;
 use crate::transcript;
@@ -129,6 +129,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/tasks/{id}/done", post(task_done))
         .route("/tasks/{id}/approve", post(approve_task))
         .route("/tasks/{id}/reject", post(reject_task))
+        .route("/tasks/{id}/check", post(check_task))
         .route("/stats", get(stats))
         .route("/search", get(search_messages))
         .route("/limits", get(limits))
@@ -136,6 +137,9 @@ fn router(app: Arc<App>) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .nest("/api", api)
+        // Los botones de los avisos: sin el token de la API (el celular no
+        // lo manda desde ntfy); la llave es el botón, de un solo uso.
+        .route("/act/{token}", post(act))
         .route("/", get(|| page("index.html")))
         .route("/{file}", get(|Path(file): Path<String>| page(file)))
         .layer(middleware::from_fn(headers))
@@ -294,18 +298,7 @@ fn saved_token() -> Result<String> {
 }
 
 fn new_token() -> Result<String> {
-    use std::io::Read;
-    let mut bytes = [0u8; 24];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .context("no pude generar el token")?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Compara sin cortar en el primer byte distinto, para no dar pistas por el
-/// tiempo de respuesta.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+    store::random_hex(24)
 }
 
 async fn auth(Shared(app): Shared<Arc<App>>, req: Request, next: Next) -> Response {
@@ -946,8 +939,30 @@ async fn reject_task(Path(id): Path<String>, Body(req): Body<Message>) -> Respon
     blocking(move || ops::reject_task(&id, &req.text)).await
 }
 
+/// Corre la revisión automática en otro proceso; el resultado llega en la
+/// tarea (`check`).
+async fn check_task(Path(id): Path<String>) -> Response {
+    blocking(move || crate::check::spawn_manual(&id).map(|cmd| json!({ "cmd": cmd }))).await
+}
+
 async fn delete_task(Path(id): Path<String>) -> Response {
     blocking(move || ops::delete_task(&id).map(|()| ok())).await
+}
+
+// ---------- botones de los avisos ----------
+
+/// Contesta el diálogo de un agente con la opción del botón, si sigue igual.
+async fn act(Path(token): Path<String>) -> Response {
+    // Solo los nuestros: así un token raro ni toca el disco.
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return error(StatusCode::NOT_FOUND, "este botón no existe");
+    }
+    match tokio::task::spawn_blocking(move || crate::acciones::act(&token)).await {
+        Ok(Ok(msg)) => Json(json!({ "message": msg })).into_response(),
+        // ntfy muestra el error: que diga por qué.
+        Ok(Err(e)) => error(StatusCode::CONFLICT, format!("{e:#}")),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 // ---------- historial ----------

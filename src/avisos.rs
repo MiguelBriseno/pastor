@@ -28,7 +28,7 @@ use crate::ntfy;
 #[cfg(feature = "serve")]
 use crate::ops::Tracker;
 use crate::ops::{self, Snapshot};
-use crate::store::{self, State};
+use crate::store::{self, CheckState, State};
 
 /// Cada cuánto mira los paneles `pastor serve` cuando avisa él.
 #[cfg(feature = "serve")]
@@ -39,6 +39,9 @@ const REFRESH: Duration = Duration::from_secs(1);
 #[derive(Default)]
 pub struct Notifier {
     status: HashMap<String, Status>,
+    /// La revisión automática de cada tarea vista la última vez. `None`
+    /// hasta la primera pasada: lo que ya había no avisa.
+    checks: Option<HashMap<String, CheckSeen>>,
     lock: Option<File>,
     /// En la TUI: el candado compartido que dice a `serve` que está abierta.
     /// Solo se guarda para no soltarlo.
@@ -50,6 +53,7 @@ impl Notifier {
     pub fn for_tui(status: HashMap<String, Status>) -> Self {
         Self {
             status,
+            checks: None,
             lock: None,
             _tui: open_lock(&store::data_dir(), "tui.lock").filter(|f| f.try_lock_shared().is_ok()),
         }
@@ -75,6 +79,7 @@ impl Notifier {
     /// de ahora daría avisos de cosas que pasaron hace mucho.
     pub fn forget(&mut self) {
         self.status.clear();
+        self.checks = None;
     }
 
     /// Los avisos por lo que cambió desde la pasada anterior, y los errores
@@ -88,15 +93,35 @@ impl Notifier {
     ) -> (Vec<String>, Vec<anyhow::Error>) {
         let lead = self.leading();
         let (mut msgs, mut errors) = (Vec::new(), Vec::new());
-        let events = transitions(state, &self.status, snaps);
+        // Cada aviso con el agente del que es (`None` si es de una tarea).
+        let mut events: Vec<(Event, String, Option<String>, Option<String>)> =
+            transitions(state, &self.status, snaps)
+                .into_iter()
+                .map(|(e, m, finished, agent)| (e, m, finished, Some(agent)))
+                .collect();
+        let checks = checks_seen(state);
+        if let Some(old) = &self.checks {
+            events.extend(
+                check_results(state, old, &checks)
+                    .into_iter()
+                    .map(|(e, m)| (e, m, None, None)),
+            );
+        }
+        self.checks = Some(checks);
+        // Los botones solo si este proceso avisa: crearlos gasta los de un
+        // aviso anterior del mismo agente.
+        let url = if lead { ntfy::serve_url() } else { None };
         // Una pasada suena una sola vez: si alguno te espera, gana ese.
         let mut sound = events
             .iter()
             .map(|e| e.0)
             .min_by_key(|&e| e != Event::Blocked);
-        for (_, msg, finished) in events {
+        for (event, mut msg, finished, agent) in events {
             if lead {
-                notify(sound.take(), &msg);
+                let actions = url.as_deref().map_or_else(Vec::new, |url| {
+                    buttons(url, agent.as_deref(), snaps, event, &mut msg)
+                });
+                notify(sound.take(), &msg, actions);
                 if let Some(Err(e)) = finished.map(|id| ops::finish_turn(&id)) {
                     errors.push(e);
                 }
@@ -194,12 +219,12 @@ enum Event {
 }
 
 /// Avisos por los cambios de estado de `old` a `new`, cada uno con el agente
-/// cuya tarea hay que pasar a revisión, si la tiene.
+/// cuya tarea hay que pasar a revisión, si la tiene, y el agente del aviso.
 fn transitions(
     state: &State,
     old: &HashMap<String, Status>,
     new: &HashMap<String, Snapshot>,
-) -> Vec<(Event, String, Option<String>)> {
+) -> Vec<(Event, String, Option<String>, String)> {
     let mut events = Vec::new();
     for a in &state.agents {
         let (Some(&old), Some(new)) = (old.get(&a.id), new.get(&a.id)) else {
@@ -211,12 +236,18 @@ fn transitions(
                     Event::Blocked,
                     format!("{} necesita tu atención", a.name),
                     None,
+                    a.id.clone(),
                 ));
             }
             (Status::Working, Status::Idle | Status::Dead) => {
                 // Sin tarea no hay nada que pasar a revisión.
                 let id = a.task.is_some().then(|| a.id.clone());
-                events.push((Event::Finished, format!("{} terminó", a.name), id));
+                events.push((
+                    Event::Finished,
+                    format!("{} terminó", a.name),
+                    id,
+                    a.id.clone(),
+                ));
             }
             _ => {}
         }
@@ -224,15 +255,117 @@ fn transitions(
     events
 }
 
-/// Un aviso para el hilo que los muestra: con qué suena (o nada) y qué dice.
-type Notice = (Option<Event>, String);
+/// Cómo estaba la revisión de una tarea: su estado y cuándo empezó.
+/// Con si se le devolvió al agente: si devolverla falla, se deshace, y eso
+/// también avisa («revísala tú»).
+type CheckSeen = (CheckState, chrono::DateTime<chrono::Utc>, bool);
+
+fn checks_seen(state: &State) -> HashMap<String, CheckSeen> {
+    state
+        .tasks
+        .iter()
+        .filter_map(|t| {
+            Some((
+                t.id.clone(),
+                t.check.as_ref().map(|c| (c.state, c.started, c.returned))?,
+            ))
+        })
+        .collect()
+}
+
+/// Avisos de las revisiones automáticas que terminaron desde la pasada
+/// anterior.
+fn check_results(
+    state: &State,
+    old: &HashMap<String, CheckSeen>,
+    new: &HashMap<String, CheckSeen>,
+) -> Vec<(Event, String)> {
+    let mut out = Vec::new();
+    for t in &state.tasks {
+        let Some(&seen @ (now, ..)) = new.get(&t.id) else {
+            continue;
+        };
+        if now == CheckState::Running || old.get(&t.id) == Some(&seen) {
+            continue;
+        }
+        let agent = t
+            .agent
+            .as_deref()
+            .and_then(|id| state.agents.iter().find(|a| a.id == id))
+            .map_or("su agente", |a| a.name.as_str());
+        out.push(match now {
+            CheckState::Passed => (
+                Event::Finished,
+                format!("{} pasó la revisión: {}", t.id, t.title),
+            ),
+            _ if t.check.as_ref().is_some_and(|c| c.returned) => (
+                Event::Finished,
+                format!(
+                    "{} no pasó la revisión; se la devolví a {agent} ({} de {})",
+                    t.id,
+                    t.check_returns,
+                    crate::check::MAX_RETURNS
+                ),
+            ),
+            _ => (
+                Event::Blocked,
+                format!("{} no pasó la revisión; revísala tú: {}", t.id, t.title),
+            ),
+        });
+    }
+    out
+}
+
+/// Los botones de un aviso: «Abrir» el agente en la app y, si te espera en
+/// un diálogo que se entiende, «Aprobar» y «Rechazar». Si es así, añade a
+/// `msg` lo que pregunta. Sin `agent`, el aviso es de una tarea.
+fn buttons(
+    url: &str,
+    agent: Option<&str>,
+    snaps: &HashMap<String, Snapshot>,
+    event: Event,
+    msg: &mut String,
+) -> Vec<ntfy::Action> {
+    let Some(id) = agent else {
+        return vec![ntfy::Action::View {
+            label: "Abrir".into(),
+            url: format!("{url}/#/tasks"),
+        }];
+    };
+    let mut actions = vec![ntfy::Action::View {
+        label: "Abrir".into(),
+        url: format!("{url}/#/agent/{id}"),
+    }];
+    let screen = snaps.get(id).map(|s| s.screen.as_str());
+    if let (Event::Blocked, Some(screen)) = (event, screen) {
+        if let Some((dialog, list)) = crate::acciones::buttons(id, screen) {
+            // Lo que pregunta puede llevar un comando con secretos, y el
+            // aviso pasa por el servidor de ntfy: `PASTOR_NTFY_DETAIL=0` lo
+            // quita.
+            let detail = std::env::var("PASTOR_NTFY_DETAIL").as_deref() != Ok("0");
+            if detail && !dialog.question.is_empty() {
+                msg.push('\n');
+                msg.push_str(&dialog.question.join("\n"));
+            }
+            actions.extend(list.into_iter().map(|b| ntfy::Action::Post {
+                label: b.label.into(),
+                url: format!("{url}/act/{}", b.token),
+            }));
+        }
+    }
+    actions
+}
+
+/// Un aviso para el hilo que los muestra: con qué suena (o nada), qué dice
+/// y sus botones en el celular.
+type Notice = (Option<Event>, String, Vec<ntfy::Action>);
 
 /// Muestra un aviso del sistema. Los lanza, de uno en uno, un único hilo que
 /// espera a cada proceso (para que no quede zombi) sin frenar al observador.
-fn notify(sound: Option<Event>, msg: &str) {
+fn notify(sound: Option<Event>, msg: &str, actions: Vec<ntfy::Action>) {
     static QUEUE: Mutex<Option<Sender<Notice>>> = Mutex::new(None);
     let mut queue = QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut notice = (sound, msg.to_string());
+    let mut notice = (sound, msg.to_string(), actions);
     if let Some(tx) = queue.as_ref() {
         match tx.send(notice) {
             Ok(()) => return,
@@ -245,8 +378,8 @@ fn notify(sound: Option<Event>, msg: &str) {
     let spawned = std::thread::Builder::new()
         .name("avisos".into())
         .spawn(move || {
-            for (sound, msg) in rx {
-                show_notice(sound, &msg);
+            for (sound, msg, actions) in rx {
+                show_notice(sound, &msg, &actions);
             }
         });
     if spawned.is_ok() && tx.send(notice).is_ok() {
@@ -258,13 +391,13 @@ fn notify(sound: Option<Event>, msg: &str) {
 /// espera hasta 25 s si nadie atiende las notificaciones).
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn show_notice(sound: Option<Event>, msg: &str) {
+fn show_notice(sound: Option<Event>, msg: &str, actions: &[ntfy::Action]) {
     // Todos a la vez, para que uno colgado no retrase a los demás.
     let desktop = notify_command(msg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    let phone = ntfy::publish(msg);
+    let phone = ntfy::publish(msg, actions);
     // Mientras suena, los otros dos ya van corriendo.
     if let Some(event) = sound {
         play(event);
@@ -440,6 +573,63 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn avisa_de_las_revisiones_que_terminan() {
+        let mut state = State::default();
+        let mut t = state.add_task("Arreglar".into(), String::new());
+        let at = chrono::Utc::now();
+        let check = |st| crate::store::Check {
+            state: st,
+            cmd: "cargo test".into(),
+            started: at,
+            finished: None,
+            output: String::new(),
+            returned: false,
+        };
+        let mut run = |t: &crate::store::Task, old: &HashMap<String, CheckSeen>| {
+            state.tasks = vec![t.clone()];
+            let new = checks_seen(&state);
+            let msgs: Vec<String> = check_results(&state, old, &new)
+                .into_iter()
+                .map(|e| e.1)
+                .collect();
+            (msgs, new)
+        };
+        t.check = Some(check(CheckState::Running));
+        let (msgs, seen) = run(&t, &HashMap::new());
+        assert!(msgs.is_empty());
+        t.check = Some(check(CheckState::Passed));
+        let (msgs, seen) = run(&t, &seen);
+        assert_eq!(msgs, ["t1 pasó la revisión: Arreglar"]);
+        // La misma, otra vez: ya se avisó.
+        assert!(run(&t, &seen).0.is_empty());
+        t.check = Some(crate::store::Check {
+            returned: true,
+            ..check(CheckState::Failed)
+        });
+        t.status = crate::store::TaskStatus::InProgress;
+        t.check_returns = 2;
+        let (msgs, returned) = run(&t, &seen);
+        assert_eq!(
+            msgs,
+            ["t1 no pasó la revisión; se la devolví a su agente (2 de 3)"]
+        );
+        // No le llegó y se deshizo: ahora es para ti.
+        t.check = Some(check(CheckState::Failed));
+        t.status = crate::store::TaskStatus::Review;
+        assert_eq!(
+            run(&t, &returned).0,
+            ["t1 no pasó la revisión; revísala tú: Arreglar"]
+        );
+        // Fallida sin devolverla (la corriste tú, o ya no quedan intentos):
+        // aunque siga en curso, no dice que se la devolvió.
+        t.check = Some(check(CheckState::Failed));
+        assert_eq!(
+            run(&t, &seen).0,
+            ["t1 no pasó la revisión; revísala tú: Arreglar"]
+        );
+    }
+
     fn snaps(list: &[(&str, Status)]) -> HashMap<String, Snapshot> {
         list.iter()
             .map(|&(id, status)| {
@@ -480,9 +670,15 @@ mod tests {
                 (
                     Event::Finished,
                     format!("{} terminó", a1.name),
-                    Some("a1".to_string())
+                    Some("a1".to_string()),
+                    "a1".to_string(),
                 ),
-                (Event::Blocked, "api necesita tu atención".to_string(), None),
+                (
+                    Event::Blocked,
+                    "api necesita tu atención".to_string(),
+                    None,
+                    "a2".to_string(),
+                ),
             ]
         );
         // Sin estado anterior (recién arrancado) no hay avisos.

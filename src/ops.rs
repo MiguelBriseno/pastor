@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::agent::{self, Kind, Observation, Status};
+use crate::check;
 use crate::history::{self, Event};
 use crate::hooks;
 use crate::remote;
@@ -303,7 +304,7 @@ fn runs_agent_script(args: &str) -> bool {
 
 /// Panel al que hay que hablarle para llegar al agente. Falla si el agente
 /// no está corriendo: el texto llegaría al shell y se ejecutaría como comando.
-fn agent_target(agent: &Agent) -> Result<String> {
+pub(crate) fn agent_target(agent: &Agent) -> Result<String> {
     match agent_panes(&agent.id).agent {
         Some(p) if !p.dead && !agent_gone(&p, &Procs::default()) => Ok(p.id),
         _ => bail!(
@@ -773,6 +774,8 @@ fn link_task(
     }
     let t = s.find_task_mut(task_id)?;
     t.agent = Some(agent_id.to_string());
+    // Otro agente (o el mismo, de nuevo): vuelve a tener sus intentos.
+    t.check_returns = 0;
     record(t, TaskStatus::InProgress);
     t.status = TaskStatus::InProgress;
     Ok(())
@@ -782,10 +785,12 @@ fn link_task(
 /// Todo se mira dentro del candado, para no pisar un cambio recién hecho por
 /// otro proceso (la tarea ya hecha, o reasignada a otro agente).
 pub fn finish_turn(agent_id: &str) -> Result<()> {
-    update_recording(|s, mut record| {
-        finish_turn_in(s, agent_id, &mut record);
-        Ok(())
-    })
+    let moved = update_recording(|s, mut record| Ok(finish_turn_in(s, agent_id, &mut record)))?;
+    // Recién pasada a revisión: si su repositorio tiene comando, se revisa.
+    if let Some(task) = moved {
+        check::spawn_auto(&task);
+    }
+    Ok(())
 }
 
 /// La tarea se queda sin agente; si estaba en curso, vuelve a pendiente.
@@ -826,7 +831,7 @@ pub fn set_task_status(task_id: &str, status: TaskStatus) -> Result<()> {
 /// Como `State::update`, pero `f` recibe con qué anotar los cambios de
 /// estado de las tareas, y solo pasan al historial si el estado se guardó
 /// (con el candado aún tomado, para que queden en el mismo orden).
-fn update_recording<T>(
+pub(crate) fn update_recording<T>(
     f: impl FnOnce(&mut State, &mut dyn FnMut(&Task, TaskStatus)) -> Result<T>,
 ) -> Result<T> {
     let (out, _) = State::update_then(
@@ -1095,6 +1100,9 @@ pub fn reject_task(task_id: &str, comment: &str) -> Result<Agent> {
         if t.agent.as_deref() == Some(&agent.id) {
             record(t, TaskStatus::InProgress);
             t.status = TaskStatus::InProgress;
+            // La revisaste tú: la revisión automática vuelve a tener sus
+            // intentos para lo que haga ahora.
+            t.check_returns = 0;
         }
         Ok(())
     })?;

@@ -507,21 +507,32 @@ const TRANSCRIPT_VAR: &str = "PASTOR_TRANSCRIPT";
 
 /// Lanza `pastor hook <event>` sin esperarlo, con `env` si se da.
 fn spawn_detached(event: &str, env: Option<(&str, &str)>) {
+    spawn_pastor(&["hook", event], env.as_slice());
+}
+
+/// Lanza `pastor <args>` sin esperarlo, en su propio grupo de procesos:
+/// sigue aunque quien lo lanzó (un hook, la TUI) termine.
+pub fn spawn_pastor(args: &[&str], env: &[(&str, &str)]) {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let Ok(exe) = pastor_exe() else { return };
     let mut c = Command::new(exe);
-    c.args(["hook", event]);
-    if let Some((k, v)) = env {
-        c.env(k, v);
-    }
+    c.args(args).envs(env.iter().copied());
     // Sin heredar stdout: Claude Code esperaría a que se cierre.
-    let _ = c
+    let child = c
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn();
+    // Esperarlo en un hilo: desde la TUI o `serve`, que viven mucho, quedaría
+    // zombi. Si quien lo lanzó termina antes, el hilo muere con él y al hijo
+    // lo recoge el sistema.
+    if let Ok(mut child) = child {
+        let _ = std::thread::Builder::new()
+            .name("pastor-hijo".into())
+            .spawn(move || child.wait());
+    }
 }
 
 /// Espera a que la pantalla del agente deje de cambiar y guarda su huella en
